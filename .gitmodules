@@ -1,0 +1,3 @@
+[submodule "models/cinema"]
+	path = models/cinema
+	url = https://github.com/mathpluscode/CineMA.git
