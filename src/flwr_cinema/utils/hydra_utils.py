@@ -11,7 +11,7 @@ def load_hydra_config(context: Context) -> DictConfig:
     
     if not config_dir or not config_name:
         raise ValueError(
-            "Both config_dir (default: ./configs) and config_name must be provided.\n"
+            "Both hydra_config_dir (default: ./configs) and hydra_config_name must be provided.\n"
             "Example usage: flwr run . --run-config hydra_config_dir=./configs hydra_config_name=config"
         )
     

@@ -1,5 +1,5 @@
 import torch
-from flwr.app import ArrayRecord, Context, Message, MetricRecord, RecordDict, ConfigRecord
+from flwr.app import Context, Message, ConfigRecord
 from flwr.clientapp import ClientApp
 from flwr.common.logger import log
 import logging
@@ -7,7 +7,7 @@ import json
 from datetime import datetime
 from pathlib import Path
 from omegaconf import DictConfig
-from models.cinema.cinema import ConvViT
+from models.cinema.cinema.convvit import ConvViT
 from models.cinema.cinema.optim import get_n_accum_steps
 from torch.utils.data import DataLoader
 

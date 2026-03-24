@@ -55,8 +55,6 @@ class BaseClient(ABC):
             client_id: Unique client identifier.
             model: Local model (initialized same as global).
             train_loader: Local training data loader.
-            server_host: Server host address.
-            server_port: Server port.
             loss_fn: Loss function for training.
             views: List of views to use.
             local_epochs: Number of local training epochs per round.
