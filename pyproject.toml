@@ -78,4 +78,4 @@ local-epochs = 1
 learning-rate = 0.1
 batch-size = 32
 hydra_config_dir = "./configs"
-hydra_config_file = None
+hydra_config_name = ""

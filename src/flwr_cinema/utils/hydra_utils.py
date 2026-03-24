@@ -1,6 +1,6 @@
-from flwr.common import Context
+from flwr.app import Context, ConfigRecord
 from hydra import compose, initialize
-from omegaconf import DictConfig
+from omegaconf import DictConfig, OmegaConf
 from hydra.core.global_hydra import GlobalHydra
 
 def load_hydra_config(context: Context) -> DictConfig:
@@ -20,3 +20,18 @@ def load_hydra_config(context: Context) -> DictConfig:
     with initialize(version_base=None, config_path=config_dir):
         cfg = compose(config_name=config_name)
     return cfg
+
+def update_config_from_config_record(config: DictConfig, config_record: ConfigRecord) -> DictConfig:
+    """Update the given Hydra config with values from the provided ConfigRecord, allowing for server-sent overrides."""
+    # TODO: May need to add some validations to ensure that only expected keys are updated
+
+    server_config_dict = dict(config_record)
+
+    OmegaConf.set_struct(config, False)  # Temporarily disable struct mode to allow merging
+    
+    for key, value in server_config_dict.items():
+        OmegaConf.update(config, key, value, merge=True)
+
+    OmegaConf.set_struct(config, True)  # Re-enable struct mode after merging
+
+    return config
