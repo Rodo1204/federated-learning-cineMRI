@@ -1,7 +1,8 @@
 import logging
 from abc import ABC, abstractmethod
-from typing import Callable
+from typing import Any, Callable
 
+import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
@@ -24,6 +25,27 @@ from flwr_cinema.scripts.lora import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _to_flwr_metric_value(value: Any) -> int | float | list[int] | list[float] | None:
+    """Convert metric values to Flower-supported MetricRecord types."""
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, (int, float, np.integer, np.floating)):
+        return value.item() if isinstance(value, (np.integer, np.floating)) else value
+    if isinstance(value, torch.Tensor) and value.ndim == 0:
+        return float(value.item())
+    if isinstance(value, (list, tuple)):
+        converted: list[int] | list[float] = []
+        for v in value:
+            if isinstance(v, bool):
+                converted.append(int(v))
+            elif isinstance(v, (int, float, np.integer, np.floating)):
+                converted.append(v.item() if isinstance(v, (np.integer, np.floating)) else v)
+            else:
+                return None
+        return converted
+    return None
 
 class BaseClient(ABC):
     """Abstract Base Class for Federated Learning Clients using Flower's Message API."""
@@ -153,11 +175,10 @@ class BaseClient(ABC):
 
     # Abstract Methods
     @abstractmethod
-    def train_local(self, round_idx: int) -> tuple[int, dict]:
+    def train_local(self, round_idx: int) -> int:
         """Local training loop. Must be implemented by subclasses.
         Returns:
             num_samples: Number of training samples processed.
-            metrics: Dictionary of training metrics.
         """
         pass
 
@@ -187,7 +208,7 @@ class BaseClient(ABC):
                 local_lora_state_dict = local_lora_record.to_torch_state_dict(keep_input=False)
                 load_local_lora_state_dict(self.model, local_lora_state_dict)
 
-        num_samples, metrics = self.train_local(round_idx)
+        num_samples = self.train_local(round_idx)
 
         updated_state_dict = self.get_model_update()
         out_params = ArrayRecord.from_torch_state_dict(updated_state_dict, keep_input=False)
@@ -203,14 +224,19 @@ class BaseClient(ABC):
 
         out_configs = ConfigRecord()
         out_configs["round"] = round_idx
+        
+        # Calculate an estimate of the number of optimizer steps taken this round. Maybe changing this to count in the real optimizer step would be better
+        optimizer_steps_this_round = 0 
+        if self.train_loader is not None:
+            batches_per_epoch = len(self.train_loader)
+            steps_per_epoch = (batches_per_epoch + self.n_accum_steps - 1) // self.n_accum_steps
+            optimizer_steps_this_round = steps_per_epoch * self.local_epochs
+        out_configs["optimizer_steps_this_round"] = int(optimizer_steps_this_round)
+        
         out_record["config"] = out_configs
 
-        n_val_samples = len(self.val_loader.dataset) if self.val_loader else 0
-
-        safe_metrics = {k: float(v) if isinstance(v, (int, float, torch.Tensor)) else str(v) for k, v in metrics.items()}
-        out_metrics = MetricRecord(safe_metrics)
+        out_metrics = MetricRecord()
         out_metrics["num_samples"] = num_samples
-        out_metrics["n_val_samples"] = n_val_samples
         out_record["metrics"] = out_metrics
 
         return message.create_reply(content=out_record)
@@ -231,8 +257,12 @@ class BaseClient(ABC):
         num_val_samples, metrics = self.validate_local()
 
         out_record = RecordDict()
-        safe_metrics = {k: float(v) if isinstance(v, (int, float, torch.Tensor)) else str(v) for k, v in metrics.items()}
+        safe_metrics = {
+            k: converted
+            for k, v in metrics.items()
+            if (converted := _to_flwr_metric_value(v)) is not None
+        }
         out_metrics = MetricRecord(safe_metrics)
-        out_metrics["num_val_samples"] = num_val_samples
+        out_metrics["num_samples"] = num_val_samples
         out_record["metrics"] = out_metrics
         return message.create_reply(content=out_record)

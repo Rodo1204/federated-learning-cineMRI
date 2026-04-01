@@ -30,10 +30,12 @@ Output MM_merge structure (what data/mnms_merged/preprocess.py expects):
 """
 
 import argparse
+import hashlib
 import logging
 import shutil
 from pathlib import Path
 
+import nibabel as nib
 import numpy as np
 import pandas as pd
 import SimpleITK as sitk
@@ -41,6 +43,132 @@ from tqdm import tqdm
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
+
+
+def ensure_scalar_3d(volume: np.ndarray, src_path: Path) -> np.ndarray:
+    """Ensure a scalar 3D array (drop singleton axes, reject unsupported shapes)."""
+    arr = np.asarray(volume)
+
+    if arr.ndim == 4:
+        arr = np.squeeze(arr)
+
+    if arr.ndim != 3:
+        raise ValueError(f"Expected 3D volume after squeeze for {src_path}, got shape {arr.shape}")
+
+    return arr
+
+
+def sanitize_volume_array(volume: np.ndarray, is_label: bool) -> np.ndarray:
+    """Sanitize volume values to avoid downstream preprocessing failures."""
+    if is_label:
+        volume = np.nan_to_num(volume, nan=0.0, posinf=0.0, neginf=0.0)
+        return np.rint(volume).astype(np.uint8)
+
+    finite_mask = np.isfinite(volume)
+    if not finite_mask.any():
+        return np.zeros_like(volume, dtype=np.float32)
+
+    finite_values = volume[finite_mask]
+    vmin = float(np.min(finite_values))
+    vmax = float(np.max(finite_values))
+    volume = np.nan_to_num(volume, nan=vmin, posinf=vmax, neginf=vmin)
+    return volume.astype(np.float32, copy=False)
+
+
+def write_sanitized_nifti(src_path: Path, dst_path: Path, is_label: bool) -> None:
+    """Rewrite a NIfTI file with sanitized values and orthonormal direction."""
+    try:
+        src_img = sitk.ReadImage(str(src_path), outputPixelType=sitk.sitkUInt8 if is_label else sitk.sitkFloat32)
+        volume = sitk.GetArrayFromImage(src_img)
+        spacing = src_img.GetSpacing()
+        origin = src_img.GetOrigin()
+    except Exception:
+        nib_img = nib.load(str(src_path))
+        volume = np.asanyarray(nib_img.dataobj)
+        spacing = tuple(float(x) for x in nib_img.header.get_zooms()[:3])
+        origin = tuple(float(x) for x in nib_img.affine[:3, 3])
+
+    volume = ensure_scalar_3d(volume, src_path=src_path)
+    volume = sanitize_volume_array(volume, is_label=is_label)
+    out_img = sitk.GetImageFromArray(volume)
+    out_img.SetSpacing(tuple(float(s) for s in spacing[:3]))
+    out_img.SetOrigin(tuple(float(o) for o in origin[:3]))
+    out_img.SetDirection((1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0))
+    sitk.WriteImage(out_img, str(dst_path), useCompression=True)
+
+
+def build_patient_signature(image_paths: list[Path]) -> str:
+    """Build a stable signature from ED/ES image and mask voxel content.
+
+    The signature ignores filenames and container/header differences so the
+    same patient can match across MnMs1 and MnMs2 even when files were
+    re-encoded or renamed.
+    """
+    hasher = hashlib.sha1()
+    for image_path in image_paths:
+        volume = None
+
+        # nibabel is usually more permissive than ITK for malformed direction metadata.
+        try:
+            import nibabel as nib
+
+            volume = np.asanyarray(nib.load(str(image_path)).dataobj)
+        except Exception:
+            volume = None
+
+        if volume is None:
+            try:
+                volume = sitk.GetArrayFromImage(sitk.ReadImage(str(image_path)))
+            except Exception:
+                # Last-resort fallback for unreadable files.
+                with image_path.open("rb") as f:
+                    volume = f.read()
+
+        if isinstance(volume, bytes):
+            hasher.update(volume)
+            continue
+
+        volume = ensure_scalar_3d(volume, src_path=image_path)
+
+        hasher.update(str(volume.shape).encode("utf-8"))
+        hasher.update(str(volume.dtype).encode("utf-8"))
+        hasher.update(np.ascontiguousarray(volume).tobytes())
+    return hasher.hexdigest()
+
+
+def first_non_empty(values: pd.Series):
+    """Return the first value that is not NaN and not an empty string."""
+    for value in values:
+        if pd.isna(value):
+            continue
+        if isinstance(value, str) and value.strip() == "":
+            continue
+        return value
+    return np.nan
+
+
+def consolidate_by_merging_code(df: pd.DataFrame) -> pd.DataFrame:
+    """Collapse rows sharing MERGING_CODE into one merged row."""
+    if df.empty:
+        return df
+
+    grouped_rows = []
+    columns = df.columns.tolist()
+    for merging_code, group in df.groupby("MERGING_CODE", sort=True, dropna=False):
+        merged_row = {"MERGING_CODE": merging_code}
+        for col in columns:
+            if col == "MERGING_CODE":
+                continue
+            merged_row[col] = first_non_empty(group[col])
+
+        if "Source" in group.columns:
+            unique_sources = sorted([str(s) for s in group["Source"].dropna().unique() if str(s).strip()])
+            if len(unique_sources) > 1:
+                merged_row["Source"] = "+".join(unique_sources)
+
+        grouped_rows.append(merged_row)
+
+    return pd.DataFrame(grouped_rows)
 
 
 def extract_and_save_frame(image_4d_path: Path, frame_index: int, out_path: Path, is_label: bool = False) -> None:
@@ -57,7 +185,16 @@ def extract_and_save_frame(image_4d_path: Path, frame_index: int, out_path: Path
     else:
         img = sitk.ReadImage(str(image_4d_path))
     frame = img[:, :, :, frame_index]
-    sitk.WriteImage(frame, str(out_path), useCompression=True)
+
+    # Rewrite frame with sanitized values and orthonormal direction.
+    frame_arr = sitk.GetArrayFromImage(frame)
+    frame_arr = ensure_scalar_3d(frame_arr, src_path=image_4d_path)
+    frame_arr = sanitize_volume_array(frame_arr, is_label=is_label)
+    out_img = sitk.GetImageFromArray(frame_arr)
+    out_img.SetSpacing(tuple(float(s) for s in frame.GetSpacing()[:3]))
+    out_img.SetOrigin(tuple(float(o) for o in frame.GetOrigin()[:3]))
+    out_img.SetDirection((1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0))
+    sitk.WriteImage(out_img, str(out_path), useCompression=True)
 
 
 def prepare_mnms1(mnms1_dir: Path, out_dir: Path, start_code: int) -> tuple:
@@ -69,7 +206,7 @@ def prepare_mnms1(mnms1_dir: Path, out_dir: Path, start_code: int) -> tuple:
         start_code: Starting MERGING_CODE integer.
 
     Returns:
-        Tuple of (DataFrame with records, next available code).
+        Tuple of (DataFrame with records, next available code, signature map).
     """
     logger.info("Processing MnMs1 dataset...")
 
@@ -85,6 +222,7 @@ def prepare_mnms1(mnms1_dir: Path, out_dir: Path, start_code: int) -> tuple:
 
     records = []
     current_code = start_code
+    signature_to_code = {}
 
     # Search for patient dirs across all splits
     split_dirs = {
@@ -130,16 +268,34 @@ def prepare_mnms1(mnms1_dir: Path, out_dir: Path, start_code: int) -> tuple:
             extract_and_save_frame(sa_gt_path, ed_index, new_dir / f"{new_pid}_ED_gt.nii.gz", is_label=True)
             extract_and_save_frame(sa_path, es_index, new_dir / f"{new_pid}_ES.nii.gz", is_label=False)
             extract_and_save_frame(sa_gt_path, es_index, new_dir / f"{new_pid}_ES_gt.nii.gz", is_label=True)
+
+            signature = build_patient_signature([
+                new_dir / f"{new_pid}_ED.nii.gz",
+                new_dir / f"{new_pid}_ED_gt.nii.gz",
+                new_dir / f"{new_pid}_ES.nii.gz",
+                new_dir / f"{new_pid}_ES_gt.nii.gz",
+            ])
         except Exception as e:
             logger.warning(f"MnMs1: Error extracting frames for {pid}: {e}. Skipping.")
             shutil.rmtree(new_dir, ignore_errors=True)
             continue
 
+        if signature in signature_to_code:
+            logger.warning(
+                "MnMs1: Duplicate image signature detected for patient %s. Keeping first occurrence with MERGING_CODE=%s.",
+                pid,
+                signature_to_code[signature],
+            )
+            shutil.rmtree(new_dir, ignore_errors=True)
+            continue
+
+        signature_to_code[signature] = current_code
+
         records.append({
             "MERGING_CODE": current_code,
             "ID_MM1": pid,
             "ID_MM2": np.nan,
-            "Vendor1": row.get("Vendor", row.get("VendorName", "")),
+            "Vendor1": row.get("VendorName", row.get("Vendor", "")),
             "Vendor2": np.nan,
             "Pathology1": row.get("Pathology", ""),
             "Pathology2": np.nan,
@@ -154,10 +310,15 @@ def prepare_mnms1(mnms1_dir: Path, out_dir: Path, start_code: int) -> tuple:
         current_code += 1
 
     logger.info(f"MnMs1: Processed {len(records)} patients (codes {start_code}-{current_code - 1})")
-    return pd.DataFrame(records), current_code
+    return pd.DataFrame(records), current_code, signature_to_code
 
 
-def prepare_mnms2(mnms2_dir: Path, out_dir: Path, start_code: int) -> tuple:
+def prepare_mnms2(
+    mnms2_dir: Path,
+    out_dir: Path,
+    start_code: int,
+    signature_to_code: dict[str, int] | None = None,
+) -> tuple:
     """Process MnMs2 dataset: copy 3D ED/ES files with new IDs.
 
     Args:
@@ -166,7 +327,7 @@ def prepare_mnms2(mnms2_dir: Path, out_dir: Path, start_code: int) -> tuple:
         start_code: Starting MERGING_CODE integer.
 
     Returns:
-        Tuple of (DataFrame with records, next available code).
+        Tuple of (DataFrame with records, next available code, updated signature map).
     """
     logger.info("Processing MnMs2 dataset...")
 
@@ -175,7 +336,8 @@ def prepare_mnms2(mnms2_dir: Path, out_dir: Path, start_code: int) -> tuple:
         logger.error(f"MnMs2 CSV not found at {csv_path}")
         return pd.DataFrame(), start_code
 
-    df = pd.read_csv(csv_path).dropna()
+    # Keep text columns as strings to avoid mixed-type parsing warnings.
+    df = pd.read_csv(csv_path, dtype=str, low_memory=False).dropna(subset=["SUBJECT_CODE"])
     data_dir = mnms2_dir / "dataset"
     if not data_dir.exists():
         # Maybe files are directly in the root
@@ -183,6 +345,8 @@ def prepare_mnms2(mnms2_dir: Path, out_dir: Path, start_code: int) -> tuple:
 
     records = []
     current_code = start_code
+    if signature_to_code is None:
+        signature_to_code = {}
 
     for _, row in tqdm(df.iterrows(), total=len(df), desc="MnMs2"):
         pid_int = int(row["SUBJECT_CODE"])
@@ -193,20 +357,16 @@ def prepare_mnms2(mnms2_dir: Path, out_dir: Path, start_code: int) -> tuple:
             logger.warning(f"MnMs2: Patient dir {patient_dir} not found. Skipping.")
             continue
 
-        new_pid = f"{current_code:03d}"
-        new_dir = out_dir / new_pid
-        new_dir.mkdir(parents=True, exist_ok=True)
-
         # MnMs2 files: {pid}_SA_ED.nii.gz, {pid}_SA_ED_gt.nii.gz, etc.
-        file_mapping = {
-            f"{pid_old}_SA_ED.nii.gz": f"{new_pid}_ED.nii.gz",
-            f"{pid_old}_SA_ED_gt.nii.gz": f"{new_pid}_ED_gt.nii.gz",
-            f"{pid_old}_SA_ES.nii.gz": f"{new_pid}_ES.nii.gz",
-            f"{pid_old}_SA_ES_gt.nii.gz": f"{new_pid}_ES_gt.nii.gz",
-        }
+        required_files = [
+            f"{pid_old}_SA_ED.nii.gz",
+            f"{pid_old}_SA_ED_gt.nii.gz",
+            f"{pid_old}_SA_ES.nii.gz",
+            f"{pid_old}_SA_ES_gt.nii.gz",
+        ]
 
         all_found = True
-        for old_name, new_name in file_mapping.items():
+        for old_name in required_files:
             src = patient_dir / old_name
             if not src.exists():
                 logger.warning(f"MnMs2: Missing {src}")
@@ -214,11 +374,9 @@ def prepare_mnms2(mnms2_dir: Path, out_dir: Path, start_code: int) -> tuple:
                 break
 
         if not all_found:
-            shutil.rmtree(new_dir, ignore_errors=True)
             continue
 
-        for old_name, new_name in file_mapping.items():
-            shutil.copy2(patient_dir / old_name, new_dir / new_name)
+        signature = build_patient_signature([patient_dir / name for name in required_files])
 
         # Determine original split from MnMs2 convention
         if pid_int <= 160:
@@ -228,12 +386,52 @@ def prepare_mnms2(mnms2_dir: Path, out_dir: Path, start_code: int) -> tuple:
         else:
             original_split = "test"
 
+        if signature in signature_to_code:
+            matched_code = signature_to_code[signature]
+            logger.info(
+                "MnMs2: Found duplicate with existing MERGING_CODE=%s for SUBJECT_CODE=%s. Merging metadata.",
+                matched_code,
+                pid_old,
+            )
+            records.append({
+                "MERGING_CODE": matched_code,
+                "ID_MM1": np.nan,
+                "ID_MM2": pid_int,
+                "Vendor1": np.nan,
+                "Vendor2": row.get("Vendor", row.get("VENDOR", "")),
+                "Pathology1": np.nan,
+                "Pathology2": row.get("DISEASE", ""),
+                "Age": np.nan,
+                "Sex": "",
+                "Height": np.nan,
+                "Weight": np.nan,
+                "Scanner": row.get("SCANNER", ""),
+                "Field": row.get("FIELD", np.nan),
+                "Original_Split": original_split,
+                "Source": "MnMs2",
+            })
+            continue
+
+        new_pid = f"{current_code:03d}"
+        new_dir = out_dir / new_pid
+        new_dir.mkdir(parents=True, exist_ok=True)
+        file_mapping = {
+            f"{pid_old}_SA_ED.nii.gz": f"{new_pid}_ED.nii.gz",
+            f"{pid_old}_SA_ED_gt.nii.gz": f"{new_pid}_ED_gt.nii.gz",
+            f"{pid_old}_SA_ES.nii.gz": f"{new_pid}_ES.nii.gz",
+            f"{pid_old}_SA_ES_gt.nii.gz": f"{new_pid}_ES_gt.nii.gz",
+        }
+        for old_name, new_name in file_mapping.items():
+            src = patient_dir / old_name
+            dst = new_dir / new_name
+            write_sanitized_nifti(src, dst, is_label=new_name.endswith("_gt.nii.gz"))
+
         records.append({
             "MERGING_CODE": current_code,
             "ID_MM1": np.nan,
             "ID_MM2": pid_int,
             "Vendor1": np.nan,
-            "Vendor2": row.get("VENDOR", ""),
+            "Vendor2": row.get("Vendor", row.get("VENDOR", "")),
             "Pathology1": np.nan,
             "Pathology2": row.get("DISEASE", ""),
             "Age": np.nan,
@@ -245,10 +443,11 @@ def prepare_mnms2(mnms2_dir: Path, out_dir: Path, start_code: int) -> tuple:
             "Original_Split": original_split,
             "Source": "MnMs2",
         })
+        signature_to_code[signature] = current_code
         current_code += 1
 
     logger.info(f"MnMs2: Processed {len(records)} patients (codes {start_code}-{current_code - 1})")
-    return pd.DataFrame(records), current_code
+    return pd.DataFrame(records), current_code, signature_to_code
 
 
 def main():
@@ -272,10 +471,15 @@ def main():
     args.out_dir.mkdir(parents=True, exist_ok=True)
 
     # Process MnMs1 first (codes starting from 1)
-    df1, next_code = prepare_mnms1(args.mnms1_dir, args.out_dir, start_code=1)
+    df1, next_code, signature_to_code = prepare_mnms1(args.mnms1_dir, args.out_dir, start_code=1)
 
     # Process MnMs2 (codes continue from where MnMs1 left off)
-    df2, final_code = prepare_mnms2(args.mnms2_dir, args.out_dir, start_code=next_code)
+    df2, _, _ = prepare_mnms2(
+        args.mnms2_dir,
+        args.out_dir,
+        start_code=next_code,
+        signature_to_code=signature_to_code,
+    )
 
     # Combine and save master CSV
     all_dfs = [d for d in [df1, df2] if not d.empty]
@@ -284,6 +488,7 @@ def main():
         return
 
     merged_df = pd.concat(all_dfs, ignore_index=True)
+    merged_df = consolidate_by_merging_code(merged_df)
 
     # Reorder columns
     cols = merged_df.columns.tolist()
@@ -301,10 +506,10 @@ def main():
     logger.info("=" * 60)
     logger.info("")
     logger.info("Next step: run the preprocessor:")
-    logger.info(f'  python data/mnms_merged/preprocess.py \\')
+    logger.info("  python data/mnms_merged/preprocess.py \\")
     logger.info(f'    --data_dir "{args.out_dir}" \\')
     logger.info(f'    --info_csv "{output_csv}" \\')
-    logger.info(f'    --out_dir "C:\\Users\\Rodo\\.cache\\cinema_datasets\\mnms_merged\\processed"')
+    logger.info('    --out_dir "C:\\Users\\Rodo\\.cache\\cinema_datasets\\mnms_merged\\processed"')
 
 
 if __name__ == "__main__":

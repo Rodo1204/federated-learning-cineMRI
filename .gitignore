@@ -205,3 +205,7 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+outputs
+src/flwr_cinema/scripts/notebook.ipynb
+src/flwr_cinema/scripts/prepare_mm_merge.py

@@ -37,7 +37,7 @@ import pandas as pd
 import torch
 from torch.utils.data import DataLoader
 
-from scripts.eval_utils import load_metadata
+from flwr_cinema.scripts.eval_utils import load_metadata
 
 if TYPE_CHECKING:
     from monai.transforms import Transform
