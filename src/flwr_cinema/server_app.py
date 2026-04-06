@@ -6,6 +6,8 @@ import torch
 from flwr.app import ArrayRecord, ConfigRecord, Context, MetricRecord
 from flwr.serverapp import Grid, ServerApp
 from flwr.serverapp.strategy import FedAvg, Result, Strategy 
+import json
+from omegaconf import OmegaConf
 
 from models.cinema.cinema.convvit import ConvViT
 
@@ -21,6 +23,7 @@ from flwr_cinema.scripts.lora import (
 
 )
 from flwr_cinema.utils.hydra_utils import load_hydra_config
+from flwr_cinema.strategies.common import get_primary_metric_name
 from models.cinema.cinema.device import get_amp_dtype_and_device
 
 # Create ServerApp
@@ -138,7 +141,6 @@ def get_strategy(config: 'DictConfig', global_model: torch.nn.Module, save_dir: 
     Creates the strategy with all CinemaStrategyMixin parameters wired from
     the Hydra config, including the global model reference for checkpointing.
     """
-    from flwr_cinema.strategies.common import get_primary_metric_name
 
     fed_strategy = getattr(config.federated, "strategy", "fedavg").lower()
     if fed_strategy == "fedavg":
@@ -193,8 +195,6 @@ def save_final_model(
         n_rounds: Number of rounds executed.
         strategy: The strategy instance used, to extract client-specific states.
     """
-    import json
-    from omegaconf import OmegaConf
 
     save_dir.mkdir(parents=True, exist_ok=True)
 
@@ -204,7 +204,7 @@ def save_final_model(
     # Build checkpoint dict
     checkpoint = {
         "n_rounds": n_rounds,
-        "model_state_dict": model.state_dict(),
+        "model": model.state_dict(),
     }
 
     # Save LoRA weights separately for easy extraction
@@ -242,10 +242,8 @@ def save_final_model(
     metrics_path = save_dir / "metrics_history.json"
     with open(metrics_path, "w") as f:
         json.dump(metrics_history, f, indent=2, default=float)
+    # TODO: consider overwriting the config file in case it has change during training
 
-    # Save config separately as YAML for easy reference
-    config_path = save_dir / "config.yaml"
-    OmegaConf.save(config, config_path)
 
 
 @app.main()
@@ -272,6 +270,9 @@ def main(grid: Grid, context: Context) -> None:
     n_rounds = getattr(config, "n_rounds", None) or config.federated.n_rounds
     save_dir = base_output_dir / "federated_server"
     save_dir.mkdir(parents=True, exist_ok=True)
+    # Save config separately as YAML for easy reference
+    config_path = save_dir / "config.yaml"
+    OmegaConf.save(config, config_path)
 
     # Initialize global model
     # logger.info("Initializing global model...")

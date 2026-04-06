@@ -171,7 +171,7 @@ class CinemaStrategyMixin:
         checkpoint = {
             "round": server_round,
             "total_optimizer_steps": self.total_optimizer_steps,
-            "model_state_dict": self.global_model.state_dict(),
+            "model": self.global_model.state_dict(),
         }
         
         if metrics is not None:

@@ -209,3 +209,4 @@ __marimo__/
 outputs
 src/flwr_cinema/scripts/notebook.ipynb
 src/flwr_cinema/scripts/prepare_mm_merge.py
+src/flwr_cinema/eval

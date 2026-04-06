@@ -14,7 +14,7 @@ logging:
 federated:
   server_host: "localhost"
   server_port: 8888
-  n_rounds: 5  # Number of communication rounds
+  n_rounds: 500  # Number of communication rounds
   local_epochs: 1  # Local epochs per round per client
   n_clients: 2  # Number of expected clients (ie. acdc + Siemens + GE + Canon + Philips)
   # client_ids: ["acdc", "Siemens"]  # Identifiers for each client
@@ -121,7 +121,7 @@ transform:
     translate_range: [60, 60, 0]
 
 train:
-  use_lora: False # Set to True to use LoRA
+  use_lora: True # Set to True to use LoRA
   use_class_weighted_loss: False # Set to True to use class-weighted BCE loss for imbalanced classification
   n_workers: 4
   clip_grad: 5.0
@@ -132,7 +132,7 @@ train:
   lr: 1e-3
   min_lr: 1e-5
   n_warmup_epochs: 0
-  n_epochs: 800
+  n_epochs: 500
   max_n_ckpts: 2
   batch_size: 32
   batch_size_per_device: 16
