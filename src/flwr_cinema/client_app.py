@@ -381,6 +381,9 @@ def evaluate(msg: Message, context: Context):
     metrics_save_path = str(client_run_dir / f"eval_metrics_{client_id}_{timestamp}.json")
     stats_save_path = str(client_run_dir / f"eval_stats_{client_id}_{timestamp}.json")
 
+    with open(stats_save_path, "w") as f:
+        json.dump(client_stats, f, indent=2)
+
     client = federated_client(
         client_id=client_id,
         model=model,
