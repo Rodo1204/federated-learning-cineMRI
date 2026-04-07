@@ -30,7 +30,7 @@ def update_config_from_config_record(config: DictConfig, config_record: ConfigRe
     OmegaConf.set_struct(config, False)  # Temporarily disable struct mode to allow merging
     
     for key, value in server_config_dict.items():
-        if key != "federated_timestamp":
+        if key != "federated_timestamp" and key != "round":  # Exclude certain keys that we don't want to merge into the config
             OmegaConf.update(config, key, value, merge=True)
 
     OmegaConf.set_struct(config, True)  # Re-enable struct mode after merging

@@ -135,7 +135,11 @@ def load_arrays_into_model(
         model.load_state_dict(state_dict)
 
 
-def get_strategy(config: 'DictConfig', global_model: torch.nn.Module, save_dir: Path) -> Strategy:
+def get_strategy(
+    config: 'DictConfig',
+    global_model: torch.nn.Module,
+    save_dir: Path,
+) -> Strategy:
     """Get federated learning strategy based on config.
     
     Creates the strategy with all CinemaStrategyMixin parameters wired from
@@ -293,6 +297,9 @@ def main(grid: Grid, context: Context) -> None:
             "train.clip_grad": config.train.clip_grad,
             "federated.local_epochs": config.federated.local_epochs,
             "federated.aggregate_head": getattr(config.federated, "aggregate_head", True),
+        }),
+        evaluate_config=ConfigRecord({
+            "federated_timestamp": timestamp_str,
         }),
         num_rounds=n_rounds
         # evaluate_fn=global_evaluate  # TODO: implement global evaluation function that evaluates on central test set after each round

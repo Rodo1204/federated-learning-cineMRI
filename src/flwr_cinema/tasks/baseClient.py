@@ -195,7 +195,7 @@ class BaseClient(ABC):
     def train(self, message: Message, context: Context) -> Message:
         """Message handler method for training to be called directly from ClientApp decorators."""
         in_configs = message.content.config_records.get("config", ConfigRecord())
-        round_idx = in_configs.get("round", 0)
+        round_idx = in_configs.get("server-round", 0)
 
         in_params = message.content.array_records.get("model_params", ArrayRecord())
         if in_params:
@@ -223,7 +223,7 @@ class BaseClient(ABC):
             out_record["local_lora_params"] = local_lora_record # TODO: only for debugging and testing, need to be removed later
 
         out_configs = ConfigRecord()
-        out_configs["round"] = round_idx
+        # out_configs["server-round"] = round_idx
         
         # Calculate an estimate of the number of optimizer steps taken this round. Maybe changing this to count in the real optimizer step would be better
         optimizer_steps_this_round = 0 
@@ -239,11 +239,13 @@ class BaseClient(ABC):
         out_metrics["num_samples"] = num_samples
         out_record["metrics"] = out_metrics
 
-        return message.create_reply(content=out_record)
+        return Message(content=out_record, reply_to=message)
 
     def evaluate(self, message: Message, context: Context) -> Message:
         """Message handler method for evaluation to be called directly from ClientApp decorators."""
-        in_params = message.content.array_records.get("model_params", ArrayRecord())
+        in_configs = message.content.config_records.get("config", ConfigRecord())
+
+        in_params = message.content.array_records.get("model_params", ArrayRecord()) 
         if in_params:
             model_state_dict = in_params.to_torch_state_dict(keep_input=False)
             self.update_model(model_state_dict)
@@ -256,13 +258,15 @@ class BaseClient(ABC):
 
         num_val_samples, metrics = self.validate_local()
 
-        out_record = RecordDict()
         safe_metrics = {
             k: converted
             for k, v in metrics.items()
             if (converted := _to_flwr_metric_value(v)) is not None
         }
+
+        out_record = RecordDict()
         out_metrics = MetricRecord(safe_metrics)
         out_metrics["num_samples"] = num_val_samples
         out_record["metrics"] = out_metrics
-        return message.create_reply(content=out_record)
+
+        return Message(content=out_record, reply_to=message)

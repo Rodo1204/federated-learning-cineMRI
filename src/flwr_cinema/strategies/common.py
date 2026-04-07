@@ -274,6 +274,7 @@ class CinemaStrategyMixin:
             self.total_optimizer_steps += avg_steps
             
         return agg_arrays, agg_metrics
+    
     def configure_evaluate(
         self,
         server_round: int,

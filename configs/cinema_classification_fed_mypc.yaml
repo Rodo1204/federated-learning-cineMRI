@@ -14,7 +14,7 @@ logging:
 federated:
   server_host: "localhost"
   server_port: 8888
-  n_rounds: 500  # Number of communication rounds
+  n_rounds: 3  # Number of communication rounds
   local_epochs: 1  # Local epochs per round per client
   n_clients: 2  # Number of expected clients (ie. acdc + Siemens + GE + Canon + Philips)
   # client_ids: ["acdc", "Siemens"]  # Identifiers for each client
@@ -136,7 +136,7 @@ train:
   max_n_ckpts: 2
   batch_size: 32
   batch_size_per_device: 16
-  eval_steps: 80  # Evaluate every N optimizer steps (aligned centralized/federated)
+  eval_steps: 5 #80  # Evaluate every N optimizer steps (aligned centralized/federated)
   early_stopping:
     metric: "roc_auc"
     mode: "max"

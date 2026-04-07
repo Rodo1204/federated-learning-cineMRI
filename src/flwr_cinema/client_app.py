@@ -170,14 +170,6 @@ def load_client_data(
     # Log statistics for IID/non-IID check
     # logger.info(f"Client statistics: {stats}")
     
-    # Save statistics for analysis
-    output_dir = Path("outputs") / client_id
-    output_dir.mkdir(parents=True, exist_ok=True)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    stats_save_path = output_dir / f"client_stats_{client_id}_{timestamp}.json"
-    with open(stats_save_path, "w") as f:
-        json.dump(stats, f, indent=2)
-    
     _TRAIN_DATALOADER_CACHE = train_loader
     _VAL_DATALOADER_CACHE = val_loader
     _STATS_CACHE = stats
@@ -274,15 +266,16 @@ def train(msg: Message, context: Context):
     # Dynamically load the appropriate client class based on task
     federated_client = get_client_class(config)
 
+    round_idx = int(in_config.get("server-round", 0))
+
     # Create client-specific output directory
     client_run_dir = base_output_dir / f"client_{client_id}"
     client_run_dir.mkdir(parents=True, exist_ok=True)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    stats_save_path = str(client_run_dir / f"client_stats_{client_id}_{timestamp}.json")
-    metrics_save_path = str(client_run_dir / f"metrics_{client_id}_{timestamp}.json")
-    
-    with open(stats_save_path, "w") as f:
-        json.dump(client_stats, f, indent=2)
+    stats_save_path = str(client_run_dir / f"client_stats_{client_id}_round_{round_idx:03d}.json")
+    metrics_save_path = str(client_run_dir / f"train_metrics_{client_id}_round_{round_idx:03d}.json")
+    if round_idx == 0 or round_idx == 1:  # Only save client stats on first round to avoid redundancy across rounds
+        with open(stats_save_path, "w") as f:
+            json.dump(client_stats, f, indent=2)
 
     client = federated_client(
         client_id=client_id,
@@ -373,16 +366,13 @@ def evaluate(msg: Message, context: Context):
     # Dynamically load the appropriate client class based on task
     federated_client = get_client_class(config)
 
-    # Create client-specific output directory
-    client_run_dir = base_output_dir / f"client_{client_id}"
-    client_run_dir.mkdir(parents=True, exist_ok=True)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    
-    metrics_save_path = str(client_run_dir / f"eval_metrics_{client_id}_{timestamp}.json")
-    stats_save_path = str(client_run_dir / f"eval_stats_{client_id}_{timestamp}.json")
+    round_idx = int(in_config.get("server-round", 0))
 
-    with open(stats_save_path, "w") as f:
-        json.dump(client_stats, f, indent=2)
+    # Create client-specific output directory only if we persist eval artifacts
+    client_run_dir = base_output_dir / f"client_{client_id}" / "eval_metrics"
+    client_run_dir.mkdir(parents=True, exist_ok=True)
+    metrics_save_path = str(client_run_dir / f"eval_metrics_{client_id}_round_{round_idx:03d}.json")
+    stats_save_path = None
 
     client = federated_client(
         client_id=client_id,
@@ -397,7 +387,7 @@ def evaluate(msg: Message, context: Context):
         clip_grad=None, 
         use_lora=config.train.use_lora,
         freeze_pretrained=config.model.freeze_pretrained,
-        metrics_save_path=metrics_save_path,
+        metrics_save_path=metrics_save_path, # TODO: maybe delete path parameters because evaluation metrics are only saved in eval function for now
         stats_save_path=stats_save_path,
         eval_dataloader_fn=eval_dataloader_fn,
         config=config,
@@ -406,4 +396,18 @@ def evaluate(msg: Message, context: Context):
     )
 
     # Call the client's evaluate method and send the reply message
-    return client.evaluate(msg, context)
+    reply = client.evaluate(msg, context)
+
+    if metrics_save_path and reply.content is not None:
+        metrics_record = reply.content.metric_records.get("metrics")
+        if metrics_record is not None:
+            client_run_dir.mkdir(parents=True, exist_ok=True)
+            payload = {
+                "client_id": client_id,
+                "round": round_idx,
+                "metrics": dict(metrics_record),
+            }
+            with open(metrics_save_path, "w") as f:
+                json.dump(payload, f, indent=2, default=float)
+
+    return reply
