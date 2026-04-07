@@ -9,7 +9,7 @@ class ClassificationClient(BaseClient):
 
     # El __init__ se hereda completamente de BaseClient para evitar código duplicado.
 
-    def train_local(self, round_idx: int) -> tuple[int, dict]:
+    def train_local(self, round_idx: int) -> int:
         """Implements the concrete local training for Cinema classification."""
         
         self.model.train()

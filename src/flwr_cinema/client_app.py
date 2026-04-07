@@ -322,7 +322,7 @@ def evaluate(msg: Message, context: Context):
         timestamp_time = datetime.now().strftime("%H-%M-%S")
         timestamp_str = f"{timestamp_date}/{timestamp_time}"
     
-    target_column = getattr(config.data, "class_column", "unknown") or getattr(config.data, "regression_column", "unknown")
+    target_column = getattr(config.data, "class_column", None) or getattr(config.data, "regression_column", "unknown")
     base_output_dir = Path("outputs") / (
         f"{config.model_name}_{config.task}/"
         f"{config.mode}/"
