@@ -77,5 +77,8 @@ fraction-evaluate = 0.5
 local-epochs = 1
 learning-rate = 0.1
 batch-size = 32
-hydra_config_dir = "./configs"
-hydra_config_name = ""
+hydra_config_dir = "../../../configs"
+hydra_config_name = "cinema_classification_fed_mypc"
+
+[superlink.local]
+options.num-supernodes = 2

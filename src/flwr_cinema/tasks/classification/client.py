@@ -9,7 +9,7 @@ class ClassificationClient(BaseClient):
 
     # El __init__ se hereda completamente de BaseClient para evitar código duplicado.
 
-    def train_local(self, round_idx: int) -> tuple[int, dict]:
+    def train_local(self, round_idx: int) -> int:
         """Implements the concrete local training for Cinema classification."""
         
         self.model.train()
@@ -33,26 +33,8 @@ class ClassificationClient(BaseClient):
                 wandb_run=None,
                 loss_fn=self.loss_fn,
             )
-
-        # (Opcional) Validación post entrenamiento
-        val_metrics = {}
-        if self.val_loader is not None and self.eval_dataloader_fn is not None:
-            patch_size_dict, spacing_dict = self.get_patch_and_spacing_dicts()
             
-            # logger.info("Evaluating local model after classification training...")
-            self.model.eval()
-            val_metrics = self.eval_dataloader_fn(
-                self.model,
-                self.val_loader,
-                patch_size_dict,
-                spacing_dict,
-                self.amp_dtype,
-                self.device,
-            )
-            # Agregar sufijo para distinguir fácilmente en Flower si es validación
-            val_metrics = {f"val_{k}": v for k, v in val_metrics.items()}
-            
-        return self.n_samples, val_metrics
+        return self.n_samples
 
     def validate_local(self) -> tuple[int, dict]:
         """Implements local validation for Cinema classification."""
