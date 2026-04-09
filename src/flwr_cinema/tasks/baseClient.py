@@ -196,12 +196,14 @@ class BaseClient(ABC):
         """Message handler method for training to be called directly from ClientApp decorators."""
         in_configs = message.content.config_records.get("config", ConfigRecord())
         round_idx = in_configs.get("server-round", 0)
+        use_fedce = in_configs.get("use_fedce", False)
 
         in_params = message.content.array_records.get("model_params", ArrayRecord())
         if in_params:
             model_state_dict = in_params.to_torch_state_dict(keep_input=False)
             self.update_model(model_state_dict)
 
+        # Load local LoRA state dict if using dual LoRA and local LoRA state is available in context (e.g., stored from previous rounds). 
         if self.use_lora and has_dual_lora(self.model):
             if "local_lora" in context.state.array_records:
                 local_lora_record = context.state.array_records["local_lora"]
@@ -211,6 +213,7 @@ class BaseClient(ABC):
         num_samples = self.train_local(round_idx)
 
         updated_state_dict = self.get_model_update()
+
         out_params = ArrayRecord.from_torch_state_dict(updated_state_dict, keep_input=False)
 
         out_record = RecordDict()
@@ -237,6 +240,61 @@ class BaseClient(ABC):
 
         out_metrics = MetricRecord()
         out_metrics["num_samples"] = num_samples
+
+        if use_fedce:
+            # TODO: dual LoRA specific handling may be updated in the future to contemplate local adapters... one problem solved one problem created :(
+            from flwr_cinema.utils.fedCE_utils import calculate_fedCE_raw_rho, calculate_excluded_model, compute_fedCE_gamma_cos
+
+            in_strategy_data = message.content.config_records.get("strategy_data", ConfigRecord())
+            prev_rho = float(in_strategy_data.get("prev_fedce_rho", 0.0))
+            primary_metric_name = in_strategy_data.get("primary_metric_name", None)
+            primary_metric_direction = in_strategy_data.get("primary_metric_direction", "max")
+            in_global_gradient = message.content.array_records.get("global_gradient", ArrayRecord())
+            if in_global_gradient:
+                global_gradient = in_global_gradient.to_torch_state_dict(keep_input=False) # ∇F(w_k) send by server instead of calculated locally to save client resource
+
+                # w_k^-i
+                excluded_model = calculate_excluded_model(
+                    global_weights=model_state_dict,
+                    local_weights=updated_state_dict,
+                    prev_rho=prev_rho)
+                
+                gamma_err = 1e-4 # Default error value if primary metric is not provided or cannot be calculated
+                try:
+                    self.update_model(excluded_model) # Update local model to excluded model to calculate validation metrics for FedCE
+                    
+                    # Γ_k,i(err)
+                    _, metrics = self.validate_local()
+                    primary_metric_value = metrics.get(primary_metric_name, None) if primary_metric_name else None
+                    if primary_metric_value is not None:
+                        if primary_metric_direction == "max":
+                            gamma_err = 1.0 - primary_metric_value
+                        else:
+                            gamma_err = primary_metric_value
+
+                    gamma_err = max(gamma_err, 1e-4) # Avoid zero or negative error
+                finally:
+                    self.update_model(updated_state_dict) # Update back to local model after calculating FedCE rho with excluded model
+
+                # raw_rho = calculate_fedCE_raw_rho(
+                #     global_weights=model_state_dict,
+                #     local_weights=updated_state_dict,
+                #     global_gradient=global_gradient,
+                #     prev_rho=prev_rho,
+                #     gamma_err=err
+                # ) # TODO: Add option for different methods to combine gamma_cos and gamma_err (e.g., sum instead of multiply) readed from config
+
+                gamma_cos = compute_fedCE_gamma_cos(
+                    global_weights=model_state_dict,
+                    local_weights=updated_state_dict,
+                    global_gradient=global_gradient,
+                    prev_rho=prev_rho
+                )
+                
+                out_metrics["fedce_gamma_cos"] = float(gamma_cos)
+                out_metrics["fedce_gamma_err"] = float(gamma_err)
+                # out_metrics["fedce_raw_rho"] = raw_rho
+
         out_record["metrics"] = out_metrics
 
         return Message(content=out_record, reply_to=message)
