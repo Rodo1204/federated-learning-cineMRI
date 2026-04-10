@@ -15,6 +15,8 @@ from flwr.app import (
     MetricRecord
 )
 
+from flwr.common.logger import log
+
 from models.cinema.cinema.device import get_amp_dtype_and_device
 from models.cinema.cinema.optim import GradScaler
 from flwr_cinema.scripts.lora import (
@@ -197,8 +199,10 @@ class BaseClient(ABC):
         in_configs = message.content.config_records.get("config", ConfigRecord())
         round_idx = in_configs.get("server-round", 0)
         use_fedce = in_configs.get("use_fedce", False)
+        model_state_dict = None
 
         in_params = message.content.array_records.get("model_params", ArrayRecord())
+        log(logging.INFO, in_params.keys())
         if in_params:
             model_state_dict = in_params.to_torch_state_dict(keep_input=False)
             self.update_model(model_state_dict)
@@ -214,7 +218,7 @@ class BaseClient(ABC):
 
         updated_state_dict = self.get_model_update()
 
-        out_params = ArrayRecord.from_torch_state_dict(updated_state_dict, keep_input=False)
+        out_params = ArrayRecord.from_torch_state_dict(updated_state_dict, keep_input=False) # reparar esto moviendo los outs bajo el if de fedce 
 
         out_record = RecordDict()
         out_record["model_params"] = out_params
@@ -241,14 +245,16 @@ class BaseClient(ABC):
         out_metrics = MetricRecord()
         out_metrics["num_samples"] = num_samples
 
-        if use_fedce:
+        if use_fedce and round_idx > 1: # For FedCE, we start calculating and sending the additional metrics from the second round since we need at least one previous round to have meaningful information for the calculations
             # TODO: dual LoRA specific handling may be updated in the future to contemplate local adapters... one problem solved one problem created :(
-            from flwr_cinema.utils.fedCE_utils import calculate_fedCE_raw_rho, calculate_excluded_model, compute_fedCE_gamma_cos
+            from flwr_cinema.utils.fedCE_utils import calculate_excluded_model, compute_fedCE_gamma_cos
 
             in_strategy_data = message.content.config_records.get("strategy_data", ConfigRecord())
+            log(logging.INFO, f"Client {self.client_id} - Starting FedCE calculations for round {round_idx} with prev_rho: {in_strategy_data.get('prev_fedce_rho', 'N/A')}")
             prev_rho = float(in_strategy_data.get("prev_fedce_rho", 0.0))
             primary_metric_name = in_strategy_data.get("primary_metric_name", None)
-            primary_metric_direction = in_strategy_data.get("primary_metric_direction", "max")
+            primary_metric_direction = in_strategy_data.get("primary_metric_direction", "maximize")
+
             in_global_gradient = message.content.array_records.get("global_gradient", ArrayRecord())
             if in_global_gradient:
                 global_gradient = in_global_gradient.to_torch_state_dict(keep_input=False) # ∇F(w_k) send by server instead of calculated locally to save client resource
@@ -267,12 +273,12 @@ class BaseClient(ABC):
                     _, metrics = self.validate_local()
                     primary_metric_value = metrics.get(primary_metric_name, None) if primary_metric_name else None
                     if primary_metric_value is not None:
-                        if primary_metric_direction == "max":
+                        if primary_metric_direction == "maximize":
                             gamma_err = 1.0 - primary_metric_value
                         else:
                             gamma_err = primary_metric_value
 
-                    gamma_err = max(gamma_err, 1e-4) # Avoid zero or negative error
+                    gamma_err = max(gamma_err, 1e-4) # Avoid zero or negative error. May need be cliped or transformed in some way depending on the scale of the primary metric.
                 finally:
                     self.update_model(updated_state_dict) # Update back to local model after calculating FedCE rho with excluded model
 
@@ -290,7 +296,7 @@ class BaseClient(ABC):
                     global_gradient=global_gradient,
                     prev_rho=prev_rho
                 )
-                
+                log(logging.INFO, f"Client {self.client_id} - Completed FedCE calculations for round {round_idx} with gamma_cos: {gamma_cos}, gamma_err: {gamma_err}")
                 out_metrics["fedce_gamma_cos"] = float(gamma_cos)
                 out_metrics["fedce_gamma_err"] = float(gamma_err)
                 # out_metrics["fedce_raw_rho"] = raw_rho

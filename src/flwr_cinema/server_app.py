@@ -146,11 +146,23 @@ def get_strategy(
     the Hydra config, including the global model reference for checkpointing.
     """
 
-    fed_strategy = getattr(config.federated, "strategy", "fedavg").lower()
-    if fed_strategy == "fedavg":
+    agg = getattr(config.federated, "aggregation_method", None)
+    agg_name = getattr(agg, "name", "fedavg").lower()
+    agg_config = getattr(agg, "config", None)
+    
+    kwargs = {
+        "arrayrecord_key": "model_params",
+        "weighted_by_key": "num_samples",  # Default to weighting by number of samples for aggregation, can be overridden by specific strategies if needed
+    }
+    if agg_name == "fedavg":
         from flwr_cinema.strategies.fedAvg import FedStrategy
+    elif agg_name == "fedce":
+        from flwr_cinema.strategies.fedCE import FedStrategy
+        kwargs.update({
+            "combination_method": getattr(agg_config, "combination_method", "multiplication"),
+        })
     else:
-        raise ValueError(f"Unknown strategy: {fed_strategy}")
+        raise ValueError(f"Unknown aggregation method: {agg_name}")
 
     # Build the load function with the server-side config
     def _load_arrays_fn(model, arrays):
@@ -169,8 +181,7 @@ def get_strategy(
         aggregate_head=getattr(config.federated, "aggregate_head", True),
         # FedAvg params can be added here as needed, e.g.:
         # fraction_train=config.federated.fraction_train,
-        arrayrecord_key="model_params",
-        weighted_by_key="num_samples", 
+        **kwargs
     )
 
 def save_final_model(
