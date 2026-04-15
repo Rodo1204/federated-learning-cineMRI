@@ -297,7 +297,7 @@ def main(grid: Grid, context: Context) -> None:
     arrays = ArrayRecord.from_torch_state_dict(get_model_params(config, global_model))
 
     strategy = get_strategy(config, global_model, save_dir)
-
+    
     result = strategy.start(
         grid=grid,
         initial_arrays=arrays,

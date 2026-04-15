@@ -1,0 +1,148 @@
+task: classification
+model_name: cinema
+mode: centralized  # federated or centralized
+seed: 0
+grad_ckpt: True
+
+logging:
+  dir: ./outputs/${model_name}_${task}/${mode}/${data.name}/${data.class_column}/client_${federated.client_tag}/lora_${train.use_lora}/seed${seed}/${now:%Y-%m-%d}/${now:%H-%M-%S}
+  wandb:
+    project: null
+    entity: null
+
+# Federated learning configuration
+federated:
+  server_host: "localhost"
+  server_port: 8888
+  n_rounds: 500  # Number of communication rounds
+  local_epochs: 1  # Local epochs per round per client
+  n_clients: 5  # Number of expected clients (ie. acdc + Siemens + GE + Canon + Philips)
+  client_ids: ["acdc", "Siemens"]  # Identifiers for each client
+  # client_ids: ["acdc", "Siemens", "GE", "Canon", "Philips"]  # Identifiers for each client
+  client_tag: "acdc_siemens"
+
+
+# Data configuration
+data:
+  name: acdc_mnms_combined
+  # client_name: acdc  # Client name for centralized training. Options: "all", "acdc", "Siemens", "GE", "Canon", "Philips". Use "all" to train on combined data.
+  class_column: "binary_label"  # Column name in metadata CSV that contains class labels (e.g., "pathology" for multi-class, "binary_label" for binary classification)
+  pathology: ["DCM", "HCM", "MINF", "NOR", "RV"] # Update this list based on which datasets are included (e.g., if using MnMs, include relevant pathologies)  
+  binary_label: ["NOR", "DISEASED"] # For binary classification, specify the two classes (e.g., "abnormal" vs "normal")
+
+  # Datasets to include
+  use_acdc: True
+  use_mnms: False  # Set to True to use original MnMs
+  use_mnms2: False  # Set to True to use original MnMs2
+  use_mnms_merged: True  # Use merged MnMs dataset
+  
+  max_n_samples: -1
+  proportion: 1.0 # Proportion of data to use (for debugging)
+  sax:
+    spacing: [1.0, 1.0, 10.0]
+    patch_size: [192, 192, 16]
+    in_chans: 1
+  
+  # ACDC dataset
+  acdc:
+    dir: ~/.cache/cinema_datasets/acdc/processed
+    lv_ef:
+      mean: 46.466146
+      std: 19.972946
+  
+  # MnMs dataset (original)
+  mnms:
+    dir: ~/.cache/cinema_datasets/mnms/processed
+    vendor_col: "vendor"  # Column name for vendor in metadata CSV
+    lv_ef:
+      mean: 54.673720
+      std: 14.766004
+  
+  # MnMs2 dataset (original)
+  mnms2:
+    dir: ~/.cache/cinema_datasets/mnms2/processed
+    vendor_col: "vendor"  # Column name for vendor in metadata CSV
+    lv_ef:
+      mean: 52.447079
+      std: 14.356394
+  
+  # MnMs Merged dataset (MnMs + MnMs2 combined)
+  mnms_merged:
+    dir: ~/.cache/cinema_datasets/mnms_merged/processed
+    lv_ef: 
+      mean: None # Mean and std will be computed from combined data
+      std: None
+
+  combined:
+    dir: C:\Users\Rodo\.cache\cinema_datasets\acdc_mnms_combined
+
+# LoRA configuration
+lora:
+  rank: 4  # LoRA rank (typically 4-16)
+  alpha: 8  # LoRA alpha scaling (typically 1x-4x of rank)
+  dropout: 0.0  # LoRA dropout
+  target_modules: ["q", "kv"]  # Attention modules to adapt: q, kv, proj
+  blocks_to_lora: null
+
+# Dual LoRA configuration (personalized federated learning)
+# Set dual_lora.enabled=True to use Dual LoRA with global + local adapters
+# Set dual_lora.enabled=False to use standard single LoRA (default)
+# Note: blocks_to_lora is shared with lora.blocks_to_lora (both global and local adapters use the same blocks)
+dual_lora:
+  enabled: False  # Toggle Dual LoRA on/off (True=personalized, False=standard FedAvg)
+  global_rank: 4  # Rank of global adapters (aggregated via FedAvg across clients)
+  local_rank: 4   # Rank of local adapters (client-specific, never aggregated)
+  alpha: 8        # Scaling factor for both global and local adapters
+  dropout: 0.1    # Dropout rate for LoRA path
+  target_modules: ["q", "kv"]  # Which attention projections to adapt
+
+
+transform:
+  prob: 0.5
+  gamma: [0.5, 1.5]
+  scale_range: 0.2
+  sax:
+    rotate_range: [0, 0, 180]
+    translate_range: [60, 60, 0]
+
+train:
+  use_lora: True # Set to True to use LoRA
+  use_class_weighted_loss: False # Set to True to use class-weighted BCE loss for imbalanced classification
+  n_workers: 4
+  clip_grad: 5.0
+  weight_decay: 0 #0.05
+  layer_decay: 0.75
+  betas: [0.9, 0.95]
+  label_smoothing: 0.1
+  lr: 1e-3
+  min_lr: 1e-5
+  n_warmup_epochs: 0
+  n_epochs: 15
+  max_n_ckpts: 2
+  batch_size: 64
+  batch_size_per_device: 4
+  eval_steps: 20  # Evaluate every N optimizer steps (aligned centralized/federated)
+  early_stopping:
+    metric: "roc_auc"
+    mode: "max"
+    patience: 10
+    min_delta: 5e-4
+
+model:
+  name: convvit # convvit, resnet
+  ckpt_path: null
+  freeze_pretrained: False
+  views: sax
+  n_frames: 2
+  out_chans: null
+  convvit:
+    size: base # tiny, base, large, huge
+    enc_patch_size: [4, 4, 1]
+    enc_scale_factor: [2, 2, 1]
+    enc_conv_chans: [64, 128]
+    enc_conv_n_blocks: 2
+    dropout: 0.1
+    drop_path: 0.1
+  resnet:
+    depth: 50 # 10, 18, 34, 50, 101, 152
+    layer_inplanes: [64, 128, 256, 512]

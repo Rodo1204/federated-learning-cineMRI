@@ -10,7 +10,6 @@ from flwr.serverapp.strategy.strategy_utils import aggregate_metricrecords
 from logging import INFO, DEBUG, ERROR
 from flwr.common.logger import log
 
-
 class FedCE(FedAvg):
     """Federated strategy implementing FedCE aggregation, combined with CineMA-specific logic (step-based validation, 
     early stopping, checkpointing).
@@ -106,6 +105,7 @@ class FedCE(FedAvg):
                 client_id = str(message.metadata.src_node_id)
                 message.content.metric_records["metrics"]["fedce_normalized_rho"] = message.content.metric_records["metrics"].get("num_samples", self.first_round_uniform_rho) 
             agg_arrays, agg_metrics = super().aggregate_train(server_round, replies_list)
+
         else: 
             raw_cos, raw_err = {}, {}
             sum_cos, sum_err = 0.0, 0.0
