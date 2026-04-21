@@ -1,44 +1,43 @@
 from collections.abc import Callable
 
-import hydra
 from hydra import compose, initialize_config_dir
 from omegaconf import DictConfig
 import torch
 from torch import nn
 
 from flwr_cinema.scripts.eval_utils import load_metadata
-from flwr_cinema.scripts.lora import apply_dual_lora_to_convvit, apply_lora_to_convvit
+from flwr_cinema.scripts.lora import apply_lora_to_convvit, get_lora_state_dict
 from models.cinema.cinema.train import maybe_reduce_batch_size
 
 from models.cinema.cinema.classification.dataset import get_image_transforms
 from models.cinema.cinema.convvit import ConvViT, load_pretrain_weights, param_groups_lr_decay
 from models.cinema.cinema.device import get_amp_dtype_and_device, print_model_info
 from models.cinema.cinema.log import get_logger, init_wandb
-from models.cinema.cinema.optim import EarlyStopping, GradScaler, save_checkpoint
+from models.cinema.cinema.optim import EarlyStopping, GradScaler
 from models.cinema.cinema.classification.dataset import EndDiastoleEndSystoleDataset
 from models.cinema.cinema.train import maybe_subset_dataset, train_one_epoch
 from models.cinema.cinema.optim import get_n_accum_steps
 
-import logging
 from pathlib import Path
 from torch.utils.data import DataLoader, Dataset, RandomSampler, SequentialSampler
 
 from hydra.core.global_hydra import GlobalHydra
+import json
 
-logger = None
+logger = get_logger(__name__)
 
 
 def get_task_specific_functions(config: DictConfig):
     """Load task-specific loss and eval functions based on config.task.
-    
+
     Args:
         config: Configuration dictionary with config.task (classification or regression).
-        
+
     Returns:
         Tuple of (loss_fn, eval_dataloader_fn) appropriate for the task.
     """
     task = getattr(config, "task", "regression")  # Default to regression for backward compatibility
-    
+
     if task == "classification":
         from models.cinema.cinema.classification.train import (
             classification_loss,
@@ -82,12 +81,12 @@ def load_combined_datasets(config: DictConfig) -> tuple[Dataset, Dataset, dict]:
             logger.warning(f"No training samples found for client: {client_name}")
         if len(val_meta_df) == 0:
             logger.warning(f"No validation samples found for client: {client_name}")
-    # Otherwise, filter by client_ids for multi-client centralized training (if specified)
-    elif hasattr(config.federated, "client_ids") and config.federated.client_ids is not None:
+    # Otherwise, filter by client_ids for multi-client centralized training (if specified) 
+    elif hasattr(config.federated, "client_ids") and config.federated.client_ids is not None: # usar client name como lista
         logger.info(f"Filtering datasets for clients: {config.federated.client_ids}")
         train_meta_df = train_meta_df[train_meta_df["client"].isin(config.federated.client_ids)].reset_index(drop=True)
         val_meta_df = val_meta_df[val_meta_df["client"].isin(config.federated.client_ids)].reset_index(drop=True)
-   
+
     train_meta_df, val_meta_df = maybe_subset_dataset(config, train_meta_df, val_meta_df)
 
     train_transform, val_transform = get_image_transforms(config)
@@ -107,7 +106,7 @@ def load_combined_datasets(config: DictConfig) -> tuple[Dataset, Dataset, dict]:
         views=config.model.views,
         transform=val_transform,
     )
-    
+
     # Print the number of samples in each dataset per class / binary label for verification
     logger.info("Training dataset class distribution:")
     train_class_distribution = train_meta_df[class_col].value_counts().sort_index().to_dict()
@@ -120,24 +119,23 @@ def load_combined_datasets(config: DictConfig) -> tuple[Dataset, Dataset, dict]:
 
 def load_per_client_val_dataloaders(config: DictConfig) -> dict[str, tuple[int, torch.utils.data.DataLoader]]:
     """Load validation dataloaders split by client/dataset for federated-style aggregation.
-    
+
     When training on a specific client (data.client_name != "all"), only loads that client's validation data.
     When training on all clients, loads validation data for each client separately for federated averaging.
-    
+
     Args:
         config: configuration file.
-    
+
     Returns:
         Dictionary mapping client_id to (n_samples, dataloader).
     """
-    from torch.utils.data import DataLoader, SequentialSampler
-    
     data_dir = Path(config.data.combined.dir).expanduser()
+
     class_col = config.data.class_column  # For classification, this is the column with class labels or binary labels
     classes = config.data[class_col]
-    
+
     val_meta_df = load_metadata(data_dir / "val_metadata.csv", metadata_type="val")
-    
+
     # Filter by specific client if specified (for client-specific centralized training)
     client_name = getattr(config.data, "client_name", None)
     if client_name and client_name.lower() != "all":
@@ -147,9 +145,9 @@ def load_per_client_val_dataloaders(config: DictConfig) -> dict[str, tuple[int, 
     elif hasattr(config.federated, "client_ids") and config.federated.client_ids is not None:
         logger.info(f"Filtering validation dataloaders for clients: {config.federated.client_ids}")
         val_meta_df = val_meta_df[val_meta_df["client"].isin(config.federated.client_ids)].reset_index(drop=True)
-    
+
     val_transform = get_image_transforms(config)[1]  # Get val transform
-    
+
     client_dataloaders = {}
     for client_id in val_meta_df["client"].unique():
         client_meta = val_meta_df[val_meta_df["client"] == client_id]
@@ -171,24 +169,25 @@ def load_per_client_val_dataloaders(config: DictConfig) -> dict[str, tuple[int, 
             pin_memory=True,
             drop_last=False,
         )
-           
+
         client_dataloaders[str(client_id)] = (len(val_dataset), val_loader)
-    
+
     logger.info(f"Loaded validation dataloaders for clients: {list(client_dataloaders.keys())}")
     return client_dataloaders
+
 
 def get_model(config: DictConfig) -> torch.nn.Module:
     """Initialize model with optional LoRA (single or dual) using CineMA pattern."""
 
     # Load pretrained model: freeze backbone unless doing full finetuning
     freeze_backbone = config.model.get('freeze_pretrained', True) or config.train.use_lora
-    
+
     logger.info(f"Loading pretrained model (freeze_backbone={freeze_backbone})...")
     model = ConvViT.from_pretrained(config=config, freeze=freeze_backbone)
 
     # Apply LoRA if enabled (using lora.blocks_to_lora for both standard and dual LoRA)
     blocks_to_lora = getattr(config.lora, 'blocks_to_lora', None)
-    
+
     if config.train.use_lora:
         # Check if Dual LoRA is enabled
         logger.info("Applying standard LoRA adapters...")
@@ -209,6 +208,49 @@ def get_model(config: DictConfig) -> torch.nn.Module:
 
     return model
 
+
+def save_checkpoint(
+    ckpt_dir: Path,
+    epoch: int,
+    model: torch.nn.Module,
+    optimizer: torch.optim.Optimizer,
+    loss_scaler: GradScaler,
+    n_samples: int,
+    use_lora: bool = False,
+) -> Path:
+    """Save checkpoint with separate LoRA weights if enabled.
+
+    Args:
+        ckpt_dir: checkpoint directory.
+        epoch: current epoch.
+        model: model to save.
+        optimizer: optimizer.
+        loss_scaler: loss scaler.
+        n_samples: number of samples processed.
+        use_lora: whether LoRA adapters are being used.
+
+    Returns:
+        ckpt_path: checkpoint path.
+    """
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    ckpt_path = ckpt_dir / f"ckpt_epoch_{epoch}.pt"
+
+    to_save = {
+        "model": model.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "epoch": epoch,
+        "scaler": loss_scaler.state_dict(),
+        "n_samples": n_samples,
+    }
+
+    # Save LoRA weights separately if using LoRA
+    if use_lora:
+        to_save["lora_state_dict"] = get_lora_state_dict(model)
+
+    torch.save(to_save, ckpt_path)
+    return ckpt_path
+
+
 def run_train(  # noqa: C901
     config: DictConfig,
     load_dataset: Callable[[DictConfig], tuple[Dataset, Dataset]],
@@ -227,6 +269,7 @@ def run_train(  # noqa: C901
         ],
         dict[str, float],
     ],
+    client_val_dataloaders: dict[str, tuple[int, DataLoader]] | None = None,
 ) -> None:
     """Main function to fine-tune.
 
@@ -236,10 +279,16 @@ def run_train(  # noqa: C901
         get_model_fn: function to initialize the model.
         loss_fn: loss function for segmentation tasks.
         eval_dataloader_fn: evaluation function for segmentation tasks.
+        client_val_dataloaders: optional dict of {client_id: (n_samples, dataloader)}
+            for per-client evaluation with FedAvg aggregation. When provided and
+            eval_mode=="client", evaluation is done per-client and aggregated.
+            When None or eval_mode=="centralized", evaluation uses combined val_dataloader.
     """
+    eval_mode = getattr(config, "eval_mode", "centralized")
+    logger.info(f"Evaluation mode: {eval_mode}")
+
     amp_dtype, device = get_amp_dtype_and_device()
     torch.manual_seed(config.seed)
-
 
     # load dataset
     train_dataset, val_dataset, train_class_distribution = load_dataset(config=config)
@@ -318,7 +367,7 @@ def run_train(  # noqa: C901
         )
     else:
         param_groups = [p for p in model.parameters() if p.requires_grad]  # Only optimize trainable parameters (e.g., LoRA adapters or unfrozen head)
-    optimizer = torch.optim.AdamW(param_groups, lr=config.train.lr, weight_decay=config.train.weight_decay if not config.train.use_lora else 0.0) #, betas=config.train.betas
+    optimizer = torch.optim.AdamW(param_groups, lr=config.train.lr, weight_decay=config.train.weight_decay if not config.train.use_lora else 0.0, betas=config.train.betas)  # 
     loss_scaler = GradScaler()
 
     # train
@@ -334,24 +383,25 @@ def run_train(  # noqa: C901
 
     forward_passes_per_epoch = len(train_dataloader)
     optimizer_steps_per_epoch = forward_passes_per_epoch // n_accum_steps
-    
+
     # Get evaluation interval directly from config (in optimizer steps)
     eval_optimizer_steps = getattr(config.train, "eval_steps", 80)
-    
+
     logger.info(f"Training step metrics:")
-    logger.info(f"  Forward passes per epoch: {forward_passes_per_epoch}")
-    logger.info(f"  Optimizer steps per epoch: {optimizer_steps_per_epoch}")
-    logger.info(f"  Eval steps: {eval_optimizer_steps} optimizer steps")
-    logger.info(f"  Gradient accumulation steps: {n_accum_steps}")
-    logger.info(f"  → Validation triggers at optimizer steps: {eval_optimizer_steps}, {eval_optimizer_steps * 2}, {eval_optimizer_steps * 3}, ...")
+    logger.info(f" Forward passes per epoch: {forward_passes_per_epoch}")
+    logger.info(f" Optimizer steps per epoch: {optimizer_steps_per_epoch}")
+    logger.info(f" Eval steps: {eval_optimizer_steps} optimizer steps")
+    logger.info(f" Gradient accumulation steps: {n_accum_steps}")
+    logger.info(f" → Validation triggers at optimizer steps: {eval_optimizer_steps}, {eval_optimizer_steps * 2}, {eval_optimizer_steps * 3}, ...")
 
     total_optimizer_steps = 0
+    last_eval_step = 0
 
     for epoch in range(config.train.n_epochs):
-        logger.info(f"\n{'='*80}")
+        logger.info(f"\n{'='*70}")
         logger.info(f"Epoch {epoch + 1}/{config.train.n_epochs}")
-        logger.info(f"{'='*80}")
-        optimizer.zero_grad()
+        logger.info(f"{'='*70}")
+        optimizer.zero_grad(set_to_none=True)
         n_samples = train_one_epoch(
             model=model,
             train_dataloader=train_dataloader,
@@ -367,26 +417,97 @@ def run_train(  # noqa: C901
             loss_fn=loss_fn,
         )
         total_optimizer_steps += optimizer_steps_per_epoch
-        if eval_optimizer_steps <= 0 or (total_optimizer_steps % eval_optimizer_steps != 0):
+
+        # Align with federated scheduling: validate once we've advanced at least
+        # eval_steps since the previous validation checkpoint.
+        if eval_optimizer_steps <= 0:
             continue
-        # evaluate model
+        should_validate = (
+            total_optimizer_steps > 0
+            and (total_optimizer_steps - last_eval_step) >= eval_optimizer_steps
+        )
+        if not should_validate:
+            continue
+        last_eval_step = (total_optimizer_steps // eval_optimizer_steps) * eval_optimizer_steps
+
+        # ── evaluate model ──────────────────────────────────────────────────────
         logger.info(f"Start evaluating model at step {total_optimizer_steps}.")
         model.eval()
 
-        val_metrics = eval_dataloader_fn(
-            model,
-            val_dataloader,
-            patch_size_dict,
-            spacing_dict,
-            amp_dtype,
-            device,
-        )
-        val_metrics = {f"{k}": v for k, v in val_metrics.items()}
-        val_metrics["n_samples"] = n_samples
+        # Decide evaluation strategy based on eval_mode
+        use_client_eval = eval_mode == "client" and client_val_dataloaders
+
+        if use_client_eval:
+            # ── per-client evaluation with FedAvg aggregation ───────────────────
+            logger.info("Eval mode 'client': evaluating each client separately then aggregating with FedAvg...")
+            per_client_metrics: dict[str, tuple[int, dict[str, float]]] = {}
+            total_samples = 0
+
+            with torch.no_grad():
+                for client_id, (n_samples_client, val_loader) in client_val_dataloaders.items():
+                    logger.info(f"  Evaluating client: {client_id} ({n_samples_client} samples)")
+                    metrics = eval_dataloader_fn(
+                        model,
+                        val_loader,
+                        patch_size_dict,
+                        spacing_dict,
+                        amp_dtype,
+                        device,
+                    )
+                    per_client_metrics[client_id] = (n_samples_client, metrics)
+                    total_samples += n_samples_client
+
+            # Federated averaging: weighted sum of per-client metrics
+            first_client_metrics = list(per_client_metrics.values())[0][1]
+            val_metrics: dict[str, float] = {}
+            macro_metrics: dict[str, float] = {}
+            for metric_key in first_client_metrics.keys():
+                weighted_sum = sum(
+                    n_samples_client * per_client_metrics[client_id][1][metric_key]
+                    for client_id, (n_samples_client, _) in per_client_metrics.items()
+                )
+                val_metrics[metric_key] = weighted_sum / total_samples
+                # Also compute unweighted (macro) average for post-hoc analysis
+                macro_sum = sum(
+                    per_client_metrics[client_id][1][metric_key]
+                    for client_id, _ in per_client_metrics.items()
+                )
+                macro_metrics[metric_key] = macro_sum / len(per_client_metrics)
+
+            # Log per-client and aggregated metrics
+            logger.info("Per-client validation metrics:")
+            for client_id, (n_samples_client, metrics) in per_client_metrics.items():
+                metrics_str = {k: v if isinstance(v, int) else f"{v:.2e}" for k, v in metrics.items()}
+                logger.info(f"  {client_id} ({n_samples_client} samples): {metrics_str}")
+
+            val_metrics_str = {k: v if isinstance(v, int) else f"{v:.2e}" for k, v in val_metrics.items()}
+            logger.info(f"Aggregated (FedAvg - weighted) validation metrics: {val_metrics_str}.")
+            macro_metrics_str = {k: v if isinstance(v, int) else f"{v:.2e}" for k, v in macro_metrics.items()}
+            logger.info(f"Aggregated (Macro - unweighted) validation metrics: {macro_metrics_str}.")
+
+        else:
+            # ── centralized evaluation (pool completo) ──────────────────────────
+            logger.info("Eval mode 'centralized': evaluating on combined validation pool...")
+            val_metrics = eval_dataloader_fn(
+                model,
+                val_dataloader,
+                patch_size_dict,
+                spacing_dict,
+                amp_dtype,
+                device,
+            )
+
+            val_metrics_str = {k: v if isinstance(v, int) else f"{v:.2e}" for k, v in val_metrics.items()}
+            logger.info(f"Validation metrics: {val_metrics_str}.")
+
+        # Log to wandb
+        # For client eval mode, use total_samples (validation samples); for centralized, use dataset length
+        if eval_mode == "client" and client_val_dataloaders:
+            val_metrics["n_samples"] = total_samples
+        else:
+            val_metrics["n_samples"] = len(val_dataset)
         if wandb_run is not None:
-            wandb_run.log(val_metrics)
-        val_metrics_str = {k: v if isinstance(v, int) else f"{v:.2e}" for k, v in val_metrics.items()}
-        logger.info(f"Validation metrics: {val_metrics_str}.")
+            wandb_run.log({f"val_{k}": v for k, v in val_metrics.items()})
 
         # early stopping update
         early_stop_metric = val_metrics[config.train.early_stopping.metric]
@@ -402,7 +523,9 @@ def run_train(  # noqa: C901
 
         # save model checkpoint
         if early_stop.has_improved or epoch == 0:
-            ckpt_path = save_checkpoint(ckpt_dir, epoch, model, optimizer, loss_scaler, n_samples)
+            ckpt_path = save_checkpoint(
+                ckpt_dir, epoch, model, optimizer, loss_scaler, n_samples, use_lora=config.train.use_lora
+            )
             saved_ckpt_paths.append(ckpt_path)
             logger.info(f"Saved checkpoint of epoch {epoch} at {ckpt_path} after {n_samples} samples.")
             if len(saved_ckpt_paths) > config.train.max_n_ckpts > 0:
@@ -417,7 +540,50 @@ def run_train(  # noqa: C901
                 f"{early_stop.best_metric} and patience {early_stop.patience_count}, breaking."
             )
             break
+
+        # ── JSONL metrics logging for post-hoc analysis ───────────────────────
+        def convert_to_serializable(obj):
+            """Convert numpy/torch types to Python native types for JSON serialization."""
+            if isinstance(obj, dict):
+                return {k: convert_to_serializable(v) for k, v in obj.items()}
+            elif isinstance(obj, (list, tuple)):
+                return [convert_to_serializable(item) for item in obj]
+            elif hasattr(obj, 'item'):  # numpy/torch scalar
+                return obj.item()
+            elif isinstance(obj, (float, int, str, bool, type(None))):
+                return obj
+            else:
+                return str(obj)
+
+        # Prepare metrics record
+        metrics_record = {
+            "epoch": epoch,
+            "optimizer_steps": total_optimizer_steps,
+            "optimizer_steps_per_epoch": optimizer_steps_per_epoch,
+            "forward_passes_per_epoch": forward_passes_per_epoch,
+            "eval_mode": eval_mode,
+            "n_accum_steps": n_accum_steps,
+        }
+
+        # Add relevant metrics based on eval_mode
+        if eval_mode == "client" and client_val_dataloaders:
+            metrics_record["fedavg_metrics"] = val_metrics
+            metrics_record["macro_metrics"] = macro_metrics
+            metrics_record["per_client_metrics"] = {
+                client_id: {"n_samples": n_client, **metrics}
+                for client_id, (n_client, metrics) in per_client_metrics.items()
+            }
+        else:
+            metrics_record["val_metrics"] = val_metrics
+
+        # Save to JSONL file
+        metrics_file = Path(config.logging.dir).expanduser() / "validation_metrics.jsonl"
+        with open(metrics_file, "a") as f:
+            f.write(json.dumps(convert_to_serializable(metrics_record)) + "\n")
+        logger.info(f"Saved metrics to {metrics_file}")
+
     logger.info(f"Last checkpoint is {saved_ckpt_paths[-1]}")
+
 
 def main() -> None:
     """Entrypoint for centralized regression training with federated-style validation.
@@ -428,23 +594,49 @@ def main() -> None:
     global logger
     # Use the root logger after Hydra's logging configuration is set up
     logger = get_logger(__name__)
+    try:
+        GlobalHydra.instance().clear()  # Clear any existing Hydra instance
 
-    GlobalHydra.instance().clear()  # Clear any existing Hydra instance
+        config_dir = Path(__file__).resolve().parents[4] / "configs"
+        with initialize_config_dir(version_base=None, config_dir=str(config_dir)):
+            config = compose(config_name="cinema_classification_centralized")
 
-    config_dir = Path(__file__).resolve().parents[5] / "configs"
-    with initialize_config_dir(version_base=None, config_dir=str(config_dir)):
-        config = compose(config_name="cinema_classification_centralized")
-    
-    task = getattr(config, "task", "classification")
-    logger.info(f"Starting centralized training for task: {task}")
+        # Save configuration to output directory for reproducibility
+        from omegaconf import OmegaConf
+        config_output_dir = Path(config.logging.dir).expanduser()
+        config_output_dir.mkdir(parents=True, exist_ok=True)
+        config_file = config_output_dir / "config.yaml"
+        with open(config_file, "w") as f:
+            OmegaConf.save(config, f)
+        logger.info(f"Saved configuration to {config_file}")
 
-    loss_fn, eval_dataloader_fn = get_task_specific_functions(config)
-    
+        task = getattr(config, "task", "classification")
+        eval_mode = getattr(config, "eval_mode", "centralized")
+        logger.info(f"Starting centralized training for task: {task}")
+        logger.info(f"Eval mode: {eval_mode}")
 
-    run_train(
-        config=config,
-        load_dataset=load_combined_datasets,
-        get_model_fn=get_model,
-        loss_fn=loss_fn,
-        eval_dataloader_fn=eval_dataloader_fn
-    )
+        loss_fn, eval_dataloader_fn = get_task_specific_functions(config)
+
+        # Load per-client val dataloaders for client-based evaluation
+        client_val_dataloaders = None
+        if eval_mode == "client":
+            logger.info("Loading per-client validation dataloaders for FedAvg aggregation...")
+            client_val_dataloaders = load_per_client_val_dataloaders(config)
+
+        run_train(
+            config=config,
+            load_dataset=load_combined_datasets,
+            get_model_fn=get_model,
+            loss_fn=loss_fn,
+            eval_dataloader_fn=eval_dataloader_fn,
+            client_val_dataloaders=client_val_dataloaders,
+        )
+    finally:
+        import gc
+        gc.collect()
+        torch.cuda.empty_cache()
+        logger.info("Finished centralized training script, cleaned up resources.")
+
+
+if __name__ == "__main__":
+    main()
