@@ -97,43 +97,24 @@ def write_sanitized_nifti(src_path: Path, dst_path: Path, is_label: bool) -> Non
     sitk.WriteImage(out_img, str(dst_path), useCompression=True)
 
 
-def build_patient_signature(image_paths: list[Path]) -> str:
-    """Build a stable signature from ED/ES image and mask voxel content.
-
-    The signature ignores filenames and container/header differences so the
-    same patient can match across MnMs1 and MnMs2 even when files were
-    re-encoded or renamed.
-    """
-    hasher = hashlib.sha1()
-    for image_path in image_paths:
-        volume = None
-
-        # nibabel is usually more permissive than ITK for malformed direction metadata.
-        try:
-            import nibabel as nib
-
-            volume = np.asanyarray(nib.load(str(image_path)).dataobj)
-        except Exception:
-            volume = None
-
-        if volume is None:
-            try:
-                volume = sitk.GetArrayFromImage(sitk.ReadImage(str(image_path)))
-            except Exception:
-                # Last-resort fallback for unreadable files.
-                with image_path.open("rb") as f:
-                    volume = f.read()
-
-        if isinstance(volume, bytes):
-            hasher.update(volume)
-            continue
-
-        volume = ensure_scalar_3d(volume, src_path=image_path)
-
-        hasher.update(str(volume.shape).encode("utf-8"))
-        hasher.update(str(volume.dtype).encode("utf-8"))
-        hasher.update(np.ascontiguousarray(volume).tobytes())
-    return hasher.hexdigest()
+def load_reference_mapping(ref_csv_path: Path | None) -> tuple[dict[str, int], dict[str, int]]:
+    """Load ID mappings from reference CSV if provided."""
+    if not ref_csv_path or not ref_csv_path.exists():
+        logger.warning("No reference CSV provided or found. Overlaps will not be detected!")
+        return {}, {}
+    
+    df = pd.read_csv(ref_csv_path, low_memory=False)
+    mm1_to_mm2 = {}
+    mm1_to_merging_code = {}
+    for _, row in df.iterrows():
+        if pd.notna(row.get("ID_MM1")):
+            pid = str(row["ID_MM1"])
+            mm1_to_merging_code[pid] = int(row["MERGING_CODE"])
+            if pd.notna(row.get("ID_MM2")):
+                mm1_to_mm2[pid] = int(row["ID_MM2"])
+    
+    logger.info("Loaded %d overlap mappings and %d total mappings from reference CSV.", len(mm1_to_mm2), len(mm1_to_merging_code))
+    return mm1_to_mm2, mm1_to_merging_code
 
 
 def first_non_empty(values: pd.Series):
@@ -161,11 +142,6 @@ def consolidate_by_merging_code(df: pd.DataFrame) -> pd.DataFrame:
                 continue
             merged_row[col] = first_non_empty(group[col])
 
-        if "Source" in group.columns:
-            unique_sources = sorted([str(s) for s in group["Source"].dropna().unique() if str(s).strip()])
-            if len(unique_sources) > 1:
-                merged_row["Source"] = "+".join(unique_sources)
-
         grouped_rows.append(merged_row)
 
     return pd.DataFrame(grouped_rows)
@@ -180,33 +156,65 @@ def extract_and_save_frame(image_4d_path: Path, frame_index: int, out_path: Path
         out_path: Output path for the 3D NIfTI.
         is_label: If True, read as UInt8 (for segmentation masks).
     """
-    if is_label:
-        img = sitk.ReadImage(str(image_4d_path), outputPixelType=sitk.sitkUInt8)
-    else:
-        img = sitk.ReadImage(str(image_4d_path))
-    frame = img[:, :, :, frame_index]
+    try:
+        if is_label:
+            img = sitk.ReadImage(str(image_4d_path), outputPixelType=sitk.sitkUInt8)
+        else:
+            img = sitk.ReadImage(str(image_4d_path))
+        
+        # the 4th dimension in SimpleITK is usually the last one [x, y, z, t]
+        frame = img[:, :, :, frame_index]
 
-    # Rewrite frame with sanitized values and orthonormal direction.
-    frame_arr = sitk.GetArrayFromImage(frame)
+        # Rewrite frame with sanitized values and orthonormal direction.
+        frame_arr = sitk.GetArrayFromImage(frame)
+        spacing = img.GetSpacing()[:3]
+        origin = img.GetOrigin()[:3]
+    except Exception as e:
+        logger.warning(f"MnMs1: SimpleITK read failed for {image_4d_path.name} ({e}). Falling back to nibabel.")
+        import nibabel as nib
+        nib_img = nib.load(str(image_4d_path))
+        # nibabel shape is (x, y, z, t)
+        data = np.asanyarray(nib_img.dataobj)
+        frame_arr = data[..., frame_index]
+        # nibabel array shape is (x,y,z), but sitk expects (z,y,x), so we transpose
+        frame_arr = frame_arr.T
+        
+        # Get spacing from header zooms
+        zooms = nib_img.header.get_zooms()
+        spacing = tuple(float(s) for s in zooms[:3])
+        
+        # NIfTI affine gives translation (origin) in last column
+        affine = nib_img.affine
+        # Convert RAS (nibabel) to LPS (ITK) for origin
+        origin = (float(-affine[0,3]), float(-affine[1,3]), float(affine[2,3]))
+
     frame_arr = ensure_scalar_3d(frame_arr, src_path=image_4d_path)
     frame_arr = sanitize_volume_array(frame_arr, is_label=is_label)
     out_img = sitk.GetImageFromArray(frame_arr)
-    out_img.SetSpacing(tuple(float(s) for s in frame.GetSpacing()[:3]))
-    out_img.SetOrigin(tuple(float(o) for o in frame.GetOrigin()[:3]))
+    out_img.SetSpacing(tuple(float(s) for s in spacing))
+    out_img.SetOrigin(tuple(float(o) for o in origin))
     out_img.SetDirection((1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0))
     sitk.WriteImage(out_img, str(out_path), useCompression=True)
 
 
-def prepare_mnms1(mnms1_dir: Path, out_dir: Path, start_code: int) -> tuple:
+def prepare_mnms1(
+    mnms1_dir: Path,
+    out_dir: Path,
+    start_code: int,
+    mm1_to_mm2: dict[str, int],
+    mm1_to_merging_code: dict[str, int],
+) -> tuple:
     """Process MnMs1 dataset: extract ED/ES frames from 4D files.
 
     Args:
         mnms1_dir: Path to MnMs1 OpenDataset directory.
         out_dir: Output MM_merge directory.
         start_code: Starting MERGING_CODE integer.
+        mm1_to_mm2: Mapping of ID_MM1 to ID_MM2 for detecting overlaps.
+        mm1_to_merging_code: Mapping of ID_MM1 to exact MERGING_CODE to preserve order.
 
     Returns:
-        Tuple of (DataFrame with records, next available code, signature map).
+        Tuple of (DataFrame with records, next available code).
     """
     logger.info("Processing MnMs1 dataset...")
 
@@ -222,24 +230,24 @@ def prepare_mnms1(mnms1_dir: Path, out_dir: Path, start_code: int) -> tuple:
 
     records = []
     current_code = start_code
-    signature_to_code = {}
 
-    # Search for patient dirs across all splits
-    split_dirs = {
-        "Training/Labeled": "train",
-        "Validation": "val",
-        "Testing": "test",
-    }
+    # Ordered by desired output sequence for MnMs1-only patients
+    split_order = [
+        ("Validation", "val"),
+        ("Training/Labeled", "train"),
+        ("Training/Unlabeled", "train"),
+        ("Testing", "test"),
+    ]
 
-    # Build a map: pid -> (patient_dir, split)
+    # Build a map: pid -> (patient_dir, split_name, order_idx)
     pid_to_info = {}
-    for split_subdir, split_name in split_dirs.items():
+    for order_idx, (split_subdir, split_name) in enumerate(split_order):
         split_path = mnms1_dir / split_subdir
         if not split_path.exists():
             continue
         for patient_dir in split_path.iterdir():
             if patient_dir.is_dir():
-                pid_to_info[patient_dir.name] = (patient_dir, split_name)
+                pid_to_info[patient_dir.name] = (patient_dir, split_name, order_idx)
 
     for _, row in tqdm(df.iterrows(), total=len(df), desc="MnMs1"):
         pid = str(row["External code"])
@@ -247,7 +255,7 @@ def prepare_mnms1(mnms1_dir: Path, out_dir: Path, start_code: int) -> tuple:
             logger.warning(f"MnMs1: Patient {pid} directory not found. Skipping.")
             continue
 
-        patient_dir, original_split = pid_to_info[pid]
+        patient_dir, _split_name, _order_idx = pid_to_info[pid]
         sa_path = patient_dir / f"{pid}_sa.nii.gz"
         sa_gt_path = patient_dir / f"{pid}_sa_gt.nii.gz"
 
@@ -255,10 +263,39 @@ def prepare_mnms1(mnms1_dir: Path, out_dir: Path, start_code: int) -> tuple:
             logger.warning(f"MnMs1: Missing NIfTI for {pid}. Skipping.")
             continue
 
+        if pid in mm1_to_mm2:
+            matched_code = mm1_to_merging_code.get(pid, mm1_to_mm2[pid])
+            logger.info(
+                "MnMs1: Patient %s matches existing MERGING_CODE=%s (MnMs2 overlap). Merging metadata.",
+                pid, matched_code,
+            )
+            records.append({
+                "MERGING_CODE": matched_code,
+                "ID_MM1": pid,
+                "ID_MM2": np.nan,
+                "Vendor1": row.get("VendorName", row.get("Vendor", "")),
+                "Vendor2": np.nan,
+                "Scanner": np.nan,
+                "Field": np.nan,
+                "Pathology1": row.get("Pathology", ""),
+                "Pathology2": np.nan,
+                "Age": row.get("Age", np.nan),
+                "Sex": row.get("Sex", ""),
+                "Height": row.get("Height", np.nan),
+                "Weight": row.get("Weight", np.nan),
+            })
+            continue
+
         ed_index = int(row["ED"])
         es_index = int(row["ES"])
 
-        new_pid = f"{current_code:03d}"
+        if pid in mm1_to_merging_code:
+            this_code = mm1_to_merging_code[pid]
+        else:
+            this_code = current_code
+            current_code += 1
+
+        new_pid = f"{this_code:03d}"
         new_dir = out_dir / new_pid
         new_dir.mkdir(parents=True, exist_ok=True)
 
@@ -269,55 +306,49 @@ def prepare_mnms1(mnms1_dir: Path, out_dir: Path, start_code: int) -> tuple:
             extract_and_save_frame(sa_path, es_index, new_dir / f"{new_pid}_ES.nii.gz", is_label=False)
             extract_and_save_frame(sa_gt_path, es_index, new_dir / f"{new_pid}_ES_gt.nii.gz", is_label=True)
 
-            signature = build_patient_signature([
-                new_dir / f"{new_pid}_ED.nii.gz",
-                new_dir / f"{new_pid}_ED_gt.nii.gz",
-                new_dir / f"{new_pid}_ES.nii.gz",
-                new_dir / f"{new_pid}_ES_gt.nii.gz",
-            ])
+            # Validate GT has actual segmentation (not just background)
+            ed_gt_arr = sitk.GetArrayFromImage(
+                sitk.ReadImage(str(new_dir / f"{new_pid}_ED_gt.nii.gz"), sitk.sitkUInt8)
+            )
+            es_gt_arr = sitk.GetArrayFromImage(
+                sitk.ReadImage(str(new_dir / f"{new_pid}_ES_gt.nii.gz"), sitk.sitkUInt8)
+            )
+            if not (ed_gt_arr > 0).any() and not (es_gt_arr > 0).any():
+                logger.warning(
+                    "MnMs1: Patient %s has empty GT (ED+ES all background). Skipping.", pid,
+                )
+                shutil.rmtree(new_dir, ignore_errors=True)
+                continue
+
         except Exception as e:
             logger.warning(f"MnMs1: Error extracting frames for {pid}: {e}. Skipping.")
             shutil.rmtree(new_dir, ignore_errors=True)
             continue
 
-        if signature in signature_to_code:
-            logger.warning(
-                "MnMs1: Duplicate image signature detected for patient %s. Keeping first occurrence with MERGING_CODE=%s.",
-                pid,
-                signature_to_code[signature],
-            )
-            shutil.rmtree(new_dir, ignore_errors=True)
-            continue
-
-        signature_to_code[signature] = current_code
-
         records.append({
-            "MERGING_CODE": current_code,
+            "MERGING_CODE": this_code,
             "ID_MM1": pid,
             "ID_MM2": np.nan,
             "Vendor1": row.get("VendorName", row.get("Vendor", "")),
             "Vendor2": np.nan,
+            "Scanner": np.nan,
+            "Field": np.nan,
             "Pathology1": row.get("Pathology", ""),
             "Pathology2": np.nan,
             "Age": row.get("Age", np.nan),
             "Sex": row.get("Sex", ""),
             "Height": row.get("Height", np.nan),
             "Weight": row.get("Weight", np.nan),
-            "Centre": row.get("Centre", ""),
-            "Original_Split": original_split,
-            "Source": "MnMs1",
         })
-        current_code += 1
 
-    logger.info(f"MnMs1: Processed {len(records)} patients (codes {start_code}-{current_code - 1})")
-    return pd.DataFrame(records), current_code, signature_to_code
+    logger.info(f"MnMs1: Processed {len(records)} patients")
+    return pd.DataFrame(records), current_code
 
 
 def prepare_mnms2(
     mnms2_dir: Path,
     out_dir: Path,
     start_code: int,
-    signature_to_code: dict[str, int] | None = None,
 ) -> tuple:
     """Process MnMs2 dataset: copy 3D ED/ES files with new IDs.
 
@@ -327,7 +358,7 @@ def prepare_mnms2(
         start_code: Starting MERGING_CODE integer.
 
     Returns:
-        Tuple of (DataFrame with records, next available code, updated signature map).
+        Tuple of (DataFrame with records, next available code).
     """
     logger.info("Processing MnMs2 dataset...")
 
@@ -345,8 +376,6 @@ def prepare_mnms2(
 
     records = []
     current_code = start_code
-    if signature_to_code is None:
-        signature_to_code = {}
 
     for _, row in tqdm(df.iterrows(), total=len(df), desc="MnMs2"):
         pid_int = int(row["SUBJECT_CODE"])
@@ -376,42 +405,6 @@ def prepare_mnms2(
         if not all_found:
             continue
 
-        signature = build_patient_signature([patient_dir / name for name in required_files])
-
-        # Determine original split from MnMs2 convention
-        if pid_int <= 160:
-            original_split = "train"
-        elif pid_int <= 200:
-            original_split = "val"
-        else:
-            original_split = "test"
-
-        if signature in signature_to_code:
-            matched_code = signature_to_code[signature]
-            logger.info(
-                "MnMs2: Found duplicate with existing MERGING_CODE=%s for SUBJECT_CODE=%s. Merging metadata.",
-                matched_code,
-                pid_old,
-            )
-            records.append({
-                "MERGING_CODE": matched_code,
-                "ID_MM1": np.nan,
-                "ID_MM2": pid_int,
-                "Vendor1": np.nan,
-                "Vendor2": row.get("Vendor", row.get("VENDOR", "")),
-                "Pathology1": np.nan,
-                "Pathology2": row.get("DISEASE", ""),
-                "Age": np.nan,
-                "Sex": "",
-                "Height": np.nan,
-                "Weight": np.nan,
-                "Scanner": row.get("SCANNER", ""),
-                "Field": row.get("FIELD", np.nan),
-                "Original_Split": original_split,
-                "Source": "MnMs2",
-            })
-            continue
-
         new_pid = f"{current_code:03d}"
         new_dir = out_dir / new_pid
         new_dir.mkdir(parents=True, exist_ok=True)
@@ -432,22 +425,19 @@ def prepare_mnms2(
             "ID_MM2": pid_int,
             "Vendor1": np.nan,
             "Vendor2": row.get("Vendor", row.get("VENDOR", "")),
+            "Scanner": row.get("SCANNER", ""),
+            "Field": row.get("FIELD", np.nan),
             "Pathology1": np.nan,
             "Pathology2": row.get("DISEASE", ""),
             "Age": np.nan,
             "Sex": "",
             "Height": np.nan,
             "Weight": np.nan,
-            "Scanner": row.get("SCANNER", ""),
-            "Field": row.get("FIELD", np.nan),
-            "Original_Split": original_split,
-            "Source": "MnMs2",
         })
-        signature_to_code[signature] = current_code
         current_code += 1
 
     logger.info(f"MnMs2: Processed {len(records)} patients (codes {start_code}-{current_code - 1})")
-    return pd.DataFrame(records), current_code, signature_to_code
+    return pd.DataFrame(records), current_code
 
 
 def main():
@@ -463,22 +453,31 @@ def main():
         help="Path to raw MnMs2 directory (contains dataset/ folder and dataset_information.csv)",
     )
     parser.add_argument(
-        "--out_dir", type=Path, required=True,
+        "--out_dir",
+        type=Path,
+        default=Path("docs/mnms_merged"),
         help="Output MM_merge directory",
+    )
+    parser.add_argument(
+        "--reference_csv", type=Path, default=None,
+        help="Path to reference CSV (e.g., docs/20241305_dataset_information_joan.csv) to load ID mappings.",
     )
     args = parser.parse_args()
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
+    
+    mm1_to_mm2, mm1_to_merging_code = load_reference_mapping(args.reference_csv)
 
-    # Process MnMs1 first (codes starting from 1)
-    df1, next_code, signature_to_code = prepare_mnms1(args.mnms1_dir, args.out_dir, start_code=1)
+    # Process MnMs2 first (codes 1..360 = SUBJECT_CODE)
+    df2, next_code = prepare_mnms2(
+        args.mnms2_dir, args.out_dir, start_code=1,
+    )
 
-    # Process MnMs2 (codes continue from where MnMs1 left off)
-    df2, _, _ = prepare_mnms2(
-        args.mnms2_dir,
-        args.out_dir,
-        start_code=next_code,
-        signature_to_code=signature_to_code,
+    # Process MnMs1 (codes continue from 361+)
+    df1, _ = prepare_mnms1(
+        args.mnms1_dir, args.out_dir, start_code=next_code,
+        mm1_to_mm2=mm1_to_mm2,
+        mm1_to_merging_code=mm1_to_merging_code,
     )
 
     # Combine and save master CSV
@@ -490,10 +489,12 @@ def main():
     merged_df = pd.concat(all_dfs, ignore_index=True)
     merged_df = consolidate_by_merging_code(merged_df)
 
-    # Reorder columns
-    cols = merged_df.columns.tolist()
-    cols.insert(0, cols.pop(cols.index("MERGING_CODE")))
-    merged_df = merged_df[cols]
+    col_order = [
+        "MERGING_CODE", "ID_MM1", "ID_MM2", "Vendor1", "Vendor2",
+        "Scanner", "Field", "Pathology1", "Pathology2",
+        "Age", "Sex", "Height", "Weight",
+    ]
+    merged_df = merged_df[col_order]
 
     output_csv = args.out_dir / "20241305_dataset_information.csv"
     merged_df.to_csv(output_csv, index=False)

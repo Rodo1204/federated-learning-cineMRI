@@ -242,17 +242,48 @@ def save_final_model(
     ckpt_path = save_dir / f"global_model_final_round_{n_rounds}.pt"
     torch.save(checkpoint, ckpt_path)
 
+    train_metrics = {
+        str(k): dict(v) for k, v in result.train_metrics_clientapp.items()
+    }
+    evaluate_metrics = {
+        str(k): dict(v) for k, v in result.evaluate_metrics_clientapp.items()
+    }
+    evaluate_metrics_serverapp = {
+        str(k): dict(v) for k, v in result.evaluate_metrics_serverapp.items()
+    }
+    round_metadata = getattr(strategy, "round_metadata", {}) if strategy is not None else {}
+
+    all_rounds = sorted(
+        {
+            *train_metrics.keys(),
+            *evaluate_metrics.keys(),
+            *evaluate_metrics_serverapp.keys(),
+            *round_metadata.keys(),
+        },
+        key=lambda round_key: int(round_key),
+    )
+
+    rounds = []
+    for round_key in all_rounds:
+        metadata = round_metadata.get(round_key, {})
+        rounds.append({
+            "round": int(round_key),
+            "validation_round": round_key in evaluate_metrics or round_key in evaluate_metrics_serverapp,
+            "participants": metadata.get("participants", []),
+            "client_steps": metadata.get("client_steps", {}),
+            "total_optimizer_steps_avg": metadata.get("total_optimizer_steps"),
+            "train_metrics": train_metrics.get(round_key, {}),
+            "evaluate_metrics": evaluate_metrics.get(round_key, {}),
+            "evaluate_metrics_serverapp": evaluate_metrics_serverapp.get(round_key, {}),
+        })
+
     # Save metrics history as JSON for analysis 
     metrics_history = {
-        "train_metrics": {
-            str(k): dict(v) for k, v in result.train_metrics_clientapp.items()
-        },
-        "evaluate_metrics": {
-            str(k): dict(v) for k, v in result.evaluate_metrics_clientapp.items()
-        },
-        "evaluate_metrics_serverapp": {
-            str(k): dict(v) for k, v in result.evaluate_metrics_serverapp.items()
-        },
+        # "train_metrics": train_metrics, # Optional separated data but can be redundant with the rounds structure 
+        # "evaluate_metrics": evaluate_metrics,
+        # "evaluate_metrics_serverapp": evaluate_metrics_serverapp,
+        # "round_metadata": round_metadata, 
+        "rounds": rounds,
     }
     metrics_path = save_dir / "metrics_history.json"
     with open(metrics_path, "w") as f:

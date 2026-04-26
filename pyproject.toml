@@ -64,6 +64,7 @@ dev = [
 [project.scripts]
 centralized_train = "flwr_cinema.centralized.combined.train:main"
 centralized_eval = "flwr_cinema.centralized.combined.evaluate:main"
+federated_eval = "flwr_cinema.federated.evaluate:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/flwr_cinema"]

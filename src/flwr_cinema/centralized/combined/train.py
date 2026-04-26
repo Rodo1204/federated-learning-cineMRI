@@ -1,3 +1,4 @@
+import argparse
 from collections.abc import Callable
 
 from hydra import compose, initialize_config_dir
@@ -366,8 +367,22 @@ def run_train(  # noqa: C901
             layer_decay=config.train.layer_decay,
         )
     else:
-        param_groups = [p for p in model.parameters() if p.requires_grad]  # Only optimize trainable parameters (e.g., LoRA adapters or unfrozen head)
-    optimizer = torch.optim.AdamW(param_groups, lr=config.train.lr, weight_decay=config.train.weight_decay if not config.train.use_lora else 0.0, betas=config.train.betas)  # 
+        lora_params = []
+        head_and_other_params = []
+        for name, param in model.named_parameters():
+            if not param.requires_grad:
+                continue
+            if "lora" in name.lower():
+                lora_params.append(param)
+            else:
+                head_and_other_params.append(param)
+
+        param_groups = [
+            {"params": head_and_other_params, "weight_decay": config.train.weight_decay},
+            {"params": lora_params, "weight_decay": 0.0},
+        ]
+
+    optimizer = torch.optim.AdamW(param_groups, lr=config.train.lr, betas=config.train.betas)
     loss_scaler = GradScaler()
 
     # train
@@ -565,16 +580,19 @@ def run_train(  # noqa: C901
             "n_accum_steps": n_accum_steps,
         }
 
-        # Add relevant metrics based on eval_mode
+        # Canonical validation contract:
+        # - primary_validation_metrics always stores the metrics used for early stopping/checkpointing
+        # - validation_aggregation is informational metadata about how primary_validation_metrics was produced
+        metrics_record["primary_validation_metrics"] = val_metrics
         if eval_mode == "client" and client_val_dataloaders:
-            metrics_record["fedavg_metrics"] = val_metrics
+            metrics_record["validation_aggregation"] = "weighted - fedavg"
             metrics_record["macro_metrics"] = macro_metrics
             metrics_record["per_client_metrics"] = {
                 client_id: {"n_samples": n_client, **metrics}
                 for client_id, (n_client, metrics) in per_client_metrics.items()
             }
         else:
-            metrics_record["val_metrics"] = val_metrics
+            metrics_record["validation_aggregation"] = "pooled"
 
         # Save to JSONL file
         metrics_file = Path(config.logging.dir).expanduser() / "validation_metrics.jsonl"
@@ -594,12 +612,26 @@ def main() -> None:
     global logger
     # Use the root logger after Hydra's logging configuration is set up
     logger = get_logger(__name__)
+
+    parser = argparse.ArgumentParser(
+        description="Centralized training script for CineMRI classification/regression with federated-style or centralized-style validation. "
+    )
+
+    parser.add_argument(
+        "--config",
+        type=str,
+        default="cinema_classification_centralized",
+        help="Name of the configuration file to use"
+    )
+
+    args = parser.parse_args()
+
     try:
         GlobalHydra.instance().clear()  # Clear any existing Hydra instance
 
         config_dir = Path(__file__).resolve().parents[4] / "configs"
         with initialize_config_dir(version_base=None, config_dir=str(config_dir)):
-            config = compose(config_name="cinema_classification_centralized")
+            config = compose(config_name=args.config)
 
         # Save configuration to output directory for reproducibility
         from omegaconf import OmegaConf

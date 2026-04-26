@@ -207,14 +207,17 @@ def evaluate_centralized(
     # get_model() already applies LoRA if use_lora=True (see train.py get_model function)
     model = get_model(cfg)
 
-    # Detect if checkpoint has LoRA weights for warning
+    # Detect if checkpoint has LoRA weights
     checkpoint_model_state = checkpoint.get("model", checkpoint)
-    has_lora_in_checkpoint = any("lora" in key.lower() for key in checkpoint_model_state.keys())
+    has_lora_in_checkpoint = (
+        "lora_state_dict" in checkpoint
+        or any("lora" in key.lower() for key in checkpoint_model_state.keys())
+    )
 
     if not use_lora and has_lora_in_checkpoint:
-        logger.warning(
-            "Checkpoint contains LoRA weights but config.train.use_lora=False, "
-            "LoRA weights may not load correctly"
+        raise ValueError(
+            "Checkpoint contains LoRA weights but config.train.use_lora=False. "
+            "Enable LoRA in config (train.use_lora=true) or evaluate with a non-LoRA checkpoint."
         )
 
     # Load checkpoint (handles both centralized and federated formats)

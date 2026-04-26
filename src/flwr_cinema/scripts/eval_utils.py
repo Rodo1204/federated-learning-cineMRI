@@ -4,22 +4,30 @@ from __future__ import annotations
 
 import json
 import logging
+from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, Callable
 
 import numpy as np
 import pandas as pd
 import torch
 from torch.utils.data import DataLoader, SequentialSampler
 
-from models.cinema.cinema.classification.dataset import (
-    get_image_transforms,
-    EndDiastoleEndSystoleDataset as ClassificationDataset,
-)
-from models.cinema.cinema.classification.train import get_classification_or_regression_model
-from models.cinema.cinema.device import get_amp_dtype_and_device
-from models.cinema.cinema.regression.dataset import EndDiastoleEndSystoleDataset as RegressionDataset
-from models.cinema.cinema.regression.train import regression_eval, regression_metrics
+try:  # pragma: no cover - import availability depends on local environment
+    from models.cinema.cinema.classification.dataset import (
+        get_image_transforms,
+        EndDiastoleEndSystoleDataset as ClassificationDataset,
+    )
+    from models.cinema.cinema.device import get_amp_dtype_and_device
+    from models.cinema.cinema.regression.dataset import EndDiastoleEndSystoleDataset as RegressionDataset
+    from models.cinema.cinema.regression.train import regression_eval, regression_metrics
+except ModuleNotFoundError:  # pragma: no cover - exercised in lightweight test envs
+    get_image_transforms = None
+    get_amp_dtype_and_device = None
+    ClassificationDataset = Any
+    RegressionDataset = Any
+    regression_eval = None
+    regression_metrics = None
 
 if TYPE_CHECKING:
     from omegaconf import DictConfig
@@ -93,181 +101,451 @@ def resolve_data_dir_with_fallback(data_dir: Path) -> Path:
 
 
 def find_best_checkpoint(checkpoint_dir: Path) -> tuple[Path, int | None]:
-    """Find the best checkpoint by validation metric in a centralized checkpoint directory.
-    
-    Searches for .pt files and looks for validation metrics in:
-    1. Nearby config.yaml or hydra config
-    2. Checkpoint metadata files
-    3. Stored JSON logs
-    
+    """Find the best checkpoint by canonical validation metric history.
+
+    Uses nearby validation history (validation_metrics.jsonl) and early-stopping
+    config (config.yaml / .hydra/config.yaml). Exact mapping reads only
+    `primary_validation_metrics`. Legacy histories without this field are treated
+    as not reliably mappable and trigger heuristic fallback.
+
     Args:
         checkpoint_dir: Directory containing checkpoints.
-    
+
     Returns:
-        Path to best checkpoint and its epoch number (if found), or last checkpoint if no metrics.
+        Path to best checkpoint and its epoch number (if found).
     """
-    checkpoint_dir = Path(checkpoint_dir)
-    
-    # Search for all .pt files in checkpoint directory and subdirectories
-    pt_files = sorted(checkpoint_dir.glob("**/*.pt"))
-    if not pt_files:
-        raise FileNotFoundError(f"No .pt checkpoint files found in {checkpoint_dir}")
-    
-    # Try to find validation metrics from nearby config or logs
-    best_ckpt = None
-    best_epoch = None
-    best_metric = float('inf')
-    
-    # Look for config.yaml to find best checkpoint info
-    config_paths = list(checkpoint_dir.parent.glob("config.yaml")) + \
-                   list(checkpoint_dir.parent.parent.glob("config.yaml")) + \
-                   list(checkpoint_dir.parent.parent.parent.glob("config.yaml"))
-    
-    # Look for validation log file
-    metrics_log = checkpoint_dir.parent / "metrics_log.json"
-    if not metrics_log.exists():
-        metrics_log = checkpoint_dir.parent.parent / "metrics_log.json"
-    if not metrics_log.exists():
-        metrics_log = checkpoint_dir.parent.parent.parent / "metrics_log.json"
-    
-    if metrics_log.exists():
-        try:
-            with open(metrics_log) as f:
-                metrics_data = json.load(f)
-                for entry in metrics_data:
-                    if "val_mae" in entry and entry["val_mae"] < best_metric:
-                        best_metric = entry["val_mae"]
-                        best_epoch = entry.get("epoch")
-                        # Find corresponding checkpoint
-                        if best_epoch is not None:
-                            epoch_ckpts = [p for p in pt_files if f"epoch_{best_epoch}" in p.name or f"_{best_epoch}" in p.name]
-                            if epoch_ckpts:
-                                best_ckpt = epoch_ckpts[0]
-        except Exception as e:
-            logger.warning(f"Failed to read metrics log: {e}")
-    
-    # If no best checkpoint found, use model_best.pt if it exists, else latest
-    if best_ckpt is None:
-        best_ckpts = [p for p in pt_files if "best" in p.name.lower()]
-        if best_ckpts:
-            best_ckpt = best_ckpts[0]
-        else:
-            # Use latest checkpoint by modification time
-            best_ckpt = max(pt_files, key=lambda p: p.stat().st_mtime)
-            logger.warning(f"Using latest checkpoint {best_ckpt.name} (no best checkpoint info found)")
-    
-    # Extract epoch if possible
-    if best_epoch is None and best_ckpt:
-        name = best_ckpt.stem
-        # Try to extract epoch number from filename
+    def _extract_epoch_from_name(path: Path) -> int | None:
+        name = path.stem
         parts = name.split("_")
         for i, part in enumerate(parts):
             if part == "epoch" and i + 1 < len(parts):
                 try:
-                    best_epoch = int(parts[i + 1])
-                    break
+                    return int(parts[i + 1])
                 except ValueError:
-                    pass
-    
-    logger.info(f"Selected best checkpoint: {best_ckpt.name} (epoch: {best_epoch})")
+                    return None
+        return None
+
+    checkpoint_dir = Path(checkpoint_dir)
+
+    # Search for all .pt files in checkpoint directory and subdirectories.
+    pt_files = sorted(checkpoint_dir.glob("**/*.pt"))
+    if not pt_files:
+        raise FileNotFoundError(f"No .pt checkpoint files found in {checkpoint_dir}")
+
+    # Map epoch -> checkpoint path, preserving deterministic order.
+    epoch_to_ckpt: dict[int, Path] = {}
+    for ckpt in pt_files:
+        epoch = _extract_epoch_from_name(ckpt)
+        if epoch is not None and epoch not in epoch_to_ckpt:
+            epoch_to_ckpt[epoch] = ckpt
+
+    # Search nearby directories for config and validation history.
+    search_dirs = [
+        checkpoint_dir,
+        checkpoint_dir.parent,
+        checkpoint_dir.parent.parent,
+        checkpoint_dir.parent.parent.parent,
+    ]
+
+    config_path = next(
+        (
+            p
+            for d in search_dirs
+            for p in (d / "config.yaml", d / ".hydra" / "config.yaml")
+            if p.exists()
+        ),
+        None,
+    )
+    metrics_path = next(
+        (
+            (d / "validation_metrics.jsonl")
+            for d in search_dirs
+            if (d / "validation_metrics.jsonl").exists()
+        ),
+        None,
+    )
+
+    if config_path is not None and metrics_path is not None:
+        try:
+            from omegaconf import OmegaConf
+
+            cfg = OmegaConf.load(config_path)
+            metric_name = str(cfg.train.early_stopping.metric)
+            mode = str(cfg.train.early_stopping.mode).lower()
+
+            if mode not in {"min", "max"}:
+                logger.warning(
+                    f"Invalid early_stopping.mode='{mode}' in {config_path}; expected 'min' or 'max'."
+                )
+            else:
+                best_ckpt: Path | None = None
+                best_epoch: int | None = None
+                best_value = float("inf") if mode == "min" else float("-inf")
+
+                history_reliably_mappable = True
+
+                with open(metrics_path, encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+
+                        try:
+                            record = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        epoch = record.get("epoch")
+                        if not isinstance(epoch, int):
+                            continue
+
+                        metric_block = record.get("primary_validation_metrics")
+                        if not isinstance(metric_block, dict):
+                            history_reliably_mappable = False
+                            logger.warning(
+                                "validation_metrics.jsonl is missing 'primary_validation_metrics' "
+                                f"for epoch {epoch}; falling back to heuristic checkpoint selection "
+                                "(NOT true best)."
+                            )
+                            break
+
+                        # Primary lookup uses configured key; fallback supports prefixed variants.
+                        metric_value = metric_block.get(metric_name)
+                        if metric_value is None and isinstance(metric_name, str):
+                            prefixed_name = (
+                                metric_name[4:]
+                                if metric_name.startswith("val_")
+                                else f"val_{metric_name}"
+                            )
+                            metric_value = metric_block.get(prefixed_name)
+
+                        if not isinstance(metric_value, (int, float)):
+                            continue
+
+                        ckpt = epoch_to_ckpt.get(epoch)
+                        if ckpt is None:
+                            continue
+
+                        is_better = (
+                            metric_value < best_value
+                            if mode == "min"
+                            else metric_value > best_value
+                        )
+                        if is_better:
+                            best_value = float(metric_value)
+                            best_epoch = epoch
+                            best_ckpt = ckpt
+
+                if history_reliably_mappable and best_ckpt is not None:
+                    logger.info(
+                        f"Selected best checkpoint from validation history: {best_ckpt.name} "
+                        f"(epoch: {best_epoch}, {metric_name}: {best_value:.6g}, mode: {mode})"
+                    )
+                    return best_ckpt, best_epoch
+
+                if history_reliably_mappable:
+                    logger.warning(
+                        "Could not map validation history to saved checkpoints; "
+                        "falling back to heuristic checkpoint selection (NOT true best)."
+                    )
+        except Exception as e:
+            logger.warning(
+                "Failed to select checkpoint from validation history "
+                f"(config: {config_path}, metrics: {metrics_path}): {e}. "
+                "Falling back to heuristic checkpoint selection (NOT true best)."
+            )
+    else:
+        logger.warning(
+            "Missing nearby config.yaml/.hydra/config.yaml or validation_metrics.jsonl; "
+            "falling back to heuristic checkpoint selection (NOT true best)."
+        )
+
+    # Fallback heuristic: prefer explicitly named best checkpoint, else latest.
+    best_ckpts = [p for p in pt_files if "best" in p.name.lower()]
+    best_ckpt = (
+        best_ckpts[0]
+        if best_ckpts
+        else max(pt_files, key=lambda p: p.stat().st_mtime)
+    )
+    best_epoch = _extract_epoch_from_name(best_ckpt)
+
+    logger.info(
+        f"Selected fallback checkpoint: {best_ckpt.name} (epoch: {best_epoch})"
+    )
     return best_ckpt, best_epoch
 
 
-def find_last_federated_round(output_dir: Path) -> tuple[Path, int]:
-    """Find the last (most recent) federated global model checkpoint.
-    
-    Args:
-        output_dir: Federated training output directory.
-    
-    Returns:
-        Path to global model checkpoint and round number.
+def resolve_federated_checkpoint_dir(checkpoint_dir: Path) -> Path:
+    """Resolve federated checkpoints directory.
+
+    Contract:
+    - preferred input is direct `.../federated_server/checkpoints`
+    - experiment root containing `federated_server/checkpoints` is accepted
     """
-    federated_server_dir = output_dir / "federated_server"
-    if not federated_server_dir.exists():
-        raise FileNotFoundError(f"No federated_server directory found in {output_dir}")
-    
-    # Search for global_model_round_*.pt files
-    round_files = sorted(federated_server_dir.glob("global_model_round_*.pt"))
-    
-    if round_files:
-        last_ckpt = round_files[-1]
-    else:
-        # Fall back to global_model_final.pt
-        final_ckpt = federated_server_dir / "global_model_final.pt"
-        if final_ckpt.exists():
-            last_ckpt = final_ckpt
-        else:
-            raise FileNotFoundError(f"No global model checkpoints found in {federated_server_dir}")
-    
-    # Extract round number
-    name = last_ckpt.stem
-    round_num = None
-    if "round" in name:
-        parts = name.split("_")
+    candidate = Path(checkpoint_dir)
+    if candidate.exists() and candidate.is_dir() and candidate.name == "checkpoints":
+        return candidate
+
+    nested = candidate / "federated_server" / "checkpoints"
+    if nested.exists() and nested.is_dir():
+        return nested
+
+    raise FileNotFoundError(
+        f"Federated checkpoint directory not found from '{checkpoint_dir}'. "
+        "Expected a checkpoints dir or an experiment root containing federated_server/checkpoints."
+    )
+
+
+def _resolve_federated_server_and_checkpoints_dirs(checkpoint_dir: Path) -> tuple[Path, Path]:
+    checkpoints_dir = resolve_federated_checkpoint_dir(checkpoint_dir)
+    server_dir = checkpoints_dir.parent
+    return server_dir, checkpoints_dir
+
+
+def _extract_round_number_from_checkpoint_name(path: Path) -> int | None:
+    stem = path.stem
+    if "round" not in stem:
+        return None
+    parts = stem.split("_")
+    for i, part in enumerate(parts):
+        if part == "round" and i + 1 < len(parts):
+            try:
+                return int(parts[i + 1])
+            except ValueError:
+                return None
+    return None
+
+
+def _candidate_checkpoint_paths_for_round(server_dir: Path, checkpoints_dir: Path, round_num: int) -> list[Path]:
+    _ = server_dir
+    suffix = f"{round_num:03d}.pt"
+    return [
+        checkpoints_dir / f"global_model_round_{suffix}",
+        checkpoints_dir / f"global_model_final_round_{suffix}",
+    ]
+
+
+def _find_ckpt_round_steps_file(checkpoints_dir: Path, round_num: int) -> Path | None:
+    candidates = sorted(checkpoints_dir.glob(f"ckpt_round_{round_num}_steps_*.pt"))
+    if not candidates:
+        return None
+
+    def _extract_steps(path: Path) -> int:
+        parts = path.stem.split("_")
         for i, part in enumerate(parts):
-            if part == "round" and i + 1 < len(parts):
+            if part == "steps" and i + 1 < len(parts):
                 try:
-                    round_num = int(parts[i + 1])
-                    break
+                    return int(parts[i + 1])
                 except ValueError:
-                    pass
-    
-    if round_num is None:
-        round_num = len(round_files)
-    
-    logger.info(f"Selected last federated round: {last_ckpt.name} (round: {round_num})")
-    return last_ckpt, round_num
+                    return -1
+        return -1
+
+    return max(candidates, key=lambda p: (_extract_steps(p), p.stat().st_mtime))
 
 
-def find_best_federated_round(output_dir: Path) -> tuple[Path, int]:
-    """Find the best federated global model checkpoint by validation metric.
-    
-    Args:
-        output_dir: Federated training output directory.
-    
-    Returns:
-        Path to global model checkpoint and round number.
-    """
-    federated_server_dir = output_dir / "federated_server"
-    if not federated_server_dir.exists():
-        raise FileNotFoundError(f"No federated_server directory found in {output_dir}")
-    
-    # Load aggregated metrics history
-    metrics_file = federated_server_dir / "aggregated_metrics_history.json"
+def find_last_federated_round(checkpoint_dir: Path) -> tuple[Path, int]:
+    """Find the last (most recent) federated global model checkpoint."""
+    _, checkpoints_dir = _resolve_federated_server_and_checkpoints_dirs(checkpoint_dir)
+
+    # Prefer true per-round checkpoints first
+    round_candidates = sorted(
+        list(checkpoints_dir.glob("global_model_round_*.pt"))
+        + list(checkpoints_dir.glob("ckpt_round_*_steps_*.pt"))
+    )
+
+    best_with_round: tuple[int, Path] | None = None
+    for candidate in round_candidates:
+        round_num = _extract_round_number_from_checkpoint_name(candidate)
+        if round_num is None:
+            continue
+        if best_with_round is None or round_num > best_with_round[0]:
+            best_with_round = (round_num, candidate)
+
+    if best_with_round is not None:
+        round_num, last_ckpt = best_with_round
+        logger.info(f"Selected last federated round: {last_ckpt.name} (round: {round_num})")
+        return last_ckpt, round_num
+
+    # If no per-round checkpoints exist, fall back to final round snapshots
+    final_round_candidates = sorted(list(checkpoints_dir.glob("global_model_final_round_*.pt")))
+    best_final_with_round: tuple[int, Path] | None = None
+    for candidate in final_round_candidates:
+        round_num = _extract_round_number_from_checkpoint_name(candidate)
+        if round_num is None:
+            continue
+        if best_final_with_round is None or round_num > best_final_with_round[0]:
+            best_final_with_round = (round_num, candidate)
+
+    if best_final_with_round is not None:
+        round_num, final_ckpt = best_final_with_round
+        logger.info(
+            f"Selected fallback final federated checkpoint: {final_ckpt.name} (round: {round_num})"
+        )
+        return final_ckpt, round_num
+
+    fallback_candidates = [checkpoints_dir / "global_model_final.pt"]
+    for fallback_ckpt in fallback_candidates:
+        if fallback_ckpt.exists():
+            logger.info(f"Selected last federated checkpoint without round metadata: {fallback_ckpt.name}")
+            return fallback_ckpt, 0
+
+    raise FileNotFoundError(
+        f"No global model checkpoints found in {checkpoints_dir}"
+    )
+
+
+def _resolve_checkpoint_path_for_round(server_dir: Path, checkpoints_dir: Path, round_num: int) -> Path | None:
+    ckpt_round_steps = _find_ckpt_round_steps_file(checkpoints_dir, round_num)
+    if ckpt_round_steps is not None:
+        return ckpt_round_steps
+
+    for candidate in _candidate_checkpoint_paths_for_round(server_dir, checkpoints_dir, round_num):
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def _load_federated_metrics_history(server_dir: Path) -> list[dict[str, Any]]:
+    metrics_file = server_dir / "metrics_history.json"
     if not metrics_file.exists():
-        logger.warning(f"No aggregated metrics found, using last round instead")
-        return find_last_federated_round(output_dir)
-    
+        raise FileNotFoundError(
+            f"Missing metrics history under {server_dir}; expected metrics_history.json"
+        )
+
     try:
-        with open(metrics_file) as f:
+        with open(metrics_file, encoding="utf-8") as f:
             metrics_history = json.load(f)
-    except Exception as e:
-        logger.warning(f"Failed to read metrics file: {e}, using last round instead")
-        return find_last_federated_round(output_dir)
-    
-    # Find round with lowest fedavg_metrics mae
-    best_round = None
-    best_metric = float('inf')
-    
-    for entry in metrics_history:
-        if "fedavg_metrics" in entry and "mae" in entry["fedavg_metrics"]:
-            mae = entry["fedavg_metrics"]["mae"]
-            if mae < best_metric:
-                best_metric = mae
-                best_round = entry.get("round")
-    
-    if best_round is None:
-        logger.warning("Could not find best round from metrics, using last round instead")
-        return find_last_federated_round(output_dir)
-    
-    # Find corresponding checkpoint file
-    ckpt_path = federated_server_dir / f"global_model_round_{best_round:03d}.pt"
-    if not ckpt_path.exists():
-        logger.warning(f"Checkpoint for round {best_round} not found, using last round instead")
-        return find_last_federated_round(output_dir)
-    
-    logger.info(f"Selected best federated round: round_{best_round:03d}.pt (mae: {best_metric:.4f})")
-    return ckpt_path, best_round
+    except Exception as e:  # pragma: no cover - defensive
+        raise ValueError(f"Unable to parse metrics_history.json: {e}") from e
+
+    # Real contract: metrics_history is a dict with evaluate_metrics keyed by round.
+    if isinstance(metrics_history, dict):
+        evaluate_metrics = metrics_history.get("evaluate_metrics")
+        if not isinstance(evaluate_metrics, dict) or not evaluate_metrics:
+            raise ValueError("metrics_history.json missing or empty 'evaluate_metrics'")
+
+        normalized_entries: list[dict[str, Any]] = []
+        for round_key, round_payload in evaluate_metrics.items():
+            try:
+                round_num = int(round_key)
+            except (TypeError, ValueError):
+                continue
+
+            if not isinstance(round_payload, dict):
+                continue
+
+            if isinstance(round_payload.get("fedavg_metrics"), dict):
+                fedavg_metrics = round_payload["fedavg_metrics"]
+            else:
+                # Accept flat metric maps as best-effort compatibility.
+                fedavg_metrics = round_payload
+
+            normalized_entries.append({"round": round_num, "fedavg_metrics": fedavg_metrics})
+
+        if not normalized_entries:
+            raise ValueError("metrics_history.json has no usable evaluate_metrics round entries")
+        return normalized_entries
+
+    # Keep compatibility if old list-based metrics were produced.
+    if isinstance(metrics_history, list) and metrics_history:
+        return metrics_history
+
+    raise ValueError("metrics_history.json must be a dict with non-empty 'evaluate_metrics'")
+
+
+def find_best_federated_round(
+    checkpoint_dir: Path,
+    primary_metric: str,
+    direction: str,
+) -> tuple[Path, int]:
+    """Select best federated round from configured primary metric.
+
+    Args:
+        checkpoint_dir: Federated checkpoint directory or experiment root.
+        primary_metric: Metric key expected inside each ``fedavg_metrics`` payload.
+        direction: Optimization direction, one of ``min`` or ``max``.
+
+    Returns:
+        Tuple of checkpoint path and round number.
+
+    Raises:
+        ValueError: If config metadata is invalid, metric values are missing/non-numeric,
+            history is empty, or no valid round can be selected.
+        FileNotFoundError: If required files/directories/checkpoints are missing.
+    """
+    try:
+        mode = direction.lower().strip()
+        if mode not in {"min", "max"}:
+            raise ValueError(
+                f"Invalid direction '{direction}' for best-round selection; expected 'min' or 'max'."
+            )
+
+        federated_server_dir, resolved_ckpt_dir = _resolve_federated_server_and_checkpoints_dirs(checkpoint_dir)
+        metrics_history = _load_federated_metrics_history(federated_server_dir)
+
+        best_round: int | None = None
+        best_metric: float | None = None
+
+        for entry in metrics_history:
+            if not isinstance(entry, dict):
+                continue
+
+            round_num = entry.get("round")
+            if not isinstance(round_num, int):
+                raise ValueError(f"Invalid round entry in metrics history: {entry}")
+
+            fedavg_metrics = entry.get("fedavg_metrics")
+            if not isinstance(fedavg_metrics, dict):
+                raise ValueError(
+                    f"Round {round_num} missing 'fedavg_metrics'; cannot evaluate primary metric '{primary_metric}'."
+                )
+
+            metric_value = fedavg_metrics.get(primary_metric)
+            if not isinstance(metric_value, (int, float)):
+                raise ValueError(
+                    f"Round {round_num} has missing/non-numeric primary metric '{primary_metric}' in fedavg_metrics."
+                )
+
+            value = float(metric_value)
+            if best_metric is None:
+                best_metric = value
+                best_round = round_num
+                continue
+
+            is_better = value < best_metric if mode == "min" else value > best_metric
+            if is_better:
+                best_metric = value
+                best_round = round_num
+
+        if best_round is None:
+            raise ValueError(
+                f"Could not select best round using primary metric '{primary_metric}' ({mode})."
+            )
+
+        ckpt_path = _resolve_checkpoint_path_for_round(
+            server_dir=federated_server_dir,
+            checkpoints_dir=resolved_ckpt_dir,
+            round_num=best_round,
+        )
+        if ckpt_path is None:
+            raise FileNotFoundError(
+                f"Selected best round {best_round} by metric '{primary_metric}' ({mode}) "
+                "but no matching checkpoint file was found in checkpoints or server directory."
+            )
+
+        logger.info(
+            "Selected best federated round %s using %s=%s (%s)",
+            best_round,
+            primary_metric,
+            f"{best_metric:.6g}",
+            mode,
+        )
+        return ckpt_path, best_round
+    except (FileNotFoundError, ValueError) as exc:
+        logger.warning(
+            "Best-round selection unavailable (%s). Falling back to last-round checkpoint.",
+            exc,
+        )
+        return find_last_federated_round(checkpoint_dir)
 
 
 def get_round_participants(output_dir: Path, round_num: int) -> list[str]:
@@ -288,7 +566,7 @@ def get_round_participants(output_dir: Path, round_num: int) -> list[str]:
     federated_server_dir = output_dir / "federated_server"
     
     # Try to extract from metrics history
-    metrics_file = federated_server_dir / "aggregated_metrics_history.json"
+    metrics_file = federated_server_dir / "metrics_history.json"
     if metrics_file.exists():
         try:
             with open(metrics_file) as f:
@@ -394,6 +672,54 @@ def load_checkpoint_and_config(
     return checkpoint, config_dict # type: ignore
 
 
+def _detect_client_column(meta_df: pd.DataFrame) -> str | None:
+    if "client" in meta_df.columns:
+        return "client"
+    if "vendor" in meta_df.columns:
+        return "vendor"
+    return None
+
+
+def filter_metadata_by_client_config(
+    config: dict,
+    meta_df: pd.DataFrame,
+    metadata_type: str,
+) -> pd.DataFrame:
+    """Apply centralized-style client filtering to metadata when configured."""
+    if meta_df.empty:
+        return meta_df
+
+    client_col = _detect_client_column(meta_df)
+    if client_col is None:
+        logger.info(f"Skipping {metadata_type} client filtering: no client/vendor column present.")
+        return meta_df
+
+    filtered_df = meta_df
+    data_cfg = config.get("data", {}) if isinstance(config, dict) else {}
+    federated_cfg = config.get("federated", {}) if isinstance(config, dict) else {}
+
+    client_name = data_cfg.get("client_name")
+    if isinstance(client_name, str) and client_name.strip() and client_name.lower() != "all":
+        logger.info(f"Filtering {metadata_type} metadata for client: {client_name}")
+        filtered_df = filtered_df[
+            filtered_df[client_col].astype(str).str.lower() == client_name.lower()
+        ].reset_index(drop=True)
+        return filtered_df
+
+    client_ids = federated_cfg.get("client_ids")
+    if client_ids is not None:
+        if isinstance(client_ids, str):
+            normalized_client_ids = {client_ids}
+        else:
+            normalized_client_ids = {str(client_id) for client_id in client_ids}
+        logger.info(f"Filtering {metadata_type} metadata for clients: {sorted(normalized_client_ids)}")
+        filtered_df = filtered_df[
+            filtered_df[client_col].astype(str).isin(normalized_client_ids)
+        ].reset_index(drop=True)
+
+    return filtered_df
+
+
 def load_test_metadata(config: dict) -> pd.DataFrame:
     """Load test metadata from combined dataset.
     
@@ -404,8 +730,10 @@ def load_test_metadata(config: dict) -> pd.DataFrame:
         DataFrame with test metadata including client column.
     """
     data_dir = Path(config["data"]["combined"]["dir"]).expanduser()
+    data_dir = resolve_data_dir_with_fallback(data_dir)
     metadata_path = data_dir / "test_metadata.csv"
-    return load_metadata(metadata_path, metadata_type="test")
+    test_meta_df = load_metadata(metadata_path, metadata_type="test")
+    return filter_metadata_by_client_config(config=config, meta_df=test_meta_df, metadata_type="test")
 
 
 def get_test_datasets_by_client(
@@ -421,6 +749,9 @@ def get_test_datasets_by_client(
     Returns:
         Dictionary mapping client_id to (n_samples, dataset).
     """
+    if get_image_transforms is None:
+        raise RuntimeError("Dataset helpers are unavailable: models.cinema package import failed.")
+
     from omegaconf import OmegaConf
     
     data_dir = Path(config["data"]["combined"]["dir"]).expanduser()
@@ -435,13 +766,7 @@ def get_test_datasets_by_client(
     _, transform = get_image_transforms(cfg)
     
     # Identify clients
-    if "client" in test_meta_df.columns:
-        client_col = "client"
-    elif "vendor" in test_meta_df.columns:
-        client_col = "vendor"
-    else:
-        # Single client dataset
-        client_col = None
+    client_col = _detect_client_column(test_meta_df)
     
     datasets_by_client = {}
     
@@ -449,6 +774,7 @@ def get_test_datasets_by_client(
         # Classification datasets
         class_col = config["data"]["class_column"]
         train_meta_df = load_metadata(data_dir / "train_metadata.csv", metadata_type="train")
+        train_meta_df = filter_metadata_by_client_config(config=config, meta_df=train_meta_df, metadata_type="train")
         # Extract classes from config to preserve training order (CRITICAL!)
         try:
             classes = list(config["data"][class_col]) if config["data"][class_col] else None
@@ -488,6 +814,7 @@ def get_test_datasets_by_client(
         # Regression datasets
         reg_col = config["data"]["regression_column"]
         train_meta_df = load_metadata(data_dir / "train_metadata.csv", metadata_type="train")
+        train_meta_df = filter_metadata_by_client_config(config=config, meta_df=train_meta_df, metadata_type="train")
         reg_mean = train_meta_df[reg_col].mean()
         reg_std = train_meta_df[reg_col].std()
         
@@ -544,6 +871,9 @@ def compute_metrics_on_dataloader(
     Returns:
         Dictionary with normalized and restored metrics.
     """
+    if get_amp_dtype_and_device is None or regression_eval is None or regression_metrics is None:
+        raise RuntimeError("Regression evaluation helpers are unavailable in this environment.")
+
     from omegaconf import OmegaConf
     cfg = OmegaConf.create(config)
     amp_dtype, _ = get_amp_dtype_and_device()
@@ -640,6 +970,183 @@ def compute_weighted_metrics(
         weighted_metrics[metric_name] = weighted_value
     
     return weighted_metrics
+
+
+def to_builtin(obj: Any) -> Any:
+    """Recursively convert numpy/torch values to JSON-serializable builtins."""
+    if isinstance(obj, dict):
+        return {k: to_builtin(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [to_builtin(v) for v in obj]
+    if isinstance(obj, tuple):
+        return [to_builtin(v) for v in obj]
+    if isinstance(obj, np.generic):
+        return obj.item()
+    if isinstance(obj, torch.Tensor):
+        return to_builtin(obj.detach().cpu().tolist())
+    return obj
+
+
+def compute_primary_metric_fairness(
+    client_results: list[dict[str, Any]],
+    primary_metric: str,
+) -> dict[str, Any]:
+    """Compute fairness metrics using one configured primary metric only.
+
+    Raises:
+        ValueError: If a client misses the metric, metric is non-numeric, or no clients provided.
+    """
+    if not client_results:
+        raise ValueError("Cannot compute fairness: client_results is empty.")
+
+    per_client_primary: dict[str, float] = {}
+    for result in client_results:
+        client_id = str(result.get("client_id"))
+        metrics = result.get("metrics")
+        if not isinstance(metrics, dict):
+            raise ValueError(f"Client '{client_id}' has invalid metrics payload: {metrics}")
+        if primary_metric not in metrics:
+            raise ValueError(
+                f"Client '{client_id}' is missing required primary metric '{primary_metric}' for fairness."
+            )
+        metric_value = metrics[primary_metric]
+        if not isinstance(metric_value, (int, float)):
+            raise ValueError(
+                f"Client '{client_id}' has non-numeric primary metric '{primary_metric}': {metric_value}"
+            )
+        per_client_primary[client_id] = float(metric_value)
+
+    values = list(per_client_primary.values())
+    clients = list(per_client_primary.keys())
+    min_idx = int(np.argmin(values))
+    max_idx = int(np.argmax(values))
+
+    return {
+        "primary_metric": primary_metric,
+        "std": float(np.std(values)),
+        "gap": float(max(values) - min(values)),
+        "min_client": clients[min_idx],
+        "min_value": values[min_idx],
+        "max_client": clients[max_idx],
+        "max_value": values[max_idx],
+        "per_client_primary": per_client_primary,
+    }
+
+
+@dataclass(frozen=True)
+class TaskAdapter:
+    """Task-specific hooks used by federated evaluator orchestration."""
+
+    task_type: str
+    build_datasets_fn: Callable[..., dict[str, tuple[int, Any]]]
+    evaluate_fn: Callable[..., dict[str, float]]
+    normalize_metrics_fn: Callable[[dict[str, Any]], dict[str, float]]
+
+
+def _normalize_metric_values(metrics: dict[str, Any]) -> dict[str, float]:
+    normalized: dict[str, float] = {}
+    for name, value in metrics.items():
+        if isinstance(value, (int, float, np.integer, np.floating)):
+            normalized[str(name)] = float(value)
+    return normalized
+
+
+def _build_test_datasets_for_task(config: dict, test_meta_df: pd.DataFrame) -> dict[str, tuple[int, Any]]:
+    return get_test_datasets_by_client(config=config, test_meta_df=test_meta_df)
+
+
+def _evaluate_classification(
+    model: torch.nn.Module,
+    dataloader: DataLoader,
+    config: dict,
+    device: torch.device,
+) -> dict[str, float]:
+    from flwr_cinema.centralized.combined.evaluate import (
+        classification_eval_dataloader_with_balanced_accuracy,
+    )
+    from omegaconf import OmegaConf
+
+    if get_amp_dtype_and_device is None:
+        raise RuntimeError("Classification evaluation dependencies are unavailable in this environment.")
+
+    cfg = OmegaConf.create(config)
+    amp_dtype, _ = get_amp_dtype_and_device()
+    views = cfg.model.views if isinstance(cfg.model.views, list) else [cfg.model.views]
+    patch_size_dict = {
+        v: cfg.data.sax.patch_size if v == "sax" else cfg.data.lax.patch_size
+        for v in views
+    }
+    metrics, _, _ = classification_eval_dataloader_with_balanced_accuracy(
+        model=model,
+        dataloader=dataloader,
+        patch_size_dict=patch_size_dict,
+        amp_dtype=amp_dtype,
+        device=device,
+    )
+    return _normalize_metric_values(metrics)
+
+
+def _evaluate_regression(
+    model: torch.nn.Module,
+    dataloader: DataLoader,
+    config: dict,
+    device: torch.device,
+) -> dict[str, float]:
+    data_dir = Path(config["data"]["combined"]["dir"]).expanduser()
+    data_dir = resolve_data_dir_with_fallback(data_dir)
+    train_meta_df = load_metadata(data_dir / "train_metadata.csv", metadata_type="train")
+    train_meta_df = filter_metadata_by_client_config(config=config, meta_df=train_meta_df, metadata_type="train")
+    reg_col = config["data"]["regression_column"]
+    reg_mean = float(train_meta_df[reg_col].mean())
+    reg_std = float(train_meta_df[reg_col].std())
+    metrics = compute_metrics_on_dataloader(
+        model=model,
+        dataloader=dataloader,
+        reg_mean=reg_mean,
+        reg_std=reg_std,
+        config=config,
+        device=device,
+    )
+    return _normalize_metric_values(metrics)
+
+
+def _segmentation_placeholder(*_: Any, **__: Any) -> dict[str, float]:
+    raise NotImplementedError(
+        "Segmentation adapter is not wired yet in flwr_cinema; "
+        "provide a concrete dataset/eval callable before running segmentation federated evaluation."
+    )
+
+
+def get_task_adapter(task: str | dict[str, Any] | Any) -> TaskAdapter:
+    """Return task adapter for classification/regression/segmentation.
+
+    Segmentation is currently an explicit placeholder and intentionally fails fast.
+    """
+    task_name = str(task.get("task") if isinstance(task, dict) else task).lower() if not isinstance(task, str) else task.lower()
+
+    if task_name == "classification":
+        return TaskAdapter(
+            task_type="classification",
+            build_datasets_fn=_build_test_datasets_for_task,
+            evaluate_fn=_evaluate_classification,
+            normalize_metrics_fn=_normalize_metric_values,
+        )
+    if task_name == "regression":
+        return TaskAdapter(
+            task_type="regression",
+            build_datasets_fn=_build_test_datasets_for_task,
+            evaluate_fn=_evaluate_regression,
+            normalize_metrics_fn=_normalize_metric_values,
+        )
+    if task_name == "segmentation":
+        return TaskAdapter(
+            task_type="segmentation",
+            build_datasets_fn=_segmentation_placeholder,
+            evaluate_fn=_segmentation_placeholder,
+            normalize_metrics_fn=_normalize_metric_values,
+        )
+
+    raise ValueError(f"Unsupported task type for federated evaluation adapter: {task_name}")
 
 
 def compute_cross_center_metrics(

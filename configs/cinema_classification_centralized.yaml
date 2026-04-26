@@ -132,7 +132,7 @@ train:
 model:
   name: convvit # convvit, resnet
   ckpt_path: null
-  freeze_pretrained: False
+  freeze_pretrained: True
   views: sax
   n_frames: 2
   out_chans: null

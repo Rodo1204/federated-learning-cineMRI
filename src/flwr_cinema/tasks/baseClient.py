@@ -298,6 +298,7 @@ class BaseClient(ABC):
             optimizer_steps_this_round = steps_per_epoch * self.local_epochs
 
         out_configs["optimizer_steps_this_round"] = int(optimizer_steps_this_round)
+        out_configs["client_id"] = str(self.client_id)
         out_record["config"] = out_configs
         out_metrics["num_samples"] = num_samples
 
@@ -343,6 +344,9 @@ class BaseClient(ABC):
         out_record = RecordDict()
         out_metrics = MetricRecord(safe_metrics)
         out_metrics["num_samples"] = num_val_samples
+        out_config = ConfigRecord()
+        out_config["client_id"] = str(self.client_id)
+        out_record["config"] = out_config
         out_record["metrics"] = out_metrics
 
         return Message(content=out_record, reply_to=message)
