@@ -231,6 +231,8 @@ def load_client_datasets(
     # Dynamically import dataset class based on task
     if task == "classification":
         from models.cinema.cinema.classification.dataset import EndDiastoleEndSystoleDataset
+    elif task == "segmentation":
+        from models.cinema.cinema.segmentation.dataset import EndDiastoleEndSystoleDataset
     else:
         from models.cinema.cinema.regression.dataset import EndDiastoleEndSystoleDataset
     
@@ -349,9 +351,10 @@ def load_client_dataloaders(
     task = getattr(config, "task", "regression")
     if task == "regression":
         target_col = config.data.regression_column
-    else:
-        # For classification, use class_column from config (same as centralized)
+    elif task == "classification":
         target_col = config.data.class_column
+    else:
+        target_col = None  # segmentation has no target column
     
     if batch_size is None:
         batch_size = config.train.batch_size_per_device
@@ -432,8 +435,12 @@ def load_client_dataloaders(
     stats_obj = client_stats[client_id]
     
     # Get transforms from config
-    from models.cinema.cinema.classification.dataset import get_image_transforms
-    train_transform, val_transform = get_image_transforms(config)
+    if task == "segmentation":
+        from models.cinema.cinema.segmentation.dataset import get_segmentation_transforms
+        train_transform, val_transform = get_segmentation_transforms(config)
+    else:
+        from models.cinema.cinema.classification.dataset import get_image_transforms
+        train_transform, val_transform = get_image_transforms(config)
     
     # Get classes for classification task (same as centralized: config.data[class_col])
     classes = None

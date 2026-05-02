@@ -1,16 +1,13 @@
-import logging
 from flwr_cinema.tasks.baseClient import BaseClient
 from models.cinema.cinema.train import train_one_epoch
 
-# logger = logging.getLogger(__name__)
-
-class ClassificationClient(BaseClient):
-    """Specific Client implementation for Classification tasks."""
+class TaskClient(BaseClient):
+    """Generic federated client for classification/regression tasks."""
 
     # El __init__ se hereda completamente de BaseClient para evitar código duplicado.
 
     def train_local(self, round_idx: int) -> int:
-        """Implements the concrete local training for Cinema classification."""
+        """Implements the concrete local training for Cinema tasks."""
         
         self.model.train()
         n_samples_trained = 0
@@ -37,7 +34,7 @@ class ClassificationClient(BaseClient):
         return self.n_samples
 
     def validate_local(self) -> tuple[int, dict]:
-        """Implements local validation for Cinema classification."""
+        """Implements local validation for Cinema tasks."""
         if self.val_loader is None or self.eval_dataloader_fn is None:
             # logger.warning("No validation loader or eval func provided, returning empty.")
             return 0, {}
@@ -55,3 +52,7 @@ class ClassificationClient(BaseClient):
         )
         
         return self.n_val_samples, metrics
+
+
+# Backward-compatible alias
+ClassificationClient = TaskClient

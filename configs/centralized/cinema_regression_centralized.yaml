@@ -1,4 +1,4 @@
-task: classification
+task: regression
 model_name: cinema
 mode: centralized  # federated or centralized
 seed: 0
@@ -6,7 +6,7 @@ grad_ckpt: True
 eval_mode: "centralized" # client, centralized or server for early stopping evaluation
 
 logging:
-  dir: ./outputs/${model_name}_${task}/${mode}/${data.name}/${data.class_column}/client_${federated.client_tag}/lora_${train.use_lora}/seed${seed}/${now:%Y-%m-%d}/${now:%H-%M-%S}
+  dir: ./outputs/${model_name}_${task}/${mode}/${data.name}/${data.regression_column}/client_${federated.client_tag}/lora_${train.use_lora}/seed${seed}/${now:%Y-%m-%d}/${now:%H-%M-%S}
   wandb:
     project: null
     entity: null
@@ -27,9 +27,10 @@ federated:
 data:
   name: acdc_mnms_combined
   client_name: acdc  # Client name for centralized training. Options: "all", "acdc", "Siemens", "GE", "Canon", "Philips". Use "all" to train on combined data.
-  class_column: "pathology"  # Column name in metadata CSV that contains class labels (e.g., "pathology" for multi-class, "binary_label" for binary classification)
-  pathology: ["DCM", "HCM", "MINF", "NOR", "RV"] # Update this list based on which datasets are included (e.g., if using MnMs, include relevant pathologies)  
-  binary_label: ["NOR", "DISEASED"] # For binary classification, specify the two classes (e.g., "abnormal" vs "normal")
+  regression_column: "bmi"
+  bmi:
+      mean: 25.561040294207242
+      std: 4.732639548868183
 
   # Datasets to include
   use_acdc: True
@@ -107,7 +108,7 @@ transform:
     translate_range: [60, 60, 0]
 
 train:
-  use_lora: True # Set to True to use LoRA
+  use_lora: False # Set to True to use LoRA
   use_class_weighted_loss: False # Set to True to use class-weighted BCE loss for imbalanced classification
   n_workers: 4
   clip_grad: 5.0
@@ -117,25 +118,25 @@ train:
   label_smoothing: 0.1
   lr: 1e-3
   min_lr: 1e-5
-  n_warmup_epochs: 0
+  n_warmup_epochs: 10
   n_epochs: 800
   max_n_ckpts: 2
-  batch_size: 64
-  batch_size_per_device: 4
-  eval_steps: 80  # Evaluate every N optimizer steps (aligned centralized/federated)
+  batch_size: 32
+  batch_size_per_device: 2
+  eval_steps: 20  # Evaluate every N optimizer steps (aligned centralized/federated)
   early_stopping:
-    metric: "mcc" #"roc_auc"
-    mode: "max"
+    metric: "mae" #"roc_auc"
+    mode: "min"
     patience: 5 #10
     min_delta: 1e-4 #5e-4
 
 model:
   name: convvit # convvit, resnet
   ckpt_path: null
-  freeze_pretrained: True
+  freeze_pretrained: False
   views: sax
   n_frames: 2
-  out_chans: null
+  out_chans: 1
   convvit:
     size: base # tiny, base, large, huge
     enc_patch_size: [4, 4, 1]

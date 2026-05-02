@@ -25,7 +25,7 @@ dependencies = [
     "huggingface-hub>=0.19.0",
 
     # Data Processing & ML
-    "numpy>=1.24.0",
+    "numpy==1.26.4",
     "pandas>=2.0.0",
     "scikit-learn>=1.3.0",
     "scipy>=1.11.0",
@@ -82,7 +82,7 @@ fraction-evaluate = 0.5
 local-epochs = 1
 learning-rate = 0.1
 batch-size = 32
-hydra_config_dir = "../../../configs"
+hydra_config_dir = "../../../configs/federated"
 hydra_config_name = "cinema_classification_fed_mypc"
 
 [superlink.local]

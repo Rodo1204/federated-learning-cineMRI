@@ -9,11 +9,7 @@ from flwr.serverapp.strategy import FedAvg, Result, Strategy
 import json
 from omegaconf import OmegaConf
 
-from models.cinema.cinema.convvit import ConvViT
-
 from flwr_cinema.scripts.lora import (
-    apply_lora_to_convvit,
-    apply_dual_lora_to_convvit,
     get_global_lora_and_head_state_dict,
     get_global_lora_state_dict,
     get_lora_and_head_state_dict,
@@ -24,54 +20,16 @@ from flwr_cinema.scripts.lora import (
 )
 from flwr_cinema.utils.hydra_utils import load_hydra_config
 from flwr_cinema.strategies.common import get_primary_metric_name
+from flwr_cinema.tasks.adapters import get_federated_task_adapter
 from models.cinema.cinema.device import get_amp_dtype_and_device
 
 # Create ServerApp
 app = ServerApp()
 
 def get_model(config: DictConfig) -> torch.nn.Module:
-    """Initialize model with optional LoRA (single or dual) using CineMA pattern."""
-
-    # Load pretrained model: freeze backbone unless doing full finetuning
-    freeze_backbone = config.model.get('freeze_pretrained', True) or config.train.use_lora
-    
-    # logger.info(f"Loading pretrained model (freeze_backbone={freeze_backbone})...")
-    model = ConvViT.from_pretrained(config=config, freeze=freeze_backbone)
-
-    # Apply LoRA if enabled (using lora.blocks_to_lora for both standard and dual LoRA)
-    blocks_to_lora = getattr(config.lora, 'blocks_to_lora', None)
-    
-    if config.train.use_lora:
-        # Check if Dual LoRA is enabled
-        if getattr(config, 'dual_lora', None) and getattr(config.dual_lora, 'enabled', False):
-            # logger.info("Applying Dual LoRA adapters (personalized federated learning)...")
-            apply_dual_lora_to_convvit(
-                model=model,
-                global_rank=config.dual_lora.global_rank,
-                local_rank=config.dual_lora.local_rank,
-                alpha=config.dual_lora.alpha,
-                dropout=config.dual_lora.dropout,
-                target_modules=config.dual_lora.target_modules,
-                blocks_to_lora=blocks_to_lora,
-            )
-        else:
-            # logger.info("Applying standard LoRA adapters...")
-            apply_lora_to_convvit(
-                model=model,
-                rank=config.lora.rank,
-                alpha=config.lora.alpha,
-                dropout=config.lora.dropout,
-                target_modules=config.lora.target_modules,
-                blocks_to_lora=blocks_to_lora,
-            )
-    elif config.model.get('freeze_pretrained', False):
-        # Head-only training: unfreeze classification head while keeping backbone frozen
-        # logger.info("Head-only training mode: unfreezing classification head...")
-        if hasattr(model, 'pred_head_dict'):
-            for head_param in model.pred_head_dict.parameters():
-                head_param.requires_grad = True
-
-    return model
+    """Build model using the task adapter model factory."""
+    adapter = get_federated_task_adapter(config)
+    return adapter.build_model(config)
 
 def get_model_params(config: DictConfig, model: torch.nn.Module) -> dict:
         """Get parameters to send to clients.
@@ -172,6 +130,7 @@ def get_strategy(
         # CinemaStrategyMixin params
         eval_steps=config.train.eval_steps,
         primary_metric_name=get_primary_metric_name(config),
+        primary_metric_direction=config.train.early_stopping.mode,
         early_stopping_patience=config.train.early_stopping.patience,
         early_stopping_min_delta=config.train.early_stopping.min_delta,
         global_model=global_model,
@@ -303,14 +262,19 @@ def main(grid: Grid, context: Context) -> None:
     timestamp_time = datetime.now().strftime("%H-%M-%S")
     timestamp_str = f"{timestamp_date}/{timestamp_time}"
     
-    target_column = getattr(config.data, "class_column", None) or getattr(config.data, "regression_column", "unknown")
+    if getattr(config, "task", "classification") == "classification":
+        target_column = getattr(config.data, "class_column", "classification")
+    elif getattr(config, "task", "regression") == "regression":
+        target_column = getattr(config.data, "regression_column", "regression")
+    else:
+        target_column = getattr(config, "task", "unknown")
     base_output_dir = Path("outputs") / (
         f"{config.model_name}_{config.task}/"
         f"{config.mode}/"
         f"{config.data.name}/{target_column}/"
         f"lora_{config.train.use_lora}/seed{config.seed}/"
         f"{timestamp_str}"
-    )
+    )  # TODO: probar enviar mejor el path completo del hydra que lee el server
     base_output_dir.mkdir(parents=True, exist_ok=True)
 
     n_rounds = getattr(config, "n_rounds", None) or config.federated.n_rounds

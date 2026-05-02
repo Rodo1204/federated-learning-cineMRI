@@ -7,15 +7,14 @@ import torch
 from torch import nn
 
 from flwr_cinema.scripts.eval_utils import load_metadata
-from flwr_cinema.scripts.lora import apply_lora_to_convvit, get_lora_state_dict
+from flwr_cinema.scripts.lora import get_lora_state_dict
+from flwr_cinema.tasks.adapters import get_centralized_task_adapter
 from models.cinema.cinema.train import maybe_reduce_batch_size
 
-from models.cinema.cinema.classification.dataset import get_image_transforms
-from models.cinema.cinema.convvit import ConvViT, load_pretrain_weights, param_groups_lr_decay
+from models.cinema.cinema.convvit import load_pretrain_weights, param_groups_lr_decay
 from models.cinema.cinema.device import get_amp_dtype_and_device, print_model_info
 from models.cinema.cinema.log import get_logger, init_wandb
 from models.cinema.cinema.optim import EarlyStopping, GradScaler
-from models.cinema.cinema.classification.dataset import EndDiastoleEndSystoleDataset
 from models.cinema.cinema.train import maybe_subset_dataset, train_one_epoch
 from models.cinema.cinema.optim import get_n_accum_steps
 
@@ -37,20 +36,9 @@ def get_task_specific_functions(config: DictConfig):
     Returns:
         Tuple of (loss_fn, eval_dataloader_fn) appropriate for the task.
     """
-    task = getattr(config, "task", "regression")  # Default to regression for backward compatibility
-
-    if task == "classification":
-        from models.cinema.cinema.classification.train import (
-            classification_loss,
-            classification_eval_dataloader,
-        )
-        return classification_loss, classification_eval_dataloader
-    else:
-        from models.cinema.cinema.regression.train import (
-            regression_loss,
-            regression_eval_dataloader,
-        )
-        return regression_loss, regression_eval_dataloader
+    adapter = get_centralized_task_adapter(config)
+    task_spec = adapter.task_spec
+    return task_spec.loss_fn_factory(), task_spec.eval_fn_factory()
 
 
 def load_combined_datasets(config: DictConfig) -> tuple[Dataset, Dataset, dict]:
@@ -65,9 +53,14 @@ def load_combined_datasets(config: DictConfig) -> tuple[Dataset, Dataset, dict]:
         train_class_distribution: dictionary mapping class labels to counts.
     """
     data_dir = Path(config.data.combined.dir).expanduser()
+    adapter = get_centralized_task_adapter(config)
+    task_spec = adapter.task_spec
 
-    class_col = config.data.class_column  # For classification, this is the column with class labels or binary labels
-    classes = config.data[class_col]
+    target_col = None
+    if getattr(config, "task", "classification") == "classification":
+        target_col = config.data.class_column
+    elif getattr(config, "task", "regression") == "regression":
+        target_col = config.data.regression_column
 
     train_meta_df = load_metadata(data_dir / "train_metadata.csv", metadata_type="train")
     val_meta_df = load_metadata(data_dir / "val_metadata.csv", metadata_type="val")
@@ -90,30 +83,40 @@ def load_combined_datasets(config: DictConfig) -> tuple[Dataset, Dataset, dict]:
 
     train_meta_df, val_meta_df = maybe_subset_dataset(config, train_meta_df, val_meta_df)
 
-    train_transform, val_transform = get_image_transforms(config)
-    train_dataset = EndDiastoleEndSystoleDataset(
+    train_transform, val_transform = task_spec.transform_factory(config)
+    train_dataset = task_spec.dataset_factory(
+        config=config,
         data_dir=data_dir / "train",
         meta_df=train_meta_df,
-        class_col=class_col,
-        classes=classes,
-        views=config.model.views,
         transform=train_transform,
+        train_meta_df=train_meta_df,
     )
-    val_dataset = EndDiastoleEndSystoleDataset(
+    val_dataset = task_spec.dataset_factory(
+        config=config,
         data_dir=data_dir / "val",
         meta_df=val_meta_df,
-        class_col=class_col,
-        classes=classes,
-        views=config.model.views,
         transform=val_transform,
+        train_meta_df=train_meta_df,
     )
 
     # Print the number of samples in each dataset per class / binary label for verification
-    logger.info("Training dataset class distribution:")
-    train_class_distribution = train_meta_df[class_col].value_counts().sort_index().to_dict()
-    logger.info(train_class_distribution)
-    logger.info("Validation dataset class distribution:")
-    logger.info(val_meta_df[class_col].value_counts().to_dict())
+    train_class_distribution: dict = {}
+    if getattr(config, "task") != "segmentation":
+        if getattr(config, "task", "classification") == "classification":
+            logger.info("Training dataset class distribution:")
+            train_class_distribution = train_meta_df[target_col].value_counts().sort_index().to_dict()
+            logger.info(train_class_distribution)
+            logger.info("Validation dataset class distribution:")
+            logger.info(val_meta_df[target_col].value_counts().to_dict())
+        elif getattr(config, "task", "regression") == "regression":
+            logger.info(
+                "Regression target stats: stat=%s mean=%s std=%s",
+                target_col,
+                train_dataset.reg_mean if hasattr(train_dataset, "reg_mean") else "N/A",
+                train_dataset.reg_std if hasattr(train_dataset, "reg_std") else "N/A",
+            )
+    else:
+        logger.info("Segmentation task — skipping class/regression distribution logging")
 
     return train_dataset, val_dataset, train_class_distribution
 
@@ -131,35 +134,36 @@ def load_per_client_val_dataloaders(config: DictConfig) -> dict[str, tuple[int, 
         Dictionary mapping client_id to (n_samples, dataloader).
     """
     data_dir = Path(config.data.combined.dir).expanduser()
+    adapter = get_centralized_task_adapter(config)
+    task_spec = adapter.task_spec
 
-    class_col = config.data.class_column  # For classification, this is the column with class labels or binary labels
-    classes = config.data[class_col]
-
+    train_meta_df = load_metadata(data_dir / "train_metadata.csv", metadata_type="train")
     val_meta_df = load_metadata(data_dir / "val_metadata.csv", metadata_type="val")
 
     # Filter by specific client if specified (for client-specific centralized training)
     client_name = getattr(config.data, "client_name", None)
     if client_name and client_name.lower() != "all":
         logger.info(f"Loading validation data for specific client: {client_name}")
+        train_meta_df = train_meta_df[train_meta_df["client"].str.lower() == client_name.lower()].reset_index(drop=True)
         val_meta_df = val_meta_df[val_meta_df["client"].str.lower() == client_name.lower()].reset_index(drop=True)
     # Otherwise, filter by client_ids for multi-client centralized training (if specified)
     elif hasattr(config.federated, "client_ids") and config.federated.client_ids is not None:
         logger.info(f"Filtering validation dataloaders for clients: {config.federated.client_ids}")
+        train_meta_df = train_meta_df[train_meta_df["client"].isin(config.federated.client_ids)].reset_index(drop=True)
         val_meta_df = val_meta_df[val_meta_df["client"].isin(config.federated.client_ids)].reset_index(drop=True)
 
-    val_transform = get_image_transforms(config)[1]  # Get val transform
+    val_transform = task_spec.transform_factory(config)[1]
 
     client_dataloaders = {}
     for client_id in val_meta_df["client"].unique():
         client_meta = val_meta_df[val_meta_df["client"] == client_id]
         # Single client case
-        val_dataset = EndDiastoleEndSystoleDataset(
+        val_dataset = task_spec.dataset_factory(
+            config=config,
             data_dir=data_dir / "val",
             meta_df=client_meta.reset_index(drop=True),
-            class_col=class_col,
-            classes=classes,
-            views=config.model.views,
             transform=val_transform,
+            train_meta_df=train_meta_df,
         )
         val_sampler = SequentialSampler(val_dataset)
         val_loader = DataLoader(
@@ -178,36 +182,9 @@ def load_per_client_val_dataloaders(config: DictConfig) -> dict[str, tuple[int, 
 
 
 def get_model(config: DictConfig) -> torch.nn.Module:
-    """Initialize model with optional LoRA (single or dual) using CineMA pattern."""
-
-    # Load pretrained model: freeze backbone unless doing full finetuning
-    freeze_backbone = config.model.get('freeze_pretrained', True) or config.train.use_lora
-
-    logger.info(f"Loading pretrained model (freeze_backbone={freeze_backbone})...")
-    model = ConvViT.from_pretrained(config=config, freeze=freeze_backbone)
-
-    # Apply LoRA if enabled (using lora.blocks_to_lora for both standard and dual LoRA)
-    blocks_to_lora = getattr(config.lora, 'blocks_to_lora', None)
-
-    if config.train.use_lora:
-        # Check if Dual LoRA is enabled
-        logger.info("Applying standard LoRA adapters...")
-        apply_lora_to_convvit(
-            model=model,
-            rank=config.lora.rank,
-            alpha=config.lora.alpha,
-            dropout=config.lora.dropout,
-            target_modules=config.lora.target_modules,
-            blocks_to_lora=blocks_to_lora,
-        )
-    elif config.model.get('freeze_pretrained', False):
-        # Head-only training: unfreeze classification head while keeping backbone frozen
-        logger.info("Head-only training mode: unfreezing classification head...")
-        if hasattr(model, 'pred_head_dict'):
-            for head_param in model.pred_head_dict.parameters():
-                head_param.requires_grad = True
-
-    return model
+    """Initialize model through shared task adapter factory."""
+    adapter = get_centralized_task_adapter(config)
+    return adapter.build_model(config)
 
 
 def save_checkpoint(
@@ -297,8 +274,10 @@ def run_train(  # noqa: C901
     use_class_weighted_loss = getattr(config.train, "use_class_weighted_loss", False)
     if getattr(config, "task", "regression") == "classification" and use_class_weighted_loss:
         from flwr_cinema.scripts.weighted_losses import wrap_loss_with_class_weights
-        loss_fn = wrap_loss_with_class_weights(loss_fn, train_class_distribution)
-        logger.info(f"Applied class-weighted BCE with distribution: {train_class_distribution}")
+        class_col = config.data.class_column
+        classes = config.data[class_col]
+        loss_fn = wrap_loss_with_class_weights(loss_fn, train_class_distribution, classes)
+        logger.info(f"Applied class-weighted CE with distribution: {train_class_distribution}")
     elif getattr(config, "task", "regression") == "classification":
         logger.info("Classification task without class-weighted loss (disabled in config)")
     config = maybe_reduce_batch_size(config, len(train_dataset))
@@ -604,7 +583,7 @@ def run_train(  # noqa: C901
 
 
 def main() -> None:
-    """Entrypoint for centralized regression training with federated-style validation.
+    """Entrypoint for centralized classification/regression training.
 
     Args:
         config: config loaded from yaml.
@@ -629,7 +608,7 @@ def main() -> None:
     try:
         GlobalHydra.instance().clear()  # Clear any existing Hydra instance
 
-        config_dir = Path(__file__).resolve().parents[4] / "configs"
+        config_dir = Path(__file__).resolve().parents[4] / "configs/centralized"
         with initialize_config_dir(version_base=None, config_dir=str(config_dir)):
             config = compose(config_name=args.config)
 

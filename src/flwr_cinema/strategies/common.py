@@ -31,46 +31,25 @@ def get_primary_metric_name(config) -> str:
         return "accuracy"
     else:
         return "mae"
-    
-def weighted_average_metrics(
-    metrics_records: list[RecordDict], weight_key: str = "num_samples"
-) -> MetricRecord:
-    """Aggregate validation metrics from clients using FedAvg (weighted average).
-    
-    This replaces aggregate_metrics() from the old server_app.py.
+
+
+def _infer_metric_direction(primary_metric_name: str) -> str:
+    """Infer optimization direction from metric name.
+
+    Handles common prefixes used in configs (e.g., ``val_mae``).
     """
-    if not metrics_records:
-        return MetricRecord()
-    total_samples = 0.0
-    weighted_metrics = {}
-    for record in metrics_records:
-        metrics = record.get("metrics", MetricRecord())
-        
-        # Get weight (number of validation samples from this client)
-        weight = float(metrics.get(weight_key, 0.0))
-        if weight == 0.0:
-            continue
-            
-        total_samples += weight
-        # Accumulate weighted metrics
-        for key, value in metrics.items():
-            # Skip non-numeric keys or the weight key itself
-            if key in [weight_key, "num_samples", "n_val_samples"] or not isinstance(value, (int, float)):
-                continue
-                
-            if key not in weighted_metrics:
-                weighted_metrics[key] = 0.0
-            weighted_metrics[key] += float(value) * weight
-    # Calculate final averages
-    if total_samples == 0:
-        return MetricRecord()
-    averaged_metrics = {
-        key: value / total_samples for key, value in weighted_metrics.items()
-    }
+    metric = (primary_metric_name or "").lower()
+    normalized = metric[4:] if metric.startswith("val_") else metric
+
+    metrics_to_minimize = {"mae", "mse", "rmse", "loss", "cross_entropy", "mean_distance"}
+    metrics_to_maximize = {"accuracy", "f1", "precision", "recall", "auc", "mcc", "roc_auc", "dice"}
+
+    if normalized in metrics_to_minimize or any(token in normalized for token in ("loss", "error", "distance")):
+        return "min"
+    if normalized in metrics_to_maximize or any(token in normalized for token in ("acc", "auc", "dice", "f1", "mcc")):
+        return "max"
+    return "min"
     
-    # Add total samples to the final record
-    averaged_metrics[f"total_{weight_key}"] = total_samples
-    return MetricRecord(averaged_metrics)
 
 class CinemaStrategyMixin:
     """Mixin class that adds step-based validation, checkpointing, and early stopping to any Flower strategy.
@@ -87,6 +66,7 @@ class CinemaStrategyMixin:
         self,
         eval_steps: int,
         primary_metric_name: str,
+        primary_metric_direction: str | None,
         early_stopping_patience: int,
         early_stopping_min_delta: float,
         global_model: nn.Module,
@@ -122,18 +102,10 @@ class CinemaStrategyMixin:
         self._eval_count = 0  # Track number of evaluations for first-eval checkpoint
         
         # Early Stopping Configuration
-        metrics_to_minimize = {"mae", "mse", "rmse", "loss", "cross_entropy"}
-        metrics_to_maximize = {"accuracy", "f1", "precision", "recall", "auc", "mcc", "roc_auc"}
-        
-        if primary_metric_name.lower() in metrics_to_minimize:
-            self.metric_direction = "minimize"
-            self.best_metric = float('inf')
-        elif primary_metric_name.lower() in metrics_to_maximize:
-            self.metric_direction = "maximize"
+        self.metric_direction = primary_metric_direction or _infer_metric_direction(primary_metric_name)
+        if self.metric_direction == "max":
             self.best_metric = -float('inf')
         else:
-            # logger.warning(f"Unknown metric direction for '{primary_metric_name}', defaulting to minimize")
-            self.metric_direction = "minimize"
             self.best_metric = float('inf')
             
         # Initialize Early Stopping
@@ -349,14 +321,14 @@ class CinemaStrategyMixin:
         if getattr(self, "early_stopping", None) is not None:
             # EarlyStopping always minimizes internally
             metric_for_early_stopping = current_metric
-            if self.metric_direction == "maximize":
+            if self.metric_direction == "max":
                 metric_for_early_stopping = -current_metric
             
             self.early_stopping.update(metric_for_early_stopping)
             
             # Format best metric for display
             # display_best = self.early_stopping.best_metric
-            # if self.metric_direction == "maximize" and display_best != float('inf'):
+            # if self.metric_direction == "max" and display_best != float('inf'):
             #     display_best = -display_best
             
             # logger.info(
