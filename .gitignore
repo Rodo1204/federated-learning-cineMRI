@@ -210,3 +210,10 @@ outputs
 src/flwr_cinema/scripts/notebook.ipynb
 src/flwr_cinema/scripts/prepare_mm_merge.py
 src/flwr_cinema/eval
+configs/cinema_classification_fed_mypc.yaml
+.claude
+src/flwr_cinema/utils/test_utils.py
+.vscode/settings.json
+GEMINI.md
+.atl/
+tests/

@@ -15,6 +15,8 @@ from flwr.app import (
     MetricRecord
 )
 
+from flwr.common.logger import log
+
 from models.cinema.cinema.device import get_amp_dtype_and_device
 from models.cinema.cinema.optim import GradScaler
 from flwr_cinema.scripts.lora import (
@@ -122,6 +124,7 @@ class BaseClient(ABC):
             trainable_params,
             lr=self.lr,
             weight_decay=self.weight_decay, # Better for LoRA 0.0
+            # betas=config.train.betas 
         ) # TODO: revisar si el optimizador es correcto con adamw en lugar de sgd
         self.loss_scaler = GradScaler()
         self.n_samples = len(self.train_loader.dataset) if self.train_loader else 0
@@ -163,15 +166,74 @@ class BaseClient(ABC):
         """Get model parameters to send to server."""
         if self.use_lora:
             if has_dual_lora(self.model):
+                log(logging.INFO, "Using dual LoRA")
                 return get_global_lora_and_head_state_dict(self.model)
                 # update["local_lora"] = get_local_lora_state_dict(self.model)
                 # return update
             else:
+                log(logging.INFO, "Using LoRA")
                 return get_lora_and_head_state_dict(self.model)
         elif self.freeze_pretrained:
+            log(logging.INFO, "Using frozen pretrained backbone")
             return get_trainable_state_dict(self.model)
         else:
+            log(logging.INFO, "Using full fine-tuning")
             return self.model.state_dict()
+        
+    def _compute_fedce(self, message: Message, model_state_dict: dict, updated_state_dict: dict, round_idx: int) -> dict | None:
+        """Compute FedCE metrics for the client."""
+
+        # TODO: dual LoRA specific handling may be updated in the future to contemplate local adapters... one problem solved one problem created :(
+        from flwr_cinema.utils.fedCE_utils import calculate_excluded_model, compute_fedCE_gamma_cos
+
+        in_strategy_data = message.content.config_records.get("strategy_data", ConfigRecord())
+        log(logging.INFO, f"Client {self.client_id} - Starting FedCE calculations for round {round_idx} with prev_rho: {in_strategy_data.get('prev_fedce_rho', 'N/A')}")
+        prev_rho = float(in_strategy_data.get("prev_fedce_rho", 0.0))
+        primary_metric_name = in_strategy_data.get("primary_metric_name", None)
+        primary_metric_direction = in_strategy_data.get("primary_metric_direction", "maximize")
+
+        in_global_gradient = message.content.array_records.get("global_gradient", ArrayRecord())
+        if in_global_gradient:
+            global_gradient = in_global_gradient.to_torch_state_dict(keep_input=False) # ∇F(w_k) send by server instead of calculated locally to save client resource
+
+            # w_k^-i
+            excluded_model = calculate_excluded_model( 
+                global_weights=model_state_dict,
+                local_weights=updated_state_dict,
+                prev_rho=prev_rho)
+            
+            gamma_err = 1e-4 # Default error value if primary metric is not provided or cannot be calculated
+            try:
+                self.update_model(excluded_model) # Update local model to excluded model to calculate validation metrics for FedCE
+                
+                # Γ_k,i(err)
+                _, metrics = self.validate_local()
+                primary_metric_value = metrics.get(primary_metric_name, None) if primary_metric_name else None
+                log(logging.INFO, f"Client {self.client_id} - FedCE primary metric value for round {round_idx}: {primary_metric_value}")
+                if primary_metric_value is not None:
+                    if primary_metric_direction == "maximize":
+                        gamma_err = 1.0 - primary_metric_value
+                    else:
+                        gamma_err = primary_metric_value
+
+                gamma_err = max(gamma_err, 1e-4) # Avoid zero or negative error. May need be cliped or transformed in some way depending on the scale of the primary metric.
+            finally:
+                self.update_model(updated_state_dict) # Update back to local model after calculating FedCE rho with excluded model
+                del excluded_model # Free memory
+
+            gamma_cos = compute_fedCE_gamma_cos(
+                global_weights=model_state_dict,
+                local_weights=updated_state_dict,
+                global_gradient=global_gradient,
+                prev_rho=prev_rho
+            )
+
+            log(logging.INFO, f"Client {self.client_id} - Completed FedCE calculations for round {round_idx} with gamma_cos: {gamma_cos}, gamma_err: {gamma_err}")
+            return {
+                "fedce_gamma_cos": float(gamma_cos),
+                "fedce_gamma_err": float(gamma_err)
+            }
+        return None
 
     # Abstract Methods
     @abstractmethod
@@ -196,12 +258,16 @@ class BaseClient(ABC):
         """Message handler method for training to be called directly from ClientApp decorators."""
         in_configs = message.content.config_records.get("config", ConfigRecord())
         round_idx = in_configs.get("server-round", 0)
+        use_fedce = in_configs.get("use_fedce", False)
+        model_state_dict = None
 
         in_params = message.content.array_records.get("model_params", ArrayRecord())
+        # log(logging.INFO, in_params.keys())
         if in_params:
             model_state_dict = in_params.to_torch_state_dict(keep_input=False)
             self.update_model(model_state_dict)
 
+        # Load local LoRA state dict if using dual LoRA and local LoRA state is available in context (e.g., stored from previous rounds). 
         if self.use_lora and has_dual_lora(self.model):
             if "local_lora" in context.state.array_records:
                 local_lora_record = context.state.array_records["local_lora"]
@@ -211,19 +277,18 @@ class BaseClient(ABC):
         num_samples = self.train_local(round_idx)
 
         updated_state_dict = self.get_model_update()
-        out_params = ArrayRecord.from_torch_state_dict(updated_state_dict, keep_input=False)
 
+        # Declare output records
         out_record = RecordDict()
-        out_record["model_params"] = out_params
+        out_metrics = MetricRecord()
+        out_configs = ConfigRecord()
+        out_params = None
 
         if self.use_lora and has_dual_lora(self.model):
             local_lora_dict = get_local_lora_state_dict(self.model)
             local_lora_record = ArrayRecord.from_torch_state_dict(local_lora_dict, keep_input=False)
             context.state.array_records["local_lora"] = local_lora_record  # Store local LoRA here to avoid potential issues with flower 
             out_record["local_lora_params"] = local_lora_record # TODO: only for debugging and testing, need to be removed later
-
-        out_configs = ConfigRecord()
-        # out_configs["server-round"] = round_idx
         
         # Calculate an estimate of the number of optimizer steps taken this round. Maybe changing this to count in the real optimizer step would be better
         optimizer_steps_this_round = 0 
@@ -231,13 +296,25 @@ class BaseClient(ABC):
             batches_per_epoch = len(self.train_loader)
             steps_per_epoch = (batches_per_epoch + self.n_accum_steps - 1) // self.n_accum_steps
             optimizer_steps_this_round = steps_per_epoch * self.local_epochs
-        out_configs["optimizer_steps_this_round"] = int(optimizer_steps_this_round)
-        
-        out_record["config"] = out_configs
 
-        out_metrics = MetricRecord()
+        out_configs["optimizer_steps_this_round"] = int(optimizer_steps_this_round)
+        out_configs["client_id"] = str(self.client_id)
+        out_record["config"] = out_configs
         out_metrics["num_samples"] = num_samples
+
+        agg_metrics = None
+        if use_fedce and round_idx > 1: # For FedCE, we start calculating and sending the additional metrics from the second round since we need at least one previous round to have meaningful information for the calculations
+            agg_metrics = self._compute_fedce(message, model_state_dict, updated_state_dict, round_idx)
+        
+        if agg_metrics is not None:
+            out_metrics.update(agg_metrics)
+        
+
+        out_params = ArrayRecord.from_torch_state_dict(updated_state_dict, keep_input=False)
+
+        out_record["model_params"] = out_params
         out_record["metrics"] = out_metrics
+
 
         return Message(content=out_record, reply_to=message)
 
@@ -267,6 +344,9 @@ class BaseClient(ABC):
         out_record = RecordDict()
         out_metrics = MetricRecord(safe_metrics)
         out_metrics["num_samples"] = num_val_samples
+        out_config = ConfigRecord()
+        out_config["client_id"] = str(self.client_id)
+        out_record["config"] = out_config
         out_record["metrics"] = out_metrics
 
         return Message(content=out_record, reply_to=message)

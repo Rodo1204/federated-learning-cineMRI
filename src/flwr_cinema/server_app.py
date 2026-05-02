@@ -146,11 +146,23 @@ def get_strategy(
     the Hydra config, including the global model reference for checkpointing.
     """
 
-    fed_strategy = getattr(config.federated, "strategy", "fedavg").lower()
-    if fed_strategy == "fedavg":
+    agg = getattr(config.federated, "aggregation_method", None)
+    agg_name = getattr(agg, "name", "fedavg").lower()
+    agg_config = getattr(agg, "config", None)
+    
+    kwargs = {
+        "arrayrecord_key": "model_params",
+        "weighted_by_key": "num_samples",  # Default to weighting by number of samples for aggregation, can be overridden by specific strategies if needed
+    }
+    if agg_name == "fedavg":
         from flwr_cinema.strategies.fedAvg import FedStrategy
+    elif agg_name == "fedce":
+        from flwr_cinema.strategies.fedCE import FedStrategy
+        kwargs.update({
+            "combination_method": getattr(agg_config, "combination_method", "multiplication"),
+        })
     else:
-        raise ValueError(f"Unknown strategy: {fed_strategy}")
+        raise ValueError(f"Unknown aggregation method: {agg_name}")
 
     # Build the load function with the server-side config
     def _load_arrays_fn(model, arrays):
@@ -169,8 +181,7 @@ def get_strategy(
         aggregate_head=getattr(config.federated, "aggregate_head", True),
         # FedAvg params can be added here as needed, e.g.:
         # fraction_train=config.federated.fraction_train,
-        arrayrecord_key="model_params",
-        weighted_by_key="num_samples", 
+        **kwargs
     )
 
 def save_final_model(
@@ -231,17 +242,48 @@ def save_final_model(
     ckpt_path = save_dir / f"global_model_final_round_{n_rounds}.pt"
     torch.save(checkpoint, ckpt_path)
 
+    train_metrics = {
+        str(k): dict(v) for k, v in result.train_metrics_clientapp.items()
+    }
+    evaluate_metrics = {
+        str(k): dict(v) for k, v in result.evaluate_metrics_clientapp.items()
+    }
+    evaluate_metrics_serverapp = {
+        str(k): dict(v) for k, v in result.evaluate_metrics_serverapp.items()
+    }
+    round_metadata = getattr(strategy, "round_metadata", {}) if strategy is not None else {}
+
+    all_rounds = sorted(
+        {
+            *train_metrics.keys(),
+            *evaluate_metrics.keys(),
+            *evaluate_metrics_serverapp.keys(),
+            *round_metadata.keys(),
+        },
+        key=lambda round_key: int(round_key),
+    )
+
+    rounds = []
+    for round_key in all_rounds:
+        metadata = round_metadata.get(round_key, {})
+        rounds.append({
+            "round": int(round_key),
+            "validation_round": round_key in evaluate_metrics or round_key in evaluate_metrics_serverapp,
+            "participants": metadata.get("participants", []),
+            "client_steps": metadata.get("client_steps", {}),
+            "total_optimizer_steps_avg": metadata.get("total_optimizer_steps"),
+            "train_metrics": train_metrics.get(round_key, {}),
+            "evaluate_metrics": evaluate_metrics.get(round_key, {}),
+            "evaluate_metrics_serverapp": evaluate_metrics_serverapp.get(round_key, {}),
+        })
+
     # Save metrics history as JSON for analysis 
     metrics_history = {
-        "train_metrics": {
-            str(k): dict(v) for k, v in result.train_metrics_clientapp.items()
-        },
-        "evaluate_metrics": {
-            str(k): dict(v) for k, v in result.evaluate_metrics_clientapp.items()
-        },
-        "evaluate_metrics_serverapp": {
-            str(k): dict(v) for k, v in result.evaluate_metrics_serverapp.items()
-        },
+        # "train_metrics": train_metrics, # Optional separated data but can be redundant with the rounds structure 
+        # "evaluate_metrics": evaluate_metrics,
+        # "evaluate_metrics_serverapp": evaluate_metrics_serverapp,
+        # "round_metadata": round_metadata, 
+        "rounds": rounds,
     }
     metrics_path = save_dir / "metrics_history.json"
     with open(metrics_path, "w") as f:
@@ -286,7 +328,7 @@ def main(grid: Grid, context: Context) -> None:
     arrays = ArrayRecord.from_torch_state_dict(get_model_params(config, global_model))
 
     strategy = get_strategy(config, global_model, save_dir)
-
+    
     result = strategy.start(
         grid=grid,
         initial_arrays=arrays,

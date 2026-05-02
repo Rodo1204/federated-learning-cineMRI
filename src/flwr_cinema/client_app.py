@@ -38,7 +38,7 @@ def get_model(config: DictConfig) -> torch.nn.Module:
     # Load pretrained model: freeze backbone unless doing full finetuning
     freeze_backbone = config.model.get('freeze_pretrained', True) or config.train.use_lora
     
-    # logger.info(f"Loading pretrained model (freeze_backbone={freeze_backbone})...")
+    # log(logging.INFO, f"Loading pretrained model (freeze_backbone={freeze_backbone})...")
     model = ConvViT.from_pretrained(config=config, freeze=freeze_backbone)
 
     # Apply LoRA if enabled (using lora.blocks_to_lora for both standard and dual LoRA)
@@ -293,7 +293,7 @@ def train(msg: Message, context: Context):
         metrics_save_path=metrics_save_path,
         stats_save_path=stats_save_path,
         eval_dataloader_fn=eval_dataloader_fn,
-        config=config,
+        config=config, # TODO: maybe client doesn't need full config, could just pass necessary fields or a subset of config related to training/evaluation
         run_dir=str(client_run_dir),
         n_accum_steps=n_accum_steps,
     )

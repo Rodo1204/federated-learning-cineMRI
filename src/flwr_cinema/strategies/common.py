@@ -1,4 +1,5 @@
 import logging
+from typing import Any
 from collections.abc import Callable, Iterable
 from pathlib import Path
 
@@ -111,11 +112,13 @@ class CinemaStrategyMixin:
         # Checkpoint management
         self.save_dir = Path(save_dir)
         self.save_dir.mkdir(parents=True, exist_ok=True)
+        (self.save_dir / "checkpoints").mkdir(parents=True, exist_ok=True)
         self.max_n_ckpts = max_n_ckpts
         self.saved_ckpt_paths: list[Path] = []
         self._latest_arrays: ArrayRecord | None = None
         self._latest_local_loras: dict[str, ArrayRecord] = {}  # client_id → local LoRA ArrayRecord
         self._latest_client_heads: dict[str, ArrayRecord] = {}  # client_id → head ArrayRecord (when aggregate_head=False)
+        self.round_metadata: dict[str, dict[str, Any]] = {}
         self._eval_count = 0  # Track number of evaluations for first-eval checkpoint
         
         # Early Stopping Configuration
@@ -191,7 +194,7 @@ class CinemaStrategyMixin:
             }
         
         # Save
-        ckpt_path = self.save_dir / f"ckpt_round_{server_round:03d}_steps_{self.total_optimizer_steps}.pt"
+        ckpt_path = self.save_dir / "checkpoints" / f"ckpt_round_{server_round:03d}_steps_{self.total_optimizer_steps}.pt"
         torch.save(checkpoint, ckpt_path)
         self.saved_ckpt_paths.append(ckpt_path)
         # logger.info(
@@ -227,7 +230,7 @@ class CinemaStrategyMixin:
         server_round: int,
         replies: Iterable[Message],
     ) -> tuple[ArrayRecord | None, MetricRecord | None]:
-        """Aggregate training results and extract average optimizer steps."""
+        """Aggregate training results and record lightweight round metadata."""
         
         # Convert to list to avoid consuming the iterator before super() can use it
         replies_list = list(replies)
@@ -239,8 +242,13 @@ class CinemaStrategyMixin:
         
         round_steps = 0
         n_clients_with_steps = 0
+        round_client_steps: dict[str, dict[str, int]] = {}
+        round_key = str(int(server_round))
         for msg in replies_list:
-            client_id = str(msg.metadata.src_node_id)
+            config_record = msg.content.config_records.get("config", ConfigRecord())
+            logical_client_id = config_record.get("client_id")
+            client_id = str(logical_client_id) if logical_client_id is not None else str(msg.metadata.src_node_id)
+            client_entry: dict[str, int] = {}
             
             # Strip head params from model_params if not aggregating heads
             if not self.aggregate_head:
@@ -259,11 +267,20 @@ class CinemaStrategyMixin:
                 if steps > 0:
                     round_steps += steps
                     n_clients_with_steps += 1
+                    client_entry["optimizer_steps_this_round"] = int(steps)
+
+            metrics_record = msg.content.metric_records.get("metrics")
+            if isinstance(metrics_record, MetricRecord):
+                num_samples = metrics_record.get("num_samples")
+                if isinstance(num_samples, (int, float)):
+                    client_entry["n_train_samples"] = int(num_samples)
             
             # Extract local LoRA (Dual LoRA, not aggregated, for archival)
             local_lora = msg.content.array_records.get("local_lora_params")
             if local_lora is not None:
                 self._latest_local_loras[client_id] = local_lora
+
+            round_client_steps[client_id] = client_entry
         
         # 2. Call the base strategy (FedAvg, FedAdam, etc.) — heads are already stripped
         agg_arrays, agg_metrics = super().aggregate_train(server_round, replies_list)
@@ -272,7 +289,13 @@ class CinemaStrategyMixin:
         if n_clients_with_steps > 0:
             avg_steps = int(round_steps / n_clients_with_steps)
             self.total_optimizer_steps += avg_steps
-            
+
+        self.round_metadata[round_key] = {
+            "participants": sorted(round_client_steps.keys()),
+            "client_steps": round_client_steps,
+            "total_optimizer_steps": int(self.total_optimizer_steps),
+        }
+              
         return agg_arrays, agg_metrics
     
     def configure_evaluate(
@@ -315,7 +338,7 @@ class CinemaStrategyMixin:
     ) -> MetricRecord | None:
         """Aggregate evaluation metrics, step EarlyStopping, and save checkpoint if improved."""
         metrics = super().aggregate_evaluate(server_round, replies)
-        
+
         if metrics is None or self.primary_metric_name not in metrics:
             return metrics
         
