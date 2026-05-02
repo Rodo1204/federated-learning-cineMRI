@@ -1,29 +1,42 @@
+"""Generic federated client for all tasks.
+
+A single concrete class that receives ``loss_fn`` and ``eval_dataloader_fn``
+via constructor injection — no ABC, no subclassing needed.
+"""
+
+from __future__ import annotations
+
 import logging
-from abc import ABC, abstractmethod
 from typing import Any, Callable
 
 import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
-from flwr.app import (
-    Message, 
-    Context, 
-    RecordDict, 
-    ArrayRecord, 
-    ConfigRecord, 
-    MetricRecord
-)
 
+from flwr.app import (
+    ArrayRecord,
+    ConfigRecord,
+    Context,
+    Message,
+    MetricRecord,
+    RecordDict,
+)
 from flwr.common.logger import log
 
 from models.cinema.cinema.device import get_amp_dtype_and_device
 from models.cinema.cinema.optim import GradScaler
+from models.cinema.cinema.train import train_one_epoch
 from flwr_cinema.scripts.lora import (
-    get_lora_and_head_state_dict, load_lora_and_head_state_dict,
-    get_global_lora_and_head_state_dict, load_global_lora_and_head_state_dict,
-    get_local_lora_state_dict, get_trainable_state_dict,
-    load_trainable_state_dict, has_dual_lora, load_local_lora_state_dict
+    get_global_lora_and_head_state_dict,
+    get_local_lora_state_dict,
+    get_lora_and_head_state_dict,
+    get_trainable_state_dict,
+    has_dual_lora,
+    load_global_lora_and_head_state_dict,
+    load_local_lora_state_dict,
+    load_lora_and_head_state_dict,
+    load_trainable_state_dict,
 )
 
 logger = logging.getLogger(__name__)
@@ -49,8 +62,53 @@ def _to_flwr_metric_value(value: Any) -> int | float | list[int] | list[float] |
         return converted
     return None
 
-class BaseClient(ABC):
-    """Abstract Base Class for Federated Learning Clients using Flower's Message API."""
+
+class FederatedClient:
+    """Generic federated learning client for all CineMA tasks.
+
+    Loss and evaluation functions are injected via constructor so the same
+    class serves classification, regression, and segmentation without
+    subclassing.
+
+    Parameters
+    ----------
+    client_id : str
+        Unique client identifier.
+    model : nn.Module
+        Local model (initialized same as global).
+    train_loader : DataLoader
+        Local training data loader.
+    loss_fn : Callable
+        Task-specific loss function.
+    views : list[str]
+        Views to use.
+    local_epochs : int
+        Number of local training epochs per round.
+    lr : float
+        Learning rate.
+    weight_decay : float
+        Weight decay for optimizer.
+    clip_grad : float | None
+        Gradient clipping value.
+    use_lora : bool
+        Whether using LoRA.
+    freeze_pretrained : bool
+        Whether pretrained backbone is frozen.
+    val_loader : DataLoader, optional
+        Local validation data loader.
+    metrics_save_path : str, optional
+        Path to save metrics.
+    stats_save_path : str, optional
+        Path to save statistics.
+    run_dir : str, optional
+        Directory to save run files.
+    eval_dataloader_fn : Callable, optional
+        Function to evaluate model on a dataloader.
+    config : object, optional
+        Configuration object.
+    n_accum_steps : int
+        Number of gradient accumulation steps.
+    """
 
     def __init__(
         self,
@@ -65,36 +123,14 @@ class BaseClient(ABC):
         clip_grad: float | None = None,
         use_lora: bool = True,
         freeze_pretrained: bool = False,
-        val_loader: DataLoader = None,
-        metrics_save_path: str = None,
-        stats_save_path: str = None,
-        run_dir: str = None,
-        eval_dataloader_fn: Callable = None,
-        config: object = None,
+        val_loader: DataLoader | None = None,
+        metrics_save_path: str | None = None,
+        stats_save_path: str | None = None,
+        run_dir: str | None = None,
+        eval_dataloader_fn: Callable | None = None,
+        config: object | None = None,
         n_accum_steps: int = 1,
     ) -> None:
-        """Initialize federated client.
-        
-        Args:
-            client_id: Unique client identifier.
-            model: Local model (initialized same as global).
-            train_loader: Local training data loader.
-            loss_fn: Loss function for training.
-            views: List of views to use.
-            local_epochs: Number of local training epochs per round.
-            lr: Learning rate.
-            weight_decay: Weight decay for optimizer.
-            clip_grad: Gradient clipping value.
-            use_lora: Whether using LoRA.
-            freeze_pretrained: Whether pretrained backbone is frozen.
-            val_loader: Local validation data loader.
-            metrics_save_path: Path to save metrics.
-            stats_save_path: Path to save statistics.
-            run_dir: Directory to save run files.
-            eval_dataloader_fn: Function to create evaluation data loader.
-            config: Configuration object.
-            n_accum_steps: Number of gradient accumulation steps.
-        """
         self.client_id = client_id
         self.model = model
         self.train_loader = train_loader
@@ -110,11 +146,11 @@ class BaseClient(ABC):
         self.metrics_save_path = metrics_save_path
         self.stats_save_path = stats_save_path
         self.run_dir = run_dir
-        self.metrics_history = []  # Store metrics for each round
+        self.metrics_history: list[dict] = []
         self.eval_dataloader_fn = eval_dataloader_fn
-        self.config = config  # Store config for train_one_epoch (now DictConfig)
+        self.config = config
         self.n_accum_steps = n_accum_steps
-        
+
         self.amp_dtype, self.device = get_amp_dtype_and_device()
         self.model.to(self.device)
 
@@ -123,16 +159,23 @@ class BaseClient(ABC):
         self.optimizer = torch.optim.AdamW(
             trainable_params,
             lr=self.lr,
-            weight_decay=self.weight_decay, # Better for LoRA 0.0
-            # betas=config.train.betas 
-        ) # TODO: revisar si el optimizador es correcto con adamw en lugar de sgd
+            weight_decay=self.weight_decay,
+        ) # TODO: verificar con centralized
         self.loss_scaler = GradScaler()
         self.n_samples = len(self.train_loader.dataset) if self.train_loader else 0
         self.n_val_samples = len(self.val_loader.dataset) if self.val_loader else 0
 
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
     def get_patch_and_spacing_dicts(self) -> tuple[dict, dict]:
-        """Helper to compute specific dicts for evaluation metrics."""
-        views = [self.config.model.views] if isinstance(self.config.model.views, str) else self.config.model.views
+        """Compute spacing/patch size dicts for evaluation metrics."""
+        views = (
+            [self.config.model.views]
+            if isinstance(self.config.model.views, str)
+            else self.config.model.views
+        )
         patch_size_dict = {
             v: self.config.data.sax.patch_size if v == "sax" else self.config.data.lax.patch_size
             for v in views
@@ -143,7 +186,10 @@ class BaseClient(ABC):
         }
         return patch_size_dict, spacing_dict
 
-    # Model Update Management
+    # ------------------------------------------------------------------
+    # Model update / get
+    # ------------------------------------------------------------------
+
     def update_model(self, server_params: dict) -> None:
         """Update local model with parameters from server."""
         if self.use_lora:
@@ -160,7 +206,6 @@ class BaseClient(ABC):
             for name, buffer in self.model.named_buffers():
                 if name in server_params:
                     buffer.data.copy_(server_params[name].to(buffer.device))
-        # logger.debug("Updated local model with server parameters") TODO: Add logging
 
     def get_model_update(self) -> dict:
         """Get model parameters to send to server."""
@@ -168,8 +213,6 @@ class BaseClient(ABC):
             if has_dual_lora(self.model):
                 log(logging.INFO, "Using dual LoRA")
                 return get_global_lora_and_head_state_dict(self.model)
-                # update["local_lora"] = get_local_lora_state_dict(self.model)
-                # return update
             else:
                 log(logging.INFO, "Using LoRA")
                 return get_lora_and_head_state_dict(self.model)
@@ -179,122 +222,194 @@ class BaseClient(ABC):
         else:
             log(logging.INFO, "Using full fine-tuning")
             return self.model.state_dict()
-        
-    def _compute_fedce(self, message: Message, model_state_dict: dict, updated_state_dict: dict, round_idx: int) -> dict | None:
-        """Compute FedCE metrics for the client."""
 
-        # TODO: dual LoRA specific handling may be updated in the future to contemplate local adapters... one problem solved one problem created :(
-        from flwr_cinema.utils.fedCE_utils import calculate_excluded_model, compute_fedCE_gamma_cos
+    # ------------------------------------------------------------------
+    # Local training / validation (concrete, task injected)
+    # ------------------------------------------------------------------
 
-        in_strategy_data = message.content.config_records.get("strategy_data", ConfigRecord())
-        log(logging.INFO, f"Client {self.client_id} - Starting FedCE calculations for round {round_idx} with prev_rho: {in_strategy_data.get('prev_fedce_rho', 'N/A')}")
+    def train_local(self, round_idx: int) -> int:
+        """Local training loop using the injected ``loss_fn``."""
+        self.model.train()
+        n_samples_trained = 0
+
+        for local_epoch in range(self.local_epochs):
+            global_epoch = round_idx * self.local_epochs + local_epoch
+            self.optimizer.zero_grad(set_to_none=True)
+
+            n_samples_trained = train_one_epoch(
+                model=self.model,
+                train_dataloader=self.train_loader,
+                optimizer=self.optimizer,
+                loss_scaler=self.loss_scaler,
+                amp_dtype=self.amp_dtype,
+                device=self.device,
+                epoch=global_epoch,
+                n_accum_steps=self.n_accum_steps,
+                n_samples=n_samples_trained,
+                config=self.config,
+                wandb_run=None,
+                loss_fn=self.loss_fn,
+            )
+
+        return self.n_samples
+
+    def validate_local(self) -> tuple[int, dict]:
+        """Local validation using the injected ``eval_dataloader_fn``."""
+        if self.val_loader is None or self.eval_dataloader_fn is None:
+            return 0, {}
+
+        patch_size_dict, spacing_dict = self.get_patch_and_spacing_dicts()
+
+        self.model.eval()
+        metrics = self.eval_dataloader_fn(
+            self.model,
+            self.val_loader,
+            patch_size_dict,
+            spacing_dict,
+            self.amp_dtype,
+            self.device,
+        )
+
+        return self.n_val_samples, metrics
+
+    # ------------------------------------------------------------------
+    # FedCE computation
+    # ------------------------------------------------------------------
+
+    def _compute_fedce(
+        self,
+        message: Message,
+        model_state_dict: dict,
+        updated_state_dict: dict,
+        round_idx: int,
+    ) -> dict | None:
+        """Compute FedCE gamma metrics for the client."""
+        from flwr_cinema.utils.fedCE_utils import (
+            calculate_excluded_model,
+            compute_fedCE_gamma_cos,
+        )
+
+        in_strategy_data = message.content.config_records.get(
+            "strategy_data", ConfigRecord()
+        )
+        log(
+            logging.INFO,
+            f"Client {self.client_id} - Starting FedCE calculations for "
+            f"round {round_idx} with prev_rho: "
+            f"{in_strategy_data.get('prev_fedce_rho', 'N/A')}",
+        )
         prev_rho = float(in_strategy_data.get("prev_fedce_rho", 0.0))
         primary_metric_name = in_strategy_data.get("primary_metric_name", None)
-        primary_metric_direction = in_strategy_data.get("primary_metric_direction", "maximize")
+        primary_metric_direction = in_strategy_data.get(
+            "primary_metric_direction", "maximize"
+        )
 
-        in_global_gradient = message.content.array_records.get("global_gradient", ArrayRecord())
+        in_global_gradient = message.content.array_records.get(
+            "global_gradient", ArrayRecord()
+        )
         if in_global_gradient:
-            global_gradient = in_global_gradient.to_torch_state_dict(keep_input=False) # ∇F(w_k) send by server instead of calculated locally to save client resource
+            global_gradient = in_global_gradient.to_torch_state_dict(keep_input=False)
 
-            # w_k^-i
-            excluded_model = calculate_excluded_model( 
+            excluded_model = calculate_excluded_model(
                 global_weights=model_state_dict,
                 local_weights=updated_state_dict,
-                prev_rho=prev_rho)
-            
-            gamma_err = 1e-4 # Default error value if primary metric is not provided or cannot be calculated
+                prev_rho=prev_rho,
+            )
+
+            gamma_err = 1e-4
             try:
-                self.update_model(excluded_model) # Update local model to excluded model to calculate validation metrics for FedCE
-                
-                # Γ_k,i(err)
+                self.update_model(excluded_model)
+
                 _, metrics = self.validate_local()
-                primary_metric_value = metrics.get(primary_metric_name, None) if primary_metric_name else None
-                log(logging.INFO, f"Client {self.client_id} - FedCE primary metric value for round {round_idx}: {primary_metric_value}")
+                primary_metric_value = (
+                    metrics.get(primary_metric_name, None)
+                    if primary_metric_name
+                    else None
+                )
+                log(
+                    logging.INFO,
+                    f"Client {self.client_id} - FedCE primary metric value "
+                    f"for round {round_idx}: {primary_metric_value}",
+                )
                 if primary_metric_value is not None:
                     if primary_metric_direction == "maximize":
                         gamma_err = 1.0 - primary_metric_value
                     else:
                         gamma_err = primary_metric_value
 
-                gamma_err = max(gamma_err, 1e-4) # Avoid zero or negative error. May need be cliped or transformed in some way depending on the scale of the primary metric.
+                gamma_err = max(gamma_err, 1e-4)
             finally:
-                self.update_model(updated_state_dict) # Update back to local model after calculating FedCE rho with excluded model
-                del excluded_model # Free memory
+                self.update_model(updated_state_dict)
+                del excluded_model
 
             gamma_cos = compute_fedCE_gamma_cos(
                 global_weights=model_state_dict,
                 local_weights=updated_state_dict,
                 global_gradient=global_gradient,
-                prev_rho=prev_rho
+                prev_rho=prev_rho,
             )
 
-            log(logging.INFO, f"Client {self.client_id} - Completed FedCE calculations for round {round_idx} with gamma_cos: {gamma_cos}, gamma_err: {gamma_err}")
+            log(
+                logging.INFO,
+                f"Client {self.client_id} - Completed FedCE calculations for "
+                f"round {round_idx} with gamma_cos: {gamma_cos}, gamma_err: {gamma_err}",
+            )
             return {
                 "fedce_gamma_cos": float(gamma_cos),
-                "fedce_gamma_err": float(gamma_err)
+                "fedce_gamma_err": float(gamma_err),
             }
         return None
 
-    # Abstract Methods
-    @abstractmethod
-    def train_local(self, round_idx: int) -> int:
-        """Local training loop. Must be implemented by subclasses.
-        Returns:
-            num_samples: Number of training samples processed.
-        """
-        pass
+    # ------------------------------------------------------------------
+    # Flower Message API
+    # ------------------------------------------------------------------
 
-    @abstractmethod
-    def validate_local(self) -> tuple[int, dict]:
-        """Local validation loop. Must be implemented by subclasses.
-        Returns:
-            num_val_samples: Number of validation samples processed.
-            metrics: Dictionary of validation metrics.
-        """
-        pass
-
-    # Flower Message API Implementations
     def train(self, message: Message, context: Context) -> Message:
-        """Message handler method for training to be called directly from ClientApp decorators."""
+        """Handle train message from server."""
         in_configs = message.content.config_records.get("config", ConfigRecord())
         round_idx = in_configs.get("server-round", 0)
         use_fedce = in_configs.get("use_fedce", False)
         model_state_dict = None
 
-        in_params = message.content.array_records.get("model_params", ArrayRecord())
-        # log(logging.INFO, in_params.keys())
+        in_params = message.content.array_records.get(
+            "model_params", ArrayRecord()
+        )
         if in_params:
             model_state_dict = in_params.to_torch_state_dict(keep_input=False)
             self.update_model(model_state_dict)
 
-        # Load local LoRA state dict if using dual LoRA and local LoRA state is available in context (e.g., stored from previous rounds). 
+        # Load local LoRA if using dual LoRA
         if self.use_lora and has_dual_lora(self.model):
             if "local_lora" in context.state.array_records:
                 local_lora_record = context.state.array_records["local_lora"]
-                local_lora_state_dict = local_lora_record.to_torch_state_dict(keep_input=False)
+                local_lora_state_dict = local_lora_record.to_torch_state_dict(
+                    keep_input=False
+                )
                 load_local_lora_state_dict(self.model, local_lora_state_dict)
 
         num_samples = self.train_local(round_idx)
 
         updated_state_dict = self.get_model_update()
 
-        # Declare output records
         out_record = RecordDict()
         out_metrics = MetricRecord()
         out_configs = ConfigRecord()
-        out_params = None
 
         if self.use_lora and has_dual_lora(self.model):
             local_lora_dict = get_local_lora_state_dict(self.model)
-            local_lora_record = ArrayRecord.from_torch_state_dict(local_lora_dict, keep_input=False)
-            context.state.array_records["local_lora"] = local_lora_record  # Store local LoRA here to avoid potential issues with flower 
-            out_record["local_lora_params"] = local_lora_record # TODO: only for debugging and testing, need to be removed later
-        
-        # Calculate an estimate of the number of optimizer steps taken this round. Maybe changing this to count in the real optimizer step would be better
-        optimizer_steps_this_round = 0 
+            local_lora_record = ArrayRecord.from_torch_state_dict(
+                local_lora_dict, keep_input=False
+            )
+            context.state.array_records["local_lora"] = local_lora_record
+            out_record["local_lora_params"] = local_lora_record
+
+        # Estimate optimizer steps this round
+        optimizer_steps_this_round = 0
         if self.train_loader is not None:
             batches_per_epoch = len(self.train_loader)
-            steps_per_epoch = (batches_per_epoch + self.n_accum_steps - 1) // self.n_accum_steps
+            steps_per_epoch = (
+                batches_per_epoch + self.n_accum_steps - 1
+            ) // self.n_accum_steps
             optimizer_steps_this_round = steps_per_epoch * self.local_epochs
 
         out_configs["optimizer_steps_this_round"] = int(optimizer_steps_this_round)
@@ -303,26 +418,29 @@ class BaseClient(ABC):
         out_metrics["num_samples"] = num_samples
 
         agg_metrics = None
-        if use_fedce and round_idx > 1: # For FedCE, we start calculating and sending the additional metrics from the second round since we need at least one previous round to have meaningful information for the calculations
-            agg_metrics = self._compute_fedce(message, model_state_dict, updated_state_dict, round_idx)
-        
+        if use_fedce and round_idx > 1:
+            agg_metrics = self._compute_fedce(
+                message, model_state_dict, updated_state_dict, round_idx
+            )
+
         if agg_metrics is not None:
             out_metrics.update(agg_metrics)
-        
 
-        out_params = ArrayRecord.from_torch_state_dict(updated_state_dict, keep_input=False)
-
+        out_params = ArrayRecord.from_torch_state_dict(
+            updated_state_dict, keep_input=False
+        )
         out_record["model_params"] = out_params
         out_record["metrics"] = out_metrics
-
 
         return Message(content=out_record, reply_to=message)
 
     def evaluate(self, message: Message, context: Context) -> Message:
-        """Message handler method for evaluation to be called directly from ClientApp decorators."""
+        """Handle evaluate message from server."""
         in_configs = message.content.config_records.get("config", ConfigRecord())
 
-        in_params = message.content.array_records.get("model_params", ArrayRecord()) 
+        in_params = message.content.array_records.get(
+            "model_params", ArrayRecord()
+        )
         if in_params:
             model_state_dict = in_params.to_torch_state_dict(keep_input=False)
             self.update_model(model_state_dict)
@@ -330,7 +448,9 @@ class BaseClient(ABC):
         if self.use_lora and has_dual_lora(self.model):
             if "local_lora" in context.state.array_records:
                 local_lora_record = context.state.array_records["local_lora"]
-                local_lora_state_dict = local_lora_record.to_torch_state_dict(keep_input=False)
+                local_lora_state_dict = local_lora_record.to_torch_state_dict(
+                    keep_input=False
+                )
                 load_local_lora_state_dict(self.model, local_lora_state_dict)
 
         num_val_samples, metrics = self.validate_local()
