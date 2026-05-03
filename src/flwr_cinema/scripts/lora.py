@@ -20,6 +20,7 @@ from models.cinema.cinema.log import get_logger
 
 if TYPE_CHECKING:
     from models.cinema.cinema.convvit import ConvViT
+    from models.cinema.cinema.segmentation.convunetr import ConvUNetR
 
 logger = get_logger(__name__)
 
@@ -218,13 +219,13 @@ class DualLoRALinear(nn.Module):
 
 
 def count_lora_parameters_by_block(
-    model: ConvViT,
+    model: ConvViT | ConvUNetR,
     blocks_to_lora: list[int] | None = None,
 ) -> dict:
     """Count LoRA parameters by block index.
     
     Args:
-        model: ConvViT model with LoRA adapters applied.
+        model: ConvViT or ConvUNetR model with LoRA adapters applied.
         blocks_to_lora: List of block indices with LoRA (if None, checks all blocks).
         
     Returns:
@@ -420,6 +421,107 @@ def apply_lora_to_convvit(
         f"({100 * lora_params / total_params:.2f}%)"
     )
     logger.debug(f"Parameter breakdown: {param_counts}")
+
+def apply_lora_to_convunetr(
+    model: ConvUNetR,
+    rank: int = 8,
+    alpha: float = 16.0,
+    dropout: float = 0.0,
+    target_modules: list[str] | None = None,
+    blocks_to_lora: list[int] | None = None,
+) -> None:
+    """Apply LoRA adapters to ConvUNetR model's transformer attention layers (only to convViT encoder, decoder remains unchanged).
+    
+    This function:
+    1. Applies LoRA to specified (or all) attention Q/K/V projections in ViT encoder blocks
+    2. Freezes all pretrained parameters (encoders, fusion, prediction heads)
+    3. Only LoRA and decoder parameters remain trainable
+    
+    Args:
+        model: ConvUNetR model instance.
+        rank: LoRA rank (typically 4-16).
+        alpha: LoRA alpha scaling (typically 16-32, or 1x-4x of rank).
+        dropout: LoRA dropout rate (typically 0.0-0.1).
+        target_modules: Which attention modules to adapt. Default ["q", "kv"].
+        blocks_to_lora: List of block indices to apply LoRA to. If None, applies to all blocks (0-11 for ViT-B).
+                       Example: [8, 9, 10, 11] for last 4 blocks, [0, 1, 2, 3] for first 4 blocks.
+    """
+
+    # First, freeze all model parameters
+    for param in model.parameters():
+        param.requires_grad = False
+    
+    # Default: apply to all blocks if not specified
+    encoder = model.encoder
+    if blocks_to_lora is None and hasattr(encoder, "blocks"):
+        blocks_to_lora = list(range(len(encoder.blocks)))
+    
+    # Validate block indices
+    if blocks_to_lora and hasattr(encoder, "blocks"):
+        invalid_blocks = [b for b in blocks_to_lora if b < 0 or b >= len(encoder.blocks)]
+        if invalid_blocks:
+            logger.warning(
+                f"Invalid block indices {invalid_blocks}. Valid range: [0, {len(encoder.blocks)-1}]. "
+                f"Using valid blocks from {blocks_to_lora}."
+            )
+            blocks_to_lora = [b for b in blocks_to_lora if 0 <= b < len(encoder.blocks)]
+    
+    logger.info(
+        f"Applying LoRA (rank={rank}, alpha={alpha}, dropout={dropout}) to ViT encoder attention layers. "
+        f"Blocks: {blocks_to_lora}"
+    )
+    
+    # Apply LoRA to selected encoder blocks
+    lora_count = 0
+    if hasattr(encoder, "blocks"):
+        for block_idx, block in enumerate(encoder.blocks):
+            # Only apply LoRA to blocks in blocks_to_lora list
+            if block_idx in blocks_to_lora and hasattr(block, "attn"):
+                apply_lora_to_attention(
+                    attention_module=block.attn,
+                    rank=rank,
+                    alpha=alpha,
+                    dropout=dropout,
+                    target_modules=target_modules,
+                )
+                lora_count += 1
+                logger.debug(f"Applied LoRA to encoder block {block_idx}")
+
+    # Unfreeze decoder parameters and prediction heads for task-specific fine-tuning
+    for view in model.views:
+        if hasattr(model, 'dec_image_conv_block_dict') and view in model.dec_image_conv_block_dict:
+            for param in model.dec_image_conv_block_dict[view].parameters():
+                param.requires_grad = True
+        if hasattr(model, 'dec_down_blocks_dict') and view in model.dec_down_blocks_dict:
+            for param in model.dec_down_blocks_dict[view].parameters():
+                param.requires_grad = True
+        if hasattr(model, 'dec_conv_blocks_dict') and view in model.dec_conv_blocks_dict:
+            for param in model.dec_conv_blocks_dict[view].parameters():
+                param.requires_grad = True
+        if hasattr(model, 'decoder_dict') and view in model.decoder_dict:
+            for param in model.decoder_dict[view].parameters():
+                param.requires_grad = True
+        if hasattr(model, 'pred_head_dict'):
+            for param in model.pred_head_dict[view].parameters():
+                param.requires_grad = True
+
+        logger.info(f"Unfroze decoder parameters and prediction heads for task-specific training on view {view}")
+    
+    # Count trainable parameters
+    lora_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    total_params = sum(p.numel() for p in model.parameters())
+    
+    # Count per-block parameters
+    # param_counts = count_lora_parameters_by_block(model, blocks_to_lora)
+    
+    logger.info(
+        f"LoRA applied to {lora_count} attention blocks. "
+        f"Trainable params: {lora_params:,} / {total_params:,} "
+        f"({100 * lora_params / total_params:.2f}%)"
+    )
+    # logger.debug(f"Parameter breakdown: {param_counts}")
+
+
 
 
 def apply_dual_lora_to_convvit(
@@ -679,8 +781,7 @@ def load_lora_and_head_state_dict(model: nn.Module, combined_state_dict: dict[st
                 key = f"pred_head_dict.{view_name}.{param_name}"
                 if key in combined_state_dict:
                     param.data.copy_(combined_state_dict[key])
-
-
+    
 def merge_all_lora_weights(model: nn.Module) -> None:
     """Merge all LoRA weights into original layers for inference.
     
@@ -693,6 +794,195 @@ def merge_all_lora_weights(model: nn.Module) -> None:
         if isinstance(module, (LoRALinear, DualLoRALinear)):
             module.merge_weights()
     logger.info("Merged all LoRA weights into base model")
+
+
+# Standard LoRA + decoder + head state dict functions (for ConvUNetR FedAvg)
+
+def _extract_lora_params(state_dict: dict[str, torch.Tensor], model: nn.Module) -> None:
+    """Extract standard LoRA parameters from model into state_dict."""
+    for name, module in model.named_modules():
+        if isinstance(module, LoRALinear):
+            state_dict[f"{name}.lora_a"] = module.lora_a.data.clone()
+            state_dict[f"{name}.lora_b"] = module.lora_b.data.clone()
+
+
+def _load_lora_params(model: nn.Module, state_dict: dict[str, torch.Tensor]) -> None:
+    """Load standard LoRA parameters from state_dict into model."""
+    for name, module in model.named_modules():
+        if isinstance(module, LoRALinear):
+            lora_a_key = f"{name}.lora_a"
+            lora_b_key = f"{name}.lora_b"
+            if lora_a_key in state_dict:
+                module.lora_a.data.copy_(state_dict[lora_a_key])
+            if lora_b_key in state_dict:
+                module.lora_b.data.copy_(state_dict[lora_b_key])
+
+
+def _extract_decoder_params(state_dict: dict[str, torch.Tensor], model: nn.Module) -> None:
+    """Extract decoder parameters from ConvUNetR model into state_dict."""
+    for view in model.views:
+        if hasattr(model, 'dec_image_conv_block_dict') and view in model.dec_image_conv_block_dict:
+            prefix = f"dec_image_conv_block_dict.{view}"
+            for param_name, param in model.dec_image_conv_block_dict[view].named_parameters():
+                state_dict[f"{prefix}.{param_name}"] = param.data.clone()
+
+        if hasattr(model, 'dec_down_blocks_dict') and view in model.dec_down_blocks_dict:
+            prefix = f"dec_down_blocks_dict.{view}"
+            for param_name, param in model.dec_down_blocks_dict[view].named_parameters():
+                state_dict[f"{prefix}.{param_name}"] = param.data.clone()
+
+        if hasattr(model, 'dec_conv_blocks_dict') and view in model.dec_conv_blocks_dict:
+            prefix = f"dec_conv_blocks_dict.{view}"
+            for param_name, param in model.dec_conv_blocks_dict[view].named_parameters():
+                state_dict[f"{prefix}.{param_name}"] = param.data.clone()
+
+        if hasattr(model, 'decoder_dict') and view in model.decoder_dict:
+            prefix = f"decoder_dict.{view}"
+            for param_name, param in model.decoder_dict[view].named_parameters():
+                state_dict[f"{prefix}.{param_name}"] = param.data.clone()
+
+
+def _load_decoder_params(model: nn.Module, state_dict: dict[str, torch.Tensor]) -> None:
+    """Load decoder parameters from state_dict into ConvUNetR model."""
+    for view in model.views:
+        if hasattr(model, 'dec_image_conv_block_dict') and view in model.dec_image_conv_block_dict:
+            prefix = f"dec_image_conv_block_dict.{view}"
+            for param_name, param in model.dec_image_conv_block_dict[view].named_parameters():
+                key = f"{prefix}.{param_name}"
+                if key in state_dict:
+                    param.data.copy_(state_dict[key])
+
+        if hasattr(model, 'dec_down_blocks_dict') and view in model.dec_down_blocks_dict:
+            prefix = f"dec_down_blocks_dict.{view}"
+            for param_name, param in model.dec_down_blocks_dict[view].named_parameters():
+                key = f"{prefix}.{param_name}"
+                if key in state_dict:
+                    param.data.copy_(state_dict[key])
+
+        if hasattr(model, 'dec_conv_blocks_dict') and view in model.dec_conv_blocks_dict:
+            prefix = f"dec_conv_blocks_dict.{view}"
+            for param_name, param in model.dec_conv_blocks_dict[view].named_parameters():
+                key = f"{prefix}.{param_name}"
+                if key in state_dict:
+                    param.data.copy_(state_dict[key])
+
+        if hasattr(model, 'decoder_dict') and view in model.decoder_dict:
+            prefix = f"decoder_dict.{view}"
+            for param_name, param in model.decoder_dict[view].named_parameters():
+                key = f"{prefix}.{param_name}"
+                if key in state_dict:
+                    param.data.copy_(state_dict[key])
+
+
+def _extract_head_params(state_dict: dict[str, torch.Tensor], model: nn.Module) -> None:
+    """Extract prediction head parameters from model into state_dict."""
+    if hasattr(model, 'pred_head_dict'):
+        for view_name, head_module in model.pred_head_dict.items():
+            prefix = f"pred_head_dict.{view_name}"
+            for param_name, param in head_module.named_parameters():
+                state_dict[f"{prefix}.{param_name}"] = param.data.clone()
+
+
+def _load_head_params(model: nn.Module, state_dict: dict[str, torch.Tensor]) -> None:
+    """Load prediction head parameters from state_dict into model."""
+    if hasattr(model, 'pred_head_dict'):
+        for view_name, head_module in model.pred_head_dict.items():
+            prefix = f"pred_head_dict.{view_name}"
+            for param_name, param in head_module.named_parameters():
+                key = f"{prefix}.{param_name}"
+                if key in state_dict:
+                    param.data.copy_(state_dict[key])
+
+
+# Standard LoRA + decoder + head state dict functions (for ConvUNetR)
+
+def get_lora_decoder_head_state_dict(model: nn.Module) -> dict[str, torch.Tensor]:
+    """Extract LoRA, decoder, and head parameters for ConvUNetR federated communication.
+
+    For standard LoRA models, this extracts all parameters that should be
+    communicated to the server for FedAvg aggregation:
+    - LoRA adapters (lora_a, lora_b) in encoder attention layers
+    - Decoder parameters (dec_image_conv, dec_down_blocks, dec_conv_blocks, decoder per view)
+    - Prediction head parameters (pred_head_dict per view)
+
+    Frozen backbone parameters (enc_down_dict, encoder non-LoRA) are excluded
+    because they are never trained.
+
+    Args:
+        model: ConvUNetR (or ConvViT) model with standard LoRA adapters applied.
+
+    Returns:
+        State dict containing LoRA, decoder, and head parameters.
+    """
+    state_dict: dict[str, torch.Tensor] = {}
+    _extract_lora_params(state_dict, model)
+    _extract_decoder_params(state_dict, model)
+    _extract_head_params(state_dict, model)
+    return state_dict
+
+
+def load_lora_decoder_head_state_dict(
+    model: nn.Module,
+    state_dict: dict[str, torch.Tensor],
+) -> None:
+    """Load LoRA, decoder, and head parameters from aggregated state dict.
+
+    Use this on clients after receiving FedAvg-aggregated parameters from the
+    server. Only parameters present in the state dict are loaded — any extra
+    keys are safely ignored.
+
+    Args:
+        model: ConvUNetR (or ConvViT) model with standard LoRA adapters applied.
+        state_dict: State dict from server aggregation containing LoRA + decoder + head params.
+    """
+    _load_lora_params(model, state_dict)
+    _load_decoder_params(model, state_dict)
+    _load_head_params(model, state_dict)
+
+
+# Standard LoRA + decoder (NO head) for ConvUNetR when aggregated_head=False
+
+def get_lora_decoder_state_dict(model: nn.Module) -> dict[str, torch.Tensor]:
+    """Extract LoRA and decoder parameters WITHOUT prediction heads.
+
+    Use this when ``aggregated_head=False`` — the prediction head is trained
+    locally and never sent to the server. Only LoRA adapters and decoder
+    parameters are communicated for FedAvg aggregation:
+
+    - LoRA adapters (lora_a, lora_b) in encoder attention layers
+    - Decoder parameters per view (dec_image_conv, dec_down_blocks,
+      dec_conv_blocks, decoder)
+    - Excludes: pred_head_dict, frozen backbone (enc_down_dict, encoder non-LoRA)
+
+    Args:
+        model: ConvUNetR model with standard LoRA adapters applied.
+
+    Returns:
+        State dict containing LoRA and decoder parameters only.
+    """
+    state_dict: dict[str, torch.Tensor] = {}
+    _extract_lora_params(state_dict, model)
+    _extract_decoder_params(state_dict, model)
+    return state_dict
+
+
+def load_lora_decoder_state_dict(
+    model: nn.Module,
+    state_dict: dict[str, torch.Tensor],
+) -> None:
+    """Load LoRA and decoder parameters while preserving local prediction heads.
+
+    Use this on clients after receiving FedAvg-aggregated parameters from the
+    server when ``aggregated_head=False``. Since pred_head_dict keys are not
+    present in the state dict, they remain untouched — each client keeps its
+    own personalized prediction head.
+
+    Args:
+        model: ConvUNetR model with standard LoRA adapters applied.
+        state_dict: State dict from server aggregation containing LoRA + decoder params.
+    """
+    _load_lora_params(model, state_dict)
+    _load_decoder_params(model, state_dict)
 
 
 # Dual LoRA parameter extraction and loading functions
