@@ -28,15 +28,10 @@ from models.cinema.cinema.device import get_amp_dtype_and_device
 from models.cinema.cinema.optim import GradScaler
 from models.cinema.cinema.train import train_one_epoch
 from flwr_cinema.scripts.lora import (
-    get_global_lora_and_head_state_dict,
     get_local_lora_state_dict,
-    get_lora_and_head_state_dict,
-    get_trainable_state_dict,
+    get_lora_policy,
     has_dual_lora,
-    load_global_lora_and_head_state_dict,
     load_local_lora_state_dict,
-    load_lora_and_head_state_dict,
-    load_trainable_state_dict,
 )
 
 logger = logging.getLogger(__name__)
@@ -94,6 +89,8 @@ class FederatedClient:
         Whether using LoRA.
     freeze_pretrained : bool
         Whether pretrained backbone is frozen.
+    aggregate_head : bool
+        Whether the server aggregates prediction heads (fed only).
     val_loader : DataLoader, optional
         Local validation data loader.
     metrics_save_path : str, optional
@@ -123,6 +120,7 @@ class FederatedClient:
         clip_grad: float | None = None,
         use_lora: bool = True,
         freeze_pretrained: bool = False,
+        aggregate_head: bool = True,
         val_loader: DataLoader | None = None,
         metrics_save_path: str | None = None,
         stats_save_path: str | None = None,
@@ -142,6 +140,7 @@ class FederatedClient:
         self.clip_grad = clip_grad
         self.use_lora = use_lora
         self.freeze_pretrained = freeze_pretrained
+        self.aggregate_head = aggregate_head
         self.val_loader = val_loader
         self.metrics_save_path = metrics_save_path
         self.stats_save_path = stats_save_path
@@ -192,36 +191,41 @@ class FederatedClient:
 
     def update_model(self, server_params: dict) -> None:
         """Update local model with parameters from server."""
-        if self.use_lora:
-            if has_dual_lora(self.model):
-                load_global_lora_and_head_state_dict(self.model, server_params)
-            else:
-                load_lora_and_head_state_dict(self.model, server_params)
-        elif self.freeze_pretrained:
-            load_trainable_state_dict(self.model, server_params)
-        else:
+        if not self.use_lora and not self.freeze_pretrained:
+            # Full fine-tuning: load all params (including buffers)
             for name, param in self.model.named_parameters():
                 if name in server_params:
                     param.data.copy_(server_params[name].to(param.device))
             for name, buffer in self.model.named_buffers():
                 if name in server_params:
                     buffer.data.copy_(server_params[name].to(buffer.device))
+            return
+
+        agg_head = self.aggregate_head
+        policy = get_lora_policy(
+            self.model,
+            use_lora=self.use_lora,
+            freeze_pretrained=self.freeze_pretrained,
+            aggregate_head=agg_head,
+        )
+        policy.load(self.model, server_params)
 
     def get_model_update(self) -> dict:
-        """Get model parameters to send to server."""
-        if self.use_lora:
-            if has_dual_lora(self.model):
-                log(logging.INFO, "Using dual LoRA")
-                return get_global_lora_and_head_state_dict(self.model)
-            else:
-                log(logging.INFO, "Using LoRA")
-                return get_lora_and_head_state_dict(self.model)
-        elif self.freeze_pretrained:
-            log(logging.INFO, "Using frozen pretrained backbone")
-            return get_trainable_state_dict(self.model)
-        else:
-            log(logging.INFO, "Using full fine-tuning")
-            return self.model.state_dict()
+        """Get model parameters to send to server.
+        
+        Always includes head so the server can archive per-client heads
+        (the server strips them before aggregation when aggregate_head=False).
+        """
+        if self.use_lora or self.freeze_pretrained:
+            policy = get_lora_policy(
+                self.model,
+                use_lora=self.use_lora,
+                freeze_pretrained=self.freeze_pretrained,
+                aggregate_head=True,  # always send head for archival
+            )
+            return policy.get(self.model)
+        # Full fine-tuning
+        return self.model.state_dict()
 
     # ------------------------------------------------------------------
     # Local training / validation (concrete, task injected)
@@ -301,7 +305,7 @@ class FederatedClient:
         prev_rho = float(in_strategy_data.get("prev_fedce_rho", 0.0))
         primary_metric_name = in_strategy_data.get("primary_metric_name", None)
         primary_metric_direction = in_strategy_data.get(
-            "primary_metric_direction", "maximize"
+            "primary_metric_direction", "max"
         )
 
         in_global_gradient = message.content.array_records.get(
@@ -318,7 +322,17 @@ class FederatedClient:
 
             gamma_err = 1e-4
             try:
-                self.update_model(excluded_model)
+                # W5 fix: filter out BN buffers from excluded_model before loading.
+                # The excluded_model is a mathematical construct — its BN running
+                # stats (mean/var) are linear interpolations that can produce
+                # invalid values (e.g., negative variance). The global model's
+                # BN stats, representing the federation's aggregate data
+                # distribution, are the correct normalization statistics.
+                excluded_params_only = {
+                    k: v for k, v in excluded_model.items()
+                    if "running_" not in k and "num_batches_tracked" not in k
+                }
+                self.update_model(excluded_params_only)
 
                 _, metrics = self.validate_local()
                 primary_metric_value = (
@@ -332,7 +346,7 @@ class FederatedClient:
                     f"for round {round_idx}: {primary_metric_value}",
                 )
                 if primary_metric_value is not None:
-                    if primary_metric_direction == "maximize":
+                    if primary_metric_direction == "max":
                         gamma_err = 1.0 - primary_metric_value
                     else:
                         gamma_err = primary_metric_value

@@ -23,8 +23,8 @@ from typing import Any, Callable
 import torch
 from omegaconf import DictConfig
 
-from flwr_cinema.scripts.lora import apply_lora_to_convvit
 from models.cinema.cinema.convvit import ConvViT
+from models.cinema.cinema.segmentation.convunetr import ConvUNetR
 
 # ---------------------------------------------------------------------------
 # Type aliases
@@ -98,8 +98,10 @@ def _build_convunetr_model(config: DictConfig) -> torch.nn.Module:
     return ConvUNetR.from_pretrained(config=config, freeze=freeze_backbone)
 
 
-def _apply_standard_lora(config: DictConfig, model: torch.nn.Module) -> None:
+def _apply_standard_lora_to_convvit(config: DictConfig, model: torch.nn.Module) -> None:
     """Apply standard LoRA adapters (shared by centralized and federated)."""
+    from flwr_cinema.scripts.lora import apply_lora_to_convvit
+
     apply_lora_to_convvit(
         model=model,
         rank=config.lora.rank,
@@ -109,12 +111,52 @@ def _apply_standard_lora(config: DictConfig, model: torch.nn.Module) -> None:
         blocks_to_lora=getattr(config.lora, "blocks_to_lora", None),
     )
 
+def _apply_standard_lora_to_convunetr(config: DictConfig, model: torch.nn.Module) -> None:
+    """Apply standard LoRA adapters to ConvUNetR (shared by centralized and federated)."""
+    from flwr_cinema.scripts.lora import apply_lora_to_convunetr
+
+    apply_lora_to_convunetr(
+        model=model,
+        rank=config.lora.rank,
+        alpha=config.lora.alpha,
+        dropout=config.lora.dropout,
+        target_modules=config.lora.target_modules,
+        blocks_to_lora=getattr(config.lora, "blocks_to_lora", None),
+    )
+
+def _apply_standard_lora(config: DictConfig, model: torch.nn.Module) -> None:
+    """Apply standard LoRA adapters to the model based on its type."""
+    if config.task == "segmentation" and config.model.name == "convunetr":
+        _apply_standard_lora_to_convunetr(config, model)
+    else:
+        _apply_standard_lora_to_convvit(config, model)
 
 def _enable_head_only_training(config: DictConfig, model: torch.nn.Module) -> None:
-    """Unfreeze prediction heads for frozen-backbone head-only mode."""
-    if config.model.get("freeze_pretrained", False) and hasattr(model, "pred_head_dict"):
+    """Unfreeze prediction heads (and decoder if applicable) for frozen-backbone head-only mode."""
+    if not config.model.get("freeze_pretrained", False):
+        return  # No freezing, so no need to unfreeze heads
+
+    if isinstance(model, ConvViT) and hasattr(model, "pred_head_dict"):
         for head_param in model.pred_head_dict.parameters():
             head_param.requires_grad = True
+
+    elif isinstance(model, ConvUNetR): # TODO: duplicated logic in apply_lora_to_convunetr, can be unified?
+        for view in model.views:
+            if hasattr(model, 'dec_image_conv_block_dict') and view in model.dec_image_conv_block_dict:
+                for param in model.dec_image_conv_block_dict[view].parameters():
+                    param.requires_grad = True
+            if hasattr(model, 'dec_down_blocks_dict') and view in model.dec_down_blocks_dict:
+                for param in model.dec_down_blocks_dict[view].parameters():
+                    param.requires_grad = True
+            if hasattr(model, 'dec_conv_blocks_dict') and view in model.dec_conv_blocks_dict:
+                for param in model.dec_conv_blocks_dict[view].parameters():
+                    param.requires_grad = True
+            if hasattr(model, 'decoder_dict') and view in model.decoder_dict:
+                for param in model.decoder_dict[view].parameters():
+                    param.requires_grad = True
+            if hasattr(model, 'pred_head_dict'):
+                for param in model.pred_head_dict[view].parameters():
+                    param.requires_grad = True
 
 
 def build_federated_model(config: DictConfig, task_spec: TaskSpec) -> torch.nn.Module:
@@ -122,9 +164,11 @@ def build_federated_model(config: DictConfig, task_spec: TaskSpec) -> torch.nn.M
     model = task_spec.base_model_factory(config)
 
     if config.train.use_lora:
-        if config.task == "segmentation":
-            raise NotImplementedError("LoRA is not yet implemented for segmentation models.")
+        
         if getattr(config, "dual_lora", None) and getattr(config.dual_lora, "enabled", False):
+            if config.task == "segmentation":
+                raise NotImplementedError("Dual LoRA is not yet implemented for segmentation models.")
+            
             from flwr_cinema.scripts.lora import apply_dual_lora_to_convvit
 
             apply_dual_lora_to_convvit(
@@ -149,8 +193,6 @@ def build_centralized_model(config: DictConfig, task_spec: TaskSpec) -> torch.nn
     model = task_spec.base_model_factory(config)
 
     if config.train.use_lora:
-        if config.task == "segmentation":
-            raise NotImplementedError("LoRA is not yet implemented for segmentation models.")
         _apply_standard_lora(config, model)
     else:
         _enable_head_only_training(config, model)

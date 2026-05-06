@@ -219,6 +219,7 @@ def train(msg: Message, context: Context):
         clip_grad=float(in_config.get("clip_grad", config.train.clip_grad)) if in_config.get("clip_grad", config.train.clip_grad) is not None and float(in_config.get("clip_grad", config.train.clip_grad)) > 0 else None,
         use_lora=config.train.use_lora,
         freeze_pretrained=config.model.freeze_pretrained,
+        aggregate_head=getattr(config.federated, "aggregate_head", True),
         metrics_save_path=metrics_save_path,
         stats_save_path=stats_save_path,
         eval_dataloader_fn=eval_dataloader_fn,
@@ -321,6 +322,7 @@ def evaluate(msg: Message, context: Context):
         clip_grad=None, 
         use_lora=config.train.use_lora,
         freeze_pretrained=config.model.freeze_pretrained,
+        aggregate_head=getattr(config.federated, "aggregate_head", True),
         metrics_save_path=metrics_save_path, # TODO: maybe delete path parameters because evaluation metrics are only saved in eval function for now
         stats_save_path=stats_save_path,
         eval_dataloader_fn=eval_dataloader_fn,

@@ -3,7 +3,7 @@ model_name: cinema
 mode: centralized  # federated or centralized
 seed: 0
 grad_ckpt: True
-eval_mode: "centralized" # client, centralized or server for early stopping evaluation
+eval_mode: "client" # client, centralized or server for early stopping evaluation
 
 logging:
   dir: ./outputs/${model_name}_${task}/${mode}/${data.name}/client_${federated.client_tag}/lora_${train.use_lora}/seed${seed}/${now:%Y-%m-%d}/${now:%H-%M-%S}
@@ -79,7 +79,7 @@ lora:
   rank: 8  # LoRA rank (typically 4-16)
   alpha: 16  # LoRA alpha scaling (typically 1x-4x of rank)
   dropout: 0.1  # LoRA dropout
-  target_modules: ["q", "kv", "proj"]  # Attention modules to adapt: q, kv, proj
+  target_modules: ["q", "kv"]  # Attention modules to adapt: q, kv, proj
   blocks_to_lora: null
 
 # Dual LoRA configuration (personalized federated learning)
@@ -104,7 +104,7 @@ transform:
     translate_range: [60, 60, 0]
 
 train:
-  use_lora: False # Set to True to use LoRA
+  use_lora: True # Set to True to use LoRA
   use_class_weighted_loss: False # Set to True to use class-weighted BCE loss for imbalanced classification
   n_workers: 4
   clip_grad: 5.0
@@ -114,12 +114,12 @@ train:
   label_smoothing: 0.1
   lr: 1e-3
   min_lr: 1e-5
-  n_warmup_epochs: 10
-  n_epochs: 1
+  n_warmup_epochs: 25
+  n_epochs: 4000
   max_n_ckpts: 2
   batch_size: 32
   batch_size_per_device: 2
-  eval_steps: 1  # Evaluate every N optimizer steps (aligned centralized/federated)
+  eval_steps: 725  # Evaluate every N optimizer steps (aligned centralized/federated)
   early_stopping:
     metric: "mean_dice_score"
     mode: "max"
@@ -129,7 +129,7 @@ train:
 model:
   name: convunetr
   ckpt_path: null
-  freeze_pretrained: False
+  freeze_pretrained: True
   views: sax
   out_chans: 4
   convunetr:

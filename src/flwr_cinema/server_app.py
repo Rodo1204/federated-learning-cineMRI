@@ -10,13 +10,8 @@ import json
 from omegaconf import OmegaConf
 
 from flwr_cinema.scripts.lora import (
-    get_global_lora_and_head_state_dict,
-    get_global_lora_state_dict,
-    get_lora_and_head_state_dict,
-    get_lora_state_dict,
-    get_trainable_state_dict,
-    has_dual_lora
-
+    get_lora_policy,
+    get_lora_state_dict,  # still needed for save_final_model checkpoint
 )
 from flwr_cinema.utils.hydra_utils import load_hydra_config
 from flwr_cinema.strategies.common import get_primary_metric_name
@@ -32,36 +27,24 @@ def get_model(config: DictConfig) -> torch.nn.Module:
     return adapter.build_model(config)
 
 def get_model_params(config: DictConfig, model: torch.nn.Module) -> dict:
-        """Get parameters to send to clients.
-        
-        Supports combining three dimensions:
-        - LoRA modes: Dual LoRA / Standard LoRA / No LoRA
-        - Head aggregation: aggregate_head=True (sync head) or False (keep locally trained)
-        - Backbone: freeze_pretrained (frozen) or not (trainable)
-        """
+    """Get parameters to send to clients.
 
-        # logger.info("Preparing model parameters to send to clients")
-        if config.train.use_lora:
-            if has_dual_lora(model):
-                if config.federated.aggregate_head:
-                        # logger.info(f"  Using Dual LoRA + aggregated head - syncing global LoRA + head (local LoRA stays on client)")
-                    return get_global_lora_and_head_state_dict(model)
-                else:
-                    # logger.info(f"  Using Dual LoRA + local head - syncing only global LoRA (head stays locally trained)")
-                    return get_global_lora_state_dict(model)
-            else:
-                if config.federated.aggregate_head:
-                    # logger.info(f"  Using standard LoRA + aggregated head - syncing LoRA + head")
-                    return get_lora_and_head_state_dict(model)
-                else:
-                    # logger.info(f"  Using standard LoRA + local head - syncing only LoRA (head stays locally trained)")
-                    return get_lora_state_dict(model)
-        elif config.model.get('freeze_pretrained', False):
-            # logger.info(f"  Using frozen backbone mode - syncing only trainable parameters (head)")
-            return get_trainable_state_dict(model)
-        else:
-            # logger.info(f"  Using full model mode - syncing all parameters")
-            return model.state_dict()
+    Delegates to ``get_lora_policy``, which resolves the correct
+    extractor based on model architecture, LoRA flavour, and
+    ``federated.aggregate_head``. if full fine-tuning is used, 
+    ignores the aggregate_head setting and returns the full state_dict.
+    """
+    if not config.train.use_lora and not config.model.get("freeze_pretrained", False):
+        return model.state_dict()
+    
+    agg_head = getattr(config.federated, "aggregate_head", True)
+    policy = get_lora_policy(
+        model,
+        use_lora=config.train.use_lora,
+        freeze_pretrained=config.model.get("freeze_pretrained", False),
+        aggregate_head=agg_head,
+    )
+    return policy.get(model)
 
 def load_arrays_into_model(
     model: torch.nn.Module,
@@ -69,28 +52,23 @@ def load_arrays_into_model(
     config: 'DictConfig',
 ) -> None:
     """Load aggregated ArrayRecord parameters back into the global model.
-    
+
     Handles LoRA (single/dual), frozen backbone, and full model modes.
-    Used by both the strategy mixin (for checkpoints) and save_final_model().
-    
-    Args:
-        model: The global model to update.
-        arrays: Aggregated ArrayRecord from Flower.
-        config: Hydra DictConfig.
+    Used by both the strategy mixin (for checkpoints) and
+    :func:`save_final_model`.
     """
     state_dict = arrays.to_torch_state_dict()
-    if config.train.use_lora:
-        if has_dual_lora(model):
-            from flwr_cinema.scripts.lora import load_global_lora_and_head_state_dict
-            load_global_lora_and_head_state_dict(model, state_dict)
-        else:
-            from flwr_cinema.scripts.lora import load_lora_and_head_state_dict
-            load_lora_and_head_state_dict(model, state_dict)
-    elif config.model.get("freeze_pretrained", False):
-        from flwr_cinema.scripts.lora import load_trainable_state_dict
-        load_trainable_state_dict(model, state_dict)
-    else:
+    if not config.train.use_lora and not config.model.get("freeze_pretrained", False):
         model.load_state_dict(state_dict)
+        return
+    agg_head = getattr(config.federated, "aggregate_head", True)
+    policy = get_lora_policy(
+        model,
+        use_lora=config.train.use_lora,
+        freeze_pretrained=config.model.get("freeze_pretrained", False),
+        aggregate_head=agg_head,
+    )
+    policy.load(model, state_dict)
 
 
 def get_strategy(

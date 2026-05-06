@@ -14,7 +14,7 @@ logging:
 federated:
   server_host: "localhost"
   server_port: 8888
-  n_rounds: 3  # Number of communication rounds
+  n_rounds: 15  # Number of communication rounds
   local_epochs: 1  # Local epochs per round per client 2
   n_clients: 2  # Number of expected clients (ie. acdc + Siemens + GE + Canon + Philips)
   # client_ids: ["acdc", "Siemens"]  # Identifiers for each client

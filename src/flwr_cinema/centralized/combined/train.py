@@ -527,14 +527,6 @@ def run_train(  # noqa: C901
                 to_delete.unlink(missing_ok=True)
                 logger.info(f"Deleted an outdated checkpoint {to_delete}.")
 
-        # early stopping
-        if early_stop.should_stop:
-            logger.info(
-                f"Met early stopping criteria with {config.train.early_stopping.metric} = "
-                f"{early_stop.best_metric} and patience {early_stop.patience_count}, breaking."
-            )
-            break
-
         # ── JSONL metrics logging for post-hoc analysis ───────────────────────
         def convert_to_serializable(obj):
             """Convert numpy/torch types to Python native types for JSON serialization."""
@@ -573,13 +565,24 @@ def run_train(  # noqa: C901
         else:
             metrics_record["validation_aggregation"] = "pooled"
 
-        # Save to JSONL file
+        # Save to JSONL file (always save before early stopping break)
         metrics_file = Path(config.logging.dir).expanduser() / "validation_metrics.jsonl"
         with open(metrics_file, "a") as f:
             f.write(json.dumps(convert_to_serializable(metrics_record)) + "\n")
         logger.info(f"Saved metrics to {metrics_file}")
 
-    logger.info(f"Last checkpoint is {saved_ckpt_paths[-1]}")
+        # early stopping (must be after JSONL save so the triggering eval is recorded)
+        if early_stop.should_stop:
+            logger.info(
+                f"Met early stopping criteria with {config.train.early_stopping.metric} = "
+                f"{early_stop.best_metric} and patience {early_stop.patience_count}, breaking."
+            )
+            break
+
+    if saved_ckpt_paths:
+        logger.info(f"Last checkpoint is {saved_ckpt_paths[-1]}")
+    else:
+        logger.info("No checkpoints were saved during this run.")
 
 
 def main() -> None:
