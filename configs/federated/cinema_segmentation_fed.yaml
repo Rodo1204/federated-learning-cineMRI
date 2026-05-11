@@ -21,6 +21,7 @@ federated:
   #client_ids: ["acdc", "Siemens", "GE", "Canon", "Philips"]  # Identifiers for each client
   client_ids: ["acdc", "Siemens"]  # For debugging with fewer clients
   aggregate_head: True  # Whether to aggregate classification/regression head across clients (True) or keep locally trained (False)
+  aggregate_decoder: True  # Whether to aggregate ConvUNetR decoder across clients (True) or keep locally trained (False). Set False for decoder-local FL (saves ~30% bandwidth per round).
   gpu_mapping:
     acdc: 0
     Siemens: 0
@@ -33,7 +34,14 @@ federated:
   #     combination_method: sum  # Method to combine gamma_cos and gamma_err ("multiplication" or "sum")
 
   aggregation_method:
-    name: fedavg  # fedavg, fedce, or custom
+    name: fedavg  # fedavg, fedce, fedratemylora, or custom
+
+  # Rate-My-LoRA: adaptive penalization for heterogeneous data
+  # aggregation_method:
+  #   name: fedratemylora
+  #   config:
+  #     lambda_init: 0.2
+  #     lambda_decay: 0.95
 
 
 # Data configuration
@@ -117,7 +125,7 @@ transform:
     translate_range: [60, 60, 0]
 
 train:
-  use_lora: False # Set to True to use LoRA
+  use_lora: False # Set to True to use LoRA (required for Rate-My-LoRA)
   use_class_weighted_loss: False # Set to True to use class-weighted BCE loss for imbalanced classification
   n_workers: 2
   clip_grad: 5.0

@@ -14,26 +14,31 @@ logging:
 federated:
   server_host: "localhost"
   server_port: 8888
-  n_rounds: 15  # Number of communication rounds
-  local_epochs: 1  # Local epochs per round per client 2
-  n_clients: 2  # Number of expected clients (ie. acdc + Siemens + GE + Canon + Philips)
+  n_rounds: 267  # Number of communication rounds
+  local_epochs: 3  # Local epochs per round per client 2
+  n_clients: 3  # Number of expected clients (ie. acdc + Siemens + GE + Canon + Philips)
   # client_ids: ["acdc", "Siemens"]  # Identifiers for each client
   #client_ids: ["acdc", "Siemens", "GE", "Canon", "Philips"]  # Identifiers for each client
-  client_ids: ["acdc", "Siemens"]  # For debugging with fewer clients
+  client_ids: ["acdc", "Siemens", "GE"]  # For debugging with fewer clients
   aggregate_head: True  # Whether to aggregate classification/regression head across clients (True) or keep locally trained (False)
+  aggregate_decoder: True  # Only relevant for ConvUNetR segmentation. Set False to keep decoder local (saves ~30% bandwidth).
   gpu_mapping:
     acdc: 0
     Siemens: 0
     Philips: 0
     GE: 0
     Canon: 0
+  # aggregation_method:
+  #   name: fedce  # fedavg, fedce, or custom
+  #   config:
+  #     combination_method: sum  # Method to combine gamma_cos and gamma_err ("multiplication" or "sum")
+  # aggregation_method:
+  #  name: fedratemylora
+  #  config:
+  #    lambda_init: 0.2
+  #    lambda_decay: 0.95
   aggregation_method:
-    name: fedce  # fedavg, fedce, or custom
-    config:
-      combination_method: sum  # Method to combine gamma_cos and gamma_err ("multiplication" or "sum")
-
-  # aggreation_method:
-  #   name: fedavg  # fedavg, fedce, or custom
+    name: fedavg  # fedavg, fedce, or custom
     
 
 
@@ -93,8 +98,8 @@ data:
 
 # LoRA configuration
 lora:
-  rank: 8  # LoRA rank (typically 4-16)
-  alpha: 16  # LoRA alpha scaling (typically 1x-4x of rank)
+  rank: 4  # LoRA rank (typically 4-16)
+  alpha: 8  # LoRA alpha scaling (typically 1x-4x of rank)
   dropout: 0.1  # LoRA dropout
   target_modules: ["q", "kv", "proj"]  # Attention modules to adapt: q, kv, proj
   # Ablation Study: Specify which transformer blocks to apply LoRA to
@@ -133,20 +138,20 @@ train:
   use_class_weighted_loss: False # Set to True to use class-weighted BCE loss for imbalanced classification
   n_workers: 4
   clip_grad: 5.0
-  weight_decay: 1e-4
+  weight_decay: 0.05
   layer_decay: 0.75
   betas: [0.9, 0.95]
-  label_smoothing: 0.0
+  label_smoothing: 0.1
   lr: 1e-3
   min_lr: 1e-5
   n_warmup_epochs: 0
-  n_epochs: 500
+  n_epochs: 801
   max_n_ckpts: 2
-  batch_size: 64
-  batch_size_per_device: 4
-  eval_steps: 1 #80  # Evaluate every N optimizer steps (aligned centralized/federated)
+  batch_size: 32
+  batch_size_per_device: 8
+  eval_steps: 80 #80  # Evaluate every N optimizer steps (aligned centralized/federated)
   early_stopping:
-    metric: "mcc"
+    metric: "roc_auc"
     mode: "max"
     patience: 10
     min_delta: 5e-4

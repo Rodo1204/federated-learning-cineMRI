@@ -179,7 +179,7 @@ class FedCE(FedAvg):
         return agg_metric
 
 
-class FedStrategy(CinemaStrategyMixin, FedCE):
+class FedCEStrategy(CinemaStrategyMixin, FedCE):
     """Federated strategy combining CineMA-specific logic (step-based validation, 
     early stopping, checkpointing) with FedCE aggregation.
     

@@ -7,6 +7,8 @@ import torch
 import torch.nn as nn
 from flwr.common import ArrayRecord, ConfigRecord, Message, MetricRecord, RecordDict
 from flwr.serverapp import Grid
+from flwr.common.logger import log
+import logging
 
 class MetricTargetReachedException(Exception):
     """Custom exception to signal that the target metric has been reached for early stopping."""
@@ -74,6 +76,7 @@ class CinemaStrategyMixin:
         save_dir: Path,
         max_n_ckpts: int = 5,
         aggregate_head: bool = True,
+        aggregate_decoder: bool = True,
         **kwargs
     ):
         # Pass remaining kwargs to the Flower base strategy (FedAvg, etc.)
@@ -88,6 +91,7 @@ class CinemaStrategyMixin:
         self.global_model = global_model
         self.load_arrays_fn = load_arrays_fn
         self.aggregate_head = aggregate_head
+        self.aggregate_decoder = aggregate_decoder
         
         # Checkpoint management
         self.save_dir = Path(save_dir)
@@ -98,6 +102,7 @@ class CinemaStrategyMixin:
         self._latest_arrays: ArrayRecord | None = None
         self._latest_local_loras: dict[str, ArrayRecord] = {}  # client_id → local LoRA ArrayRecord
         self._latest_client_heads: dict[str, ArrayRecord] = {}  # client_id → head ArrayRecord (when aggregate_head=False)
+        self._latest_client_decoders: dict[str, ArrayRecord] = {}  # client_id → decoder ArrayRecord (when aggregate_decoder=False)
         self.round_metadata: dict[str, dict[str, Any]] = {}
         self._eval_count = 0  # Track number of evaluations for first-eval checkpoint
         
@@ -165,6 +170,12 @@ class CinemaStrategyMixin:
                 cid: rec.to_torch_state_dict() for cid, rec in self._latest_client_heads.items()
             }
         
+        # Include per-client decoders if available (when aggregate_decoder=False)
+        if self._latest_client_decoders:
+            checkpoint["client_decoders"] = {
+                cid: rec.to_torch_state_dict() for cid, rec in self._latest_client_decoders.items()
+            }
+        
         # Save
         ckpt_path = self.save_dir / "checkpoints" / f"ckpt_round_{server_round:03d}_steps_{self.total_optimizer_steps}.pt"
         torch.save(checkpoint, ckpt_path)
@@ -211,6 +222,15 @@ class CinemaStrategyMixin:
         #    This prevents FedAvg from aggregating head params
         self._latest_local_loras.clear()
         self._latest_client_heads.clear()
+        self._latest_client_decoders.clear()
+        
+        # Decoder param prefixes for ConvUNetR (stripped when aggregate_decoder=False)
+        _DECODER_PREFIXES = (
+            "dec_image_conv_block_dict.",
+            "dec_down_blocks_dict.",
+            "dec_conv_blocks_dict.",
+            "decoder_dict.",
+        )
         
         round_steps = 0
         n_clients_with_steps = 0
@@ -232,6 +252,23 @@ class CinemaStrategyMixin:
                         self._latest_client_heads[client_id] = ArrayRecord.from_torch_state_dict(head)
                         no_head = {k: v for k, v in state_dict.items() if not k.startswith("pred_head_dict.")}
                         msg.content.array_records["model_params"] = ArrayRecord.from_torch_state_dict(no_head)
+
+            # Strip decoder params if decoder stays local (ConvUNetR)
+            if not self.aggregate_decoder:
+                ar = msg.content.array_records.get("model_params")
+                if ar is not None:
+                    state_dict = ar.to_torch_state_dict()
+                    decoder = {
+                        k: v for k, v in state_dict.items()
+                        if any(k.startswith(p) for p in _DECODER_PREFIXES)
+                    }
+                    if decoder:
+                        self._latest_client_decoders[client_id] = ArrayRecord.from_torch_state_dict(decoder)
+                        no_decoder = {
+                            k: v for k, v in state_dict.items()
+                            if not any(k.startswith(p) for p in _DECODER_PREFIXES)
+                        }
+                        msg.content.array_records["model_params"] = ArrayRecord.from_torch_state_dict(no_decoder)
             
             # Extract optimizer steps (average, to match centralized)
             if "optimizer_steps_this_round" in msg.content.config_records.get("config", {}):
@@ -254,13 +291,14 @@ class CinemaStrategyMixin:
 
             round_client_steps[client_id] = client_entry
         
-        # 2. Call the base strategy (FedAvg, FedAdam, etc.) — heads are already stripped
+        # 2. Call the base strategy (FedAvg, FedAdam, etc.) — heads & decoder already stripped
         agg_arrays, agg_metrics = super().aggregate_train(server_round, replies_list)
         
         # 3. Accumulate average optimizer steps
         if n_clients_with_steps > 0:
-            avg_steps = int(round_steps / n_clients_with_steps)
+            avg_steps = round_steps / n_clients_with_steps
             self.total_optimizer_steps += avg_steps
+            log(logging.INFO, f"Round {server_round}: Received optimizer steps from {n_clients_with_steps} clients, total_optimizer_steps updated to {self.total_optimizer_steps}")
 
         self.round_metadata[round_key] = {
             "participants": sorted(round_client_steps.keys()),
@@ -310,43 +348,50 @@ class CinemaStrategyMixin:
     ) -> MetricRecord | None:
         """Aggregate evaluation metrics, step EarlyStopping, and save checkpoint if improved."""
         metrics = super().aggregate_evaluate(server_round, replies)
+        self._apply_early_stopping(server_round, metrics)
+        return metrics
 
+    def _apply_early_stopping(
+        self,
+        server_round: int,
+        metrics: MetricRecord | None,
+        eval_count_increment: bool = True,
+    ) -> None:
+        """Check early stopping and save checkpoint if improved.
+
+        Extracted as a standalone method so strategies that always
+        evaluate (e.g. Rate-My-LoRA) can call it conditionally
+        via ``aggregate_evaluate``, while others call it on every
+        evaluation through the default ``aggregate_evaluate`` above.
+
+        Parameters
+        ----------
+        eval_count_increment : bool
+            If True, increment ``_eval_count`` inside this method.
+            Set to False when the caller handles eval counting
+            separately (e.g. Rate-My-LoRA evaluates every round but
+            gates early-stopping checks).
+        """
         if metrics is None or self.primary_metric_name not in metrics:
-            return metrics
-        
+            return
+
         current_metric = float(metrics[self.primary_metric_name])
-        self._eval_count += 1
-        
-        # Early Stopping Evaluation 
+        if eval_count_increment:
+            self._eval_count += 1
+
+        # Early Stopping Evaluation
         if getattr(self, "early_stopping", None) is not None:
             # EarlyStopping always minimizes internally
             metric_for_early_stopping = current_metric
             if self.metric_direction == "max":
                 metric_for_early_stopping = -current_metric
-            
+
             self.early_stopping.update(metric_for_early_stopping)
-            
-            # Format best metric for display
-            # display_best = self.early_stopping.best_metric
-            # if self.metric_direction == "max" and display_best != float('inf'):
-            #     display_best = -display_best
-            
-            # logger.info(
-            #     f"[EVAL Round {server_round}] {self.primary_metric_name}: {current_metric:.4f} "
-            #     f"| Best: {display_best:.4f} "
-            #     f"| Patience: {self.early_stopping.patience_count}/{self.early_stopping.patience}"
-            # )
-            
+
             # Save checkpoint if improved
             # Also save on first evaluation to always have at least one checkpoint
             if self.early_stopping.has_improved or self._eval_count == 1:
                 self._save_checkpoint(server_round, metrics)
-            
+
             if self.early_stopping.should_stop:
-                    # logger.warning(
-                    #     f" EARLY STOPPING TRIGGERED AT ROUND {server_round} "
-                    #     f"(No improvement for {self.early_stopping.patience} validation intervals)"
-                    # )
                 self.early_stopping_triggered = True
-                    
-        return metrics

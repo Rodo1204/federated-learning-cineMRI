@@ -121,6 +121,7 @@ class FederatedClient:
         use_lora: bool = True,
         freeze_pretrained: bool = False,
         aggregate_head: bool = True,
+        aggregate_decoder: bool = True,
         val_loader: DataLoader | None = None,
         metrics_save_path: str | None = None,
         stats_save_path: str | None = None,
@@ -128,6 +129,7 @@ class FederatedClient:
         eval_dataloader_fn: Callable | None = None,
         config: object | None = None,
         n_accum_steps: int = 1,
+        gpu_id: int | None = None,
     ) -> None:
         self.client_id = client_id
         self.model = model
@@ -141,6 +143,7 @@ class FederatedClient:
         self.use_lora = use_lora
         self.freeze_pretrained = freeze_pretrained
         self.aggregate_head = aggregate_head
+        self.aggregate_decoder = aggregate_decoder
         self.val_loader = val_loader
         self.metrics_save_path = metrics_save_path
         self.stats_save_path = stats_save_path
@@ -149,9 +152,19 @@ class FederatedClient:
         self.eval_dataloader_fn = eval_dataloader_fn
         self.config = config
         self.n_accum_steps = n_accum_steps
+        self.gpu_id = gpu_id
 
+        # Cinema sets up amp_dtype, cudnn.benchmark, empty_cache
         self.amp_dtype, self.device = get_amp_dtype_and_device()
+
+        # Override device with explicit GPU mapping when provided
+        self.device = (
+            torch.device(f"cuda:{self.gpu_id}")
+            if self.gpu_id is not None and torch.cuda.is_available()
+            else self.device
+        )
         self.model.to(self.device)
+        log(logging.INFO, f"Client {self.client_id} - Initialized on device: {self.device}")
 
         # Optimizer for local training
         trainable_params = [p for p in self.model.parameters() if p.requires_grad]

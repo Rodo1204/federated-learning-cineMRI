@@ -32,20 +32,27 @@ from flwr_cinema.scripts.eval_utils import (
 )
 
 
-def detect_model_variant(applied_head: bool, applied_local_lora: bool) -> str:
+def detect_model_variant(applied_head: bool, applied_local_lora: bool, applied_decoder: bool = False) -> str:
     """Derive model variant exclusively from applied private artifacts."""
-    if applied_head and applied_local_lora:
-        return "personalized_head_and_local_lora"
+    parts = []
     if applied_head:
-        return "personalized_head"
+        parts.append("head")
     if applied_local_lora:
-        return "personalized_local_lora"
+        parts.append("local_lora")
+    if applied_decoder:
+        parts.append("decoder")
+    if parts:
+        return "personalized_" + "_and_".join(parts)
     return "global"
 
 
 def has_private_artifacts(checkpoint: dict[str, Any]) -> bool:
     """Return whether checkpoint contains any client-private evaluation artifacts."""
-    return bool(checkpoint.get("client_heads")) or bool(checkpoint.get("client_local_loras"))
+    return (
+        bool(checkpoint.get("client_heads"))
+        or bool(checkpoint.get("client_local_loras"))
+        or bool(checkpoint.get("client_decoders"))
+    )
 
 
 def _extract_primary_metric_meta(config: dict[str, Any]) -> tuple[str, str]:
@@ -125,12 +132,14 @@ def build_base_model(config: dict[str, Any], checkpoint: dict[str, Any]) -> torc
 
 
 def apply_private_artifacts(model: torch.nn.Module, checkpoint: dict[str, Any], client_id: str) -> dict[str, bool]:
-    """Apply client-private head/local LoRA artifacts when present."""
+    """Apply client-private head / decoder / local LoRA artifacts when present."""
     from flwr_cinema.scripts.lora import load_local_lora_state_dict
 
     applied_head = False
     applied_local_lora = False
+    applied_decoder = False
 
+    # --- per-client head ---
     client_heads = checkpoint.get("client_heads")
     if isinstance(client_heads, dict) and client_id in client_heads and isinstance(client_heads[client_id], dict):
         model_state = model.state_dict()
@@ -140,6 +149,7 @@ def apply_private_artifacts(model: torch.nn.Module, checkpoint: dict[str, Any], 
         model.load_state_dict(model_state, strict=False)
         applied_head = True
 
+    # --- per-client local LoRA (Dual LoRA) ---
     client_local_loras = checkpoint.get("client_local_loras")
     if (
         isinstance(client_local_loras, dict)
@@ -149,7 +159,17 @@ def apply_private_artifacts(model: torch.nn.Module, checkpoint: dict[str, Any], 
         load_local_lora_state_dict(model, client_local_loras[client_id])
         applied_local_lora = True
 
-    return {"local_head": applied_head, "local_lora": applied_local_lora}
+    # --- per-client decoder (ConvUNetR with aggregate_decoder=False) ---
+    client_decoders = checkpoint.get("client_decoders")
+    if isinstance(client_decoders, dict) and client_id in client_decoders and isinstance(client_decoders[client_id], dict):
+        model_state = model.state_dict()
+        for key, value in client_decoders[client_id].items():
+            if key in model_state:
+                model_state[key] = value.clone()
+        model.load_state_dict(model_state, strict=False)
+        applied_decoder = True
+
+    return {"local_head": applied_head, "local_lora": applied_local_lora, "local_decoder": applied_decoder}
 
 
 def build_eval_dataloader(dataset: Any) -> DataLoader:
@@ -179,7 +199,11 @@ def evaluate_single_client(
     model.load_state_dict(base_state, strict=False)
 
     applied = apply_private_artifacts(model=model, checkpoint=checkpoint, client_id=client_id)
-    model_variant = detect_model_variant(applied_head=applied["local_head"], applied_local_lora=applied["local_lora"])
+    model_variant = detect_model_variant(
+        applied_head=applied["local_head"],
+        applied_local_lora=applied["local_lora"],
+        applied_decoder=applied.get("local_decoder", False),
+    )
 
     dataloader = build_eval_dataloader(dataset)
     model.to(device)
@@ -372,7 +396,15 @@ def evaluate_global_pool(
                 base_state=base_state,
                 device=device,
             )
-        raise ValueError(f"Unsupported task type '{task_type}' for personalized pooled evaluation.")
+        # Segmentation with private artifacts: per-client eval already covers
+        # personalization; global pool falls back to aggregated model.
+        model.load_state_dict(base_state, strict=False)
+        pooled_dataset = ConcatDataset([dataset for _, dataset in datasets_by_client.values()])
+        pooled_dataloader = build_eval_dataloader(pooled_dataset)
+        model.to(device)
+        model.eval()
+        metrics = evaluate_fn(model=model, dataloader=pooled_dataloader, config=config, device=device)
+        return "global", normalize_metric_values(metrics)
 
     model.load_state_dict(base_state, strict=False)
     pooled_dataset = ConcatDataset([dataset for _, dataset in datasets_by_client.values()])

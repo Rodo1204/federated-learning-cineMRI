@@ -16,24 +16,43 @@ from flwr_cinema.utils.hydra_utils import load_hydra_config, update_config_from_
 # Flower ClientApp 
 app = ClientApp()
 
-# Caches to avoid redundant loading across train/eval calls in the same process 
-_MODEL_CACHE = None
+# Model cache per client_id to preserve local decoder/head state across rounds
+# when aggregate_decoder=False or aggregate_head=False. Each client gets its
+# own model object so per-client artifacts don't leak across clients sharing
+# the same Ray actor in simulation mode.
+_MODEL_CACHE: dict[str, torch.nn.Module] = {}
 _TRAIN_DATALOADER_CACHE = None
 _VAL_DATALOADER_CACHE = None
 _STATS_CACHE = None
 # def setup_logging(log_dir: Path, ):
 
-def get_model(config: DictConfig) -> torch.nn.Module:
-    """Build model using the task adapter model factory."""
+def get_model(config: DictConfig, client_id: str | None = None) -> torch.nn.Module:
+    """Build or retrieve the model for a specific federated client.
     
+    Caches one model per client_id so local decoder/head parameters
+    survive across rounds. Inactive client models are flushed to CPU to
+    avoid exhausting GPU VRAM when many clients share the same actor.
+    The active model will be moved to GPU by FederatedClient.
+    """
     global _MODEL_CACHE
-    if _MODEL_CACHE is not None:
-        return _MODEL_CACHE
+    
+    cid = client_id or "__default__"
+    if cid in _MODEL_CACHE:
+        _flush_other_clients_to_cpu(cid)
+        return _MODEL_CACHE[cid]
 
     adapter = get_federated_task_adapter(config)
     model = adapter.build_model(config)
-    _MODEL_CACHE = model
+    _MODEL_CACHE[cid] = model
+    _flush_other_clients_to_cpu(cid)
     return model
+
+
+def _flush_other_clients_to_cpu(active_client_id: str) -> None:
+    """Move inactive client models to CPU to free GPU memory."""
+    for cid, model in _MODEL_CACHE.items():
+        if cid != active_client_id:
+            model.to("cpu")
 
 def get_client_class(config: DictConfig):
     """Resolve federated client class from task adapter."""
@@ -166,8 +185,11 @@ def train(msg: Message, context: Context):
 
     vendor = getattr(config, "vendor", None)
 
+    # Resolve GPU mapping for this client
+    gpu_id = getattr(config.federated, "gpu_mapping", {}).get(client_id)
+
     # Initialize model
-    model = get_model(config)
+    model = get_model(config, client_id)
     
     # Load client data
     train_loader, val_loader, client_stats = load_client_data(
@@ -220,12 +242,14 @@ def train(msg: Message, context: Context):
         use_lora=config.train.use_lora,
         freeze_pretrained=config.model.freeze_pretrained,
         aggregate_head=getattr(config.federated, "aggregate_head", True),
+        aggregate_decoder=getattr(config.federated, "aggregate_decoder", True),
         metrics_save_path=metrics_save_path,
         stats_save_path=stats_save_path,
         eval_dataloader_fn=eval_dataloader_fn,
         config=config, # TODO: maybe client doesn't need full config, could just pass necessary fields or a subset of config related to training/evaluation
         run_dir=str(client_run_dir),
         n_accum_steps=n_accum_steps,
+        gpu_id=gpu_id,
     )
 
     # Call the client's train method and send the reply message
@@ -280,8 +304,11 @@ def evaluate(msg: Message, context: Context):
 
     vendor = getattr(config, "vendor", None)
 
+    # Resolve GPU mapping for this client
+    gpu_id = getattr(config.federated, "gpu_mapping", {}).get(client_id)
+
     # Initialize model
-    model = get_model(config)
+    model = get_model(config, client_id)
     
     # Load client data
     train_loader, val_loader, client_stats = load_client_data(
@@ -323,12 +350,14 @@ def evaluate(msg: Message, context: Context):
         use_lora=config.train.use_lora,
         freeze_pretrained=config.model.freeze_pretrained,
         aggregate_head=getattr(config.federated, "aggregate_head", True),
+        aggregate_decoder=getattr(config.federated, "aggregate_decoder", True),
         metrics_save_path=metrics_save_path, # TODO: maybe delete path parameters because evaluation metrics are only saved in eval function for now
         stats_save_path=stats_save_path,
         eval_dataloader_fn=eval_dataloader_fn,
         config=config,
         run_dir=str(client_run_dir),
         n_accum_steps=1,
+        gpu_id=gpu_id,
     )
 
     # Call the client's evaluate method and send the reply message
