@@ -1,21 +1,15 @@
 import torch
 from flwr.app import Context, Message, ConfigRecord
 from flwr.clientapp import ClientApp
-from flwr.common.logger import log
-import logging
 import json
 from datetime import datetime
 from pathlib import Path
 from omegaconf import DictConfig
-from models.cinema.cinema.convvit import ConvViT
 from models.cinema.cinema.optim import get_n_accum_steps
 from torch.utils.data import DataLoader
 
-from flwr_cinema.scripts.lora import (
-    apply_lora_to_convvit,
-    apply_dual_lora_to_convvit
-)
 from flwr_cinema.scripts.federated_dataset_loader import load_client_dataloaders
+from flwr_cinema.tasks.adapters import get_federated_task_adapter
 
 from flwr_cinema.utils.hydra_utils import load_hydra_config, update_config_from_config_record
 
@@ -30,98 +24,26 @@ _STATS_CACHE = None
 # def setup_logging(log_dir: Path, ):
 
 def get_model(config: DictConfig) -> torch.nn.Module:
-    """Initialize model with optional LoRA (single or dual) using CineMA pattern."""
+    """Build model using the task adapter model factory."""
     
     global _MODEL_CACHE
     if _MODEL_CACHE is not None:
         return _MODEL_CACHE
-    # Load pretrained model: freeze backbone unless doing full finetuning
-    freeze_backbone = config.model.get('freeze_pretrained', True) or config.train.use_lora
-    
-    # log(logging.INFO, f"Loading pretrained model (freeze_backbone={freeze_backbone})...")
-    model = ConvViT.from_pretrained(config=config, freeze=freeze_backbone)
 
-    # Apply LoRA if enabled (using lora.blocks_to_lora for both standard and dual LoRA)
-    blocks_to_lora = getattr(config.lora, 'blocks_to_lora', None)
-    
-    if config.train.use_lora:
-        # Check if Dual LoRA is enabled
-        if getattr(config, 'dual_lora', None) and getattr(config.dual_lora, 'enabled', False):
-            # logger.info("Applying Dual LoRA adapters (personalized federated learning)...")
-            apply_dual_lora_to_convvit(
-                model=model,
-                global_rank=config.dual_lora.global_rank,
-                local_rank=config.dual_lora.local_rank,
-                alpha=config.dual_lora.alpha,
-                dropout=config.dual_lora.dropout,
-                target_modules=config.dual_lora.target_modules,
-                blocks_to_lora=blocks_to_lora,
-            )
-        else:
-            # logger.info("Applying standard LoRA adapters...")
-            apply_lora_to_convvit(
-                model=model,
-                rank=config.lora.rank,
-                alpha=config.lora.alpha,
-                dropout=config.lora.dropout,
-                target_modules=config.lora.target_modules,
-                blocks_to_lora=blocks_to_lora,
-            )
-    elif config.model.get('freeze_pretrained', False):
-        # Head-only training: unfreeze classification head while keeping backbone frozen
-        # logger.info("Head-only training mode: unfreezing classification head...")
-        if hasattr(model, 'pred_head_dict'):
-            for head_param in model.pred_head_dict.parameters():
-                head_param.requires_grad = True
-    
+    adapter = get_federated_task_adapter(config)
+    model = adapter.build_model(config)
     _MODEL_CACHE = model
     return model
 
 def get_client_class(config: DictConfig):
-    """Dynamically import federated client based on task type.
-    
-    Args:
-        config: Configuration with config.task field.
-        
-    Returns:
-        FederatedClient class from appropriate module (classification or regression).
-    """
-    task = getattr(config, "task", "classification")
-    
-    if task == "classification":
-        from flwr_cinema.tasks.classification.client import ClassificationClient
-        return ClassificationClient
-    elif task == "regression":
-        # from flwr_cinema.tasks.regression.client import RegressionClient
-        # return RegressionClient
-        raise NotImplementedError("Regression client not implemented yet.") # TODO: Temporal, en proceso de investigacion si se puede usar el mismo cliente para ambas tareas solo cambiando las funciones propias 
-    else:
-        raise ValueError(f"Unknown task type: {task}")
+    """Resolve federated client class from task adapter."""
+    return get_federated_task_adapter(config).client_class_factory()
 
 def get_task_specific_functions(config: DictConfig):
-    """Load task-specific loss and eval functions based on config.task.
-    
-    Args:
-        config: Configuration dictionary with config.task (classification or regression).
-        
-    Returns:
-        Tuple of (loss_fn, eval_dataloader_fn) appropriate for the task.
-    """
-    task = getattr(config, "task", "classification")
-    
-    if task == "classification":
-        from models.cinema.cinema.classification.train import (
-            classification_loss,
-            classification_eval_dataloader,
-        )
-        return classification_loss, classification_eval_dataloader
-    else:
-        raise NotImplementedError("Only classification task is implemented currently.") # TODO: Temporal, en proceso de investigacion si se puede usar el mismo cliente para ambas tareas solo cambiando las funciones propias
-        # from models.cinema.cinema.regression.train import (
-        #     regression_loss,
-        #     regression_eval_dataloader,
-        # )
-        # return regression_loss, regression_eval_dataloader
+    """Resolve task-specific loss and evaluation functions from adapter."""
+    adapter = get_federated_task_adapter(config)
+    task_spec = adapter.task_spec
+    return task_spec.loss_fn_factory(), task_spec.eval_fn_factory()
 
 
 def load_client_data(
@@ -182,8 +104,10 @@ def maybe_apply_class_weighted_loss(config: DictConfig, loss_fn, client_stats: d
         from flwr_cinema.scripts.weighted_losses import wrap_loss_with_class_weights
         class_distribution = client_stats.get("train", {}).get("class_distribution", None)
         if class_distribution:
-            loss_fn = wrap_loss_with_class_weights(loss_fn, class_distribution)
-            # logger.info(f"Applied class-weighted BCE with distribution: {class_distribution}")
+            class_col = config.data.class_column
+            classes = config.data[class_col]
+            loss_fn = wrap_loss_with_class_weights(loss_fn, class_distribution, classes)
+            # logger.info(f"Applied class-weighted CE with distribution: {class_distribution}")
         # else:
             # logger.info("Classification task: class_weighted_loss enabled but no class_distribution available")
     return loss_fn
@@ -211,7 +135,12 @@ def train(msg: Message, context: Context):
         timestamp_time = datetime.now().strftime("%H-%M-%S")
         timestamp_str = f"{timestamp_date}/{timestamp_time}"
 
-    target_column = getattr(config.data, "class_column", None) or getattr(config.data, "regression_column", "unknown")
+    if getattr(config, "task", "classification") == "classification":
+        target_column = getattr(config.data, "class_column", "classification")
+    elif getattr(config, "task", "regression") == "regression":
+        target_column = getattr(config.data, "regression_column", "regression")
+    else:
+        target_column = getattr(config, "task", "unknown")
     base_output_dir = Path("outputs") / (
         f"{config.model_name}_{config.task}/"
         f"{config.mode}/"
@@ -290,6 +219,7 @@ def train(msg: Message, context: Context):
         clip_grad=float(in_config.get("clip_grad", config.train.clip_grad)) if in_config.get("clip_grad", config.train.clip_grad) is not None and float(in_config.get("clip_grad", config.train.clip_grad)) > 0 else None,
         use_lora=config.train.use_lora,
         freeze_pretrained=config.model.freeze_pretrained,
+        aggregate_head=getattr(config.federated, "aggregate_head", True),
         metrics_save_path=metrics_save_path,
         stats_save_path=stats_save_path,
         eval_dataloader_fn=eval_dataloader_fn,
@@ -322,7 +252,12 @@ def evaluate(msg: Message, context: Context):
         timestamp_time = datetime.now().strftime("%H-%M-%S")
         timestamp_str = f"{timestamp_date}/{timestamp_time}"
     
-    target_column = getattr(config.data, "class_column", None) or getattr(config.data, "regression_column", "unknown")
+    if getattr(config, "task", "classification") == "classification":
+        target_column = getattr(config.data, "class_column", "classification")
+    elif getattr(config, "task", "regression") == "regression":
+        target_column = getattr(config.data, "regression_column", "regression")
+    else:
+        target_column = getattr(config, "task", "unknown")
     base_output_dir = Path("outputs") / (
         f"{config.model_name}_{config.task}/"
         f"{config.mode}/"
@@ -387,6 +322,7 @@ def evaluate(msg: Message, context: Context):
         clip_grad=None, 
         use_lora=config.train.use_lora,
         freeze_pretrained=config.model.freeze_pretrained,
+        aggregate_head=getattr(config.federated, "aggregate_head", True),
         metrics_save_path=metrics_save_path, # TODO: maybe delete path parameters because evaluation metrics are only saved in eval function for now
         stats_save_path=stats_save_path,
         eval_dataloader_fn=eval_dataloader_fn,

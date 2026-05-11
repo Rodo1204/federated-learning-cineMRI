@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import logging
-from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
 
@@ -12,6 +11,8 @@ import numpy as np
 import pandas as pd
 import torch
 from torch.utils.data import DataLoader, SequentialSampler
+
+from flwr_cinema.tasks.adapters import get_task_spec
 
 try:  # pragma: no cover - import availability depends on local environment
     from models.cinema.cinema.classification.dataset import (
@@ -736,11 +737,20 @@ def load_test_metadata(config: dict) -> pd.DataFrame:
     return filter_metadata_by_client_config(config=config, meta_df=test_meta_df, metadata_type="test")
 
 
+def resolve_federated_eval_task(task: str | dict[str, Any] | Any) -> str:
+    """Resolve and validate task name for federated evaluation."""
+    task_name = str(task.get("task") if isinstance(task, dict) else task).lower() if not isinstance(task, str) else task.lower()
+
+    if task_name not in {"classification", "regression", "segmentation"}:
+        raise ValueError(f"Unsupported task type for federated evaluation: {task_name}")
+    return task_name
+
+
 def get_test_datasets_by_client(
     config: dict,
     test_meta_df: pd.DataFrame,
 ) -> dict[str, tuple[int, ClassificationDataset | RegressionDataset]]:
-    """Create test datasets split by client. Supports both classification and regression.
+    """Create test datasets split by client for the configured task.
     
     Args:
         config: Configuration dictionary.
@@ -749,8 +759,8 @@ def get_test_datasets_by_client(
     Returns:
         Dictionary mapping client_id to (n_samples, dataset).
     """
-    if get_image_transforms is None:
-        raise RuntimeError("Dataset helpers are unavailable: models.cinema package import failed.")
+    if get_task_spec is None:
+        raise RuntimeError("Task adapter helpers are unavailable in this environment.")
 
     from omegaconf import OmegaConf
     
@@ -758,93 +768,41 @@ def get_test_datasets_by_client(
     data_dir = resolve_data_dir_with_fallback(data_dir)
     cfg = OmegaConf.create(config)
     
-    # Determine task type
-    task = getattr(cfg, "task", "regression")
-    is_classification = task == "classification"
+    task = resolve_federated_eval_task(config)
+    task_spec = get_task_spec(cfg)
     
-    # Get image transforms
-    _, transform = get_image_transforms(cfg)
+    _, transform = task_spec.transform_factory(cfg)
+    train_meta_df = load_metadata(data_dir / "train_metadata.csv", metadata_type="train")
+    train_meta_df = filter_metadata_by_client_config(config=config, meta_df=train_meta_df, metadata_type="train")
     
     # Identify clients
     client_col = _detect_client_column(test_meta_df)
     
     datasets_by_client = {}
     
-    if is_classification:
-        # Classification datasets
-        class_col = config["data"]["class_column"]
-        train_meta_df = load_metadata(data_dir / "train_metadata.csv", metadata_type="train")
-        train_meta_df = filter_metadata_by_client_config(config=config, meta_df=train_meta_df, metadata_type="train")
-        # Extract classes from config to preserve training order (CRITICAL!)
-        try:
-            classes = list(config["data"][class_col]) if config["data"][class_col] else None
-        except (KeyError, TypeError):
-            classes = None
-        
-        if not classes:
-            logger.warning(f"No explicit class list in config.data.{class_col}, using sorted unique from training")
-            classes = sorted(train_meta_df[class_col].unique().tolist())
-        
-        if client_col is None:
-            # Single client case
-            client_id = test_meta_df["dataset"].iloc[0] if "dataset" in test_meta_df.columns else "unknown"
-            dataset = ClassificationDataset(
-                data_dir=data_dir / "test",
-                meta_df=test_meta_df,
-                class_col=class_col,
-                classes=classes,
-                views=cfg.model.views,
-                transform=transform,
-            )
-            datasets_by_client[client_id] = (len(test_meta_df), dataset)
-        else:
-            # Multi-client case
-            for client_id in sorted(test_meta_df[client_col].unique()):
-                client_meta_df = test_meta_df[test_meta_df[client_col] == client_id]
-                dataset = ClassificationDataset(
-                    data_dir=data_dir / "test",
-                    meta_df=client_meta_df,
-                    class_col=class_col,
-                    classes=classes,
-                    views=cfg.model.views,
-                    transform=transform,
-                )
-                datasets_by_client[client_id] = (len(client_meta_df), dataset)
+    if client_col is None:
+        # Single client case
+        client_id = test_meta_df["dataset"].iloc[0] if "dataset" in test_meta_df.columns else "unknown"
+        dataset = task_spec.dataset_factory(
+            config=cfg,
+            data_dir=data_dir / "test",
+            meta_df=test_meta_df,
+            transform=transform,
+            train_meta_df=train_meta_df,
+        )
+        datasets_by_client[client_id] = (len(test_meta_df), dataset)
     else:
-        # Regression datasets
-        reg_col = config["data"]["regression_column"]
-        train_meta_df = load_metadata(data_dir / "train_metadata.csv", metadata_type="train")
-        train_meta_df = filter_metadata_by_client_config(config=config, meta_df=train_meta_df, metadata_type="train")
-        reg_mean = train_meta_df[reg_col].mean()
-        reg_std = train_meta_df[reg_col].std()
-        
-        if client_col is None:
-            # Single client case
-            client_id = test_meta_df["dataset"].iloc[0] if "dataset" in test_meta_df.columns else "unknown"
-            dataset = RegressionDataset(
+        # Multi-client case
+        for client_id in sorted(test_meta_df[client_col].unique()):
+            client_meta_df = test_meta_df[test_meta_df[client_col] == client_id]
+            dataset = task_spec.dataset_factory(
+                config=cfg,
                 data_dir=data_dir / "test",
-                meta_df=test_meta_df,
-                reg_col=reg_col,
-                reg_mean=reg_mean,
-                reg_std=reg_std,
-                views=cfg.model.views,
+                meta_df=client_meta_df,
                 transform=transform,
+                train_meta_df=train_meta_df,
             )
-            datasets_by_client[client_id] = (len(test_meta_df), dataset)
-        else:
-            # Multi-client case
-            for client_id in sorted(test_meta_df[client_col].unique()):
-                client_meta_df = test_meta_df[test_meta_df[client_col] == client_id]
-                dataset = RegressionDataset(
-                    data_dir=data_dir / "test",
-                    meta_df=client_meta_df,
-                    reg_col=reg_col,
-                    reg_mean=reg_mean,
-                    reg_std=reg_std,
-                    views=cfg.model.views,
-                    transform=transform,
-                )
-                datasets_by_client[client_id] = (len(client_meta_df), dataset)
+            datasets_by_client[client_id] = (len(client_meta_df), dataset)
     
     logger.info(f"Created test datasets ({task}) for {len(datasets_by_client)} clients: {list(datasets_by_client.keys())}")
     return datasets_by_client
@@ -1033,26 +991,12 @@ def compute_primary_metric_fairness(
     }
 
 
-@dataclass(frozen=True)
-class TaskAdapter:
-    """Task-specific hooks used by federated evaluator orchestration."""
-
-    task_type: str
-    build_datasets_fn: Callable[..., dict[str, tuple[int, Any]]]
-    evaluate_fn: Callable[..., dict[str, float]]
-    normalize_metrics_fn: Callable[[dict[str, Any]], dict[str, float]]
-
-
-def _normalize_metric_values(metrics: dict[str, Any]) -> dict[str, float]:
+def normalize_metric_values(metrics: dict[str, Any]) -> dict[str, float]:
     normalized: dict[str, float] = {}
     for name, value in metrics.items():
         if isinstance(value, (int, float, np.integer, np.floating)):
             normalized[str(name)] = float(value)
     return normalized
-
-
-def _build_test_datasets_for_task(config: dict, test_meta_df: pd.DataFrame) -> dict[str, tuple[int, Any]]:
-    return get_test_datasets_by_client(config=config, test_meta_df=test_meta_df)
 
 
 def _evaluate_classification(
@@ -1083,7 +1027,7 @@ def _evaluate_classification(
         amp_dtype=amp_dtype,
         device=device,
     )
-    return _normalize_metric_values(metrics)
+    return normalize_metric_values(metrics)
 
 
 def _evaluate_regression(
@@ -1092,61 +1036,43 @@ def _evaluate_regression(
     config: dict,
     device: torch.device,
 ) -> dict[str, float]:
-    data_dir = Path(config["data"]["combined"]["dir"]).expanduser()
-    data_dir = resolve_data_dir_with_fallback(data_dir)
-    train_meta_df = load_metadata(data_dir / "train_metadata.csv", metadata_type="train")
-    train_meta_df = filter_metadata_by_client_config(config=config, meta_df=train_meta_df, metadata_type="train")
-    reg_col = config["data"]["regression_column"]
-    reg_mean = float(train_meta_df[reg_col].mean())
-    reg_std = float(train_meta_df[reg_col].std())
-    metrics = compute_metrics_on_dataloader(
+    from omegaconf import OmegaConf
+
+    if get_amp_dtype_and_device is None:
+        raise RuntimeError("Regression evaluation dependencies are unavailable in this environment.")
+
+    _ = resolve_federated_eval_task(config)
+    cfg = OmegaConf.create(config)
+    task_spec = get_task_spec(cfg)
+    eval_dataloader_fn = task_spec.eval_fn_factory()
+    amp_dtype, _ = get_amp_dtype_and_device()
+    views = cfg.model.views if isinstance(cfg.model.views, list) else [cfg.model.views]
+    patch_size_dict = {
+        v: cfg.data.sax.patch_size if v == "sax" else cfg.data.lax.patch_size
+        for v in views
+    }
+    spacing_dict = {
+        v: cfg.data.sax.spacing if v == "sax" else cfg.data.lax.spacing
+        for v in views
+    }
+
+    metrics = eval_dataloader_fn(
         model=model,
         dataloader=dataloader,
-        reg_mean=reg_mean,
-        reg_std=reg_std,
-        config=config,
+        patch_size_dict=patch_size_dict,
+        spacing_dict=spacing_dict,
+        amp_dtype=amp_dtype,
         device=device,
     )
-    return _normalize_metric_values(metrics)
+    return normalize_metric_values(metrics)
 
 
-def _segmentation_placeholder(*_: Any, **__: Any) -> dict[str, float]:
-    raise NotImplementedError(
-        "Segmentation adapter is not wired yet in flwr_cinema; "
-        "provide a concrete dataset/eval callable before running segmentation federated evaluation."
-    )
-
-
-def get_task_adapter(task: str | dict[str, Any] | Any) -> TaskAdapter:
-    """Return task adapter for classification/regression/segmentation.
-
-    Segmentation is currently an explicit placeholder and intentionally fails fast.
-    """
-    task_name = str(task.get("task") if isinstance(task, dict) else task).lower() if not isinstance(task, str) else task.lower()
-
+def get_federated_eval_fn(task: str | dict[str, Any] | Any) -> Callable[..., dict[str, float]]:
+    """Return federated evaluation function for supported tasks."""
+    task_name = resolve_federated_eval_task(task)
     if task_name == "classification":
-        return TaskAdapter(
-            task_type="classification",
-            build_datasets_fn=_build_test_datasets_for_task,
-            evaluate_fn=_evaluate_classification,
-            normalize_metrics_fn=_normalize_metric_values,
-        )
-    if task_name == "regression":
-        return TaskAdapter(
-            task_type="regression",
-            build_datasets_fn=_build_test_datasets_for_task,
-            evaluate_fn=_evaluate_regression,
-            normalize_metrics_fn=_normalize_metric_values,
-        )
-    if task_name == "segmentation":
-        return TaskAdapter(
-            task_type="segmentation",
-            build_datasets_fn=_segmentation_placeholder,
-            evaluate_fn=_segmentation_placeholder,
-            normalize_metrics_fn=_normalize_metric_values,
-        )
-
-    raise ValueError(f"Unsupported task type for federated evaluation adapter: {task_name}")
+        return _evaluate_classification
+    return _evaluate_regression
 
 
 def compute_cross_center_metrics(

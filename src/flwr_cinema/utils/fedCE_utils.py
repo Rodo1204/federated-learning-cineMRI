@@ -37,10 +37,8 @@ def compute_flattened_delta_and_global_gradient(global_weights: dict, local_weig
 
 
 def calculate_excluded_delta(delta_1d: torch.Tensor, global_gradient_1d: torch.Tensor, prev_rho: float, epsilon: float = 1e-5) -> torch.Tensor:
-    """Calculate the excluded delta for FedCE."""
-    if prev_rho == 0.0:
-         return global_gradient_1d 
-    return (global_gradient_1d - (prev_rho*delta_1d)) / max((1-prev_rho), epsilon) # ∇F(w_k^-i)
+    """Calculate the excluded delta for FedCE (authors-style, no division by 1-prev_rho)."""
+    return global_gradient_1d - (prev_rho * delta_1d)  # ∇F(w_k^-i)
 
 def calculate_gamma_cos(delta_1d: torch.Tensor, excluded_delta_1d: torch.Tensor) -> float:
     """Calculate the cosine similarity-based gamma for FedCE."""
@@ -51,10 +49,18 @@ def calculate_gamma_cos(delta_1d: torch.Tensor, excluded_delta_1d: torch.Tensor)
     return max(0, gamma_cos) # Γ_k,i(cos)
 
 def calculate_excluded_model(global_weights: dict, local_weights: dict, prev_rho: float, epsilon: float = 1e-5) -> dict:
-    """Calculate the excluded model for FedCE."""
+    """Calculate the excluded model for FedCE.
+
+    Caps prev_rho at 0.99 to prevent numerical explosion when a single
+    client dominates (denominator 1-prev_rho → 0 amplifies the excluded
+    model by orders of magnitude).
+    """
     if prev_rho == 0.0:
         return global_weights 
-    
+
+    # cap to prevent division by near-zero (1-prev_rho)
+    prev_rho = min(prev_rho, 0.99)
+
     excluded_model = {}
     common_keys = [k for k in global_weights.keys() if k in local_weights]
     for key in common_keys:
@@ -87,25 +93,24 @@ def calculate_excluded_model(global_weights: dict, local_weights: dict, prev_rho
 
 
 def compute_fedCE_gamma_cos(global_weights: dict, local_weights: dict, global_gradient: dict, prev_rho: float, epsilon: float = 1e-5) -> float:
-    """Compute the FedCE gamma_cos for a client."""
+    """Compute the FedCE gamma_cos for a client.
+
+    Uses NVFlare-style excluded gradient (without division by 1-prev_rho)
+    since cosine similarity is scale-invariant. This avoids numerical
+    instability when prev_rho ≈ 1.
+    """
     
     start_time = time.perf_counter()
     if not global_gradient:
         log(logging.WARNING, "Global gradient is empty. Cannot compute FedCE gamma_cos without global gradient information.")
         return 0.0
     
-    excl_denom = max(1.0 - prev_rho, epsilon)
     dot = 0.0
     norm_delta = 0.0
     norm_excl = 0.0
 
     common_keys = [k for k in global_weights.keys() if k in local_weights and k in global_gradient]
     log(logging.INFO, f"FedCE gamma_cos streaming. Common keys: {len(common_keys)}")
-    # log(logging.INFO, 
-    #     f"Key {common_keys[0]} dtypes — g: {global_weights[common_keys[0]].device}, "
-    #     f"l: {local_weights[common_keys[0]].device}, "
-    #     f"gg: {global_gradient[common_keys[0]].device}"
-    # )
 
     with torch.no_grad():
         for key in common_keys:
@@ -116,10 +121,10 @@ def compute_fedCE_gamma_cos(global_weights: dict, local_weights: dict, global_gr
 
             delta = (l - g).reshape(-1)
             gg = gg.reshape(-1)
-            if prev_rho == 0.0:
-                excluded_delta = gg
-            else:
-                excluded_delta = ((gg - (prev_rho * delta)) / excl_denom).reshape(-1)
+            # Authors implementation excluded gradient (no division by 1-prev_rho).
+            # Cosine similarity is scale-invariant, so this produces identical
+            # gamma_cos while avoiding numerical instability when prev_rho near 1.
+            excluded_delta = (gg - (prev_rho * delta)).reshape(-1)
 
             # Acumuladores escalares, memoria constante
             dot += torch.dot(delta, excluded_delta).item()

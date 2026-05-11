@@ -10,6 +10,8 @@ https://arxiv.org/abs/2106.09685
 
 from __future__ import annotations
 
+from collections.abc import Callable
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
 import torch
@@ -505,7 +507,7 @@ def apply_lora_to_convunetr(
             for param in model.pred_head_dict[view].parameters():
                 param.requires_grad = True
 
-        logger.info(f"Unfroze decoder parameters and prediction heads for task-specific training on view {view}")
+        logger.info(f"Unfroze decoder parameters and prediction head for task-specific training on view {view}")
     
     # Count trainable parameters
     lora_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -1220,3 +1222,99 @@ def load_trainable_state_dict(model: nn.Module, trainable_state_dict: dict[str, 
     for name, param in model.named_parameters():
         if param.requires_grad and name in trainable_state_dict:
             param.data.copy_(trainable_state_dict[name])
+
+
+# ── LoRa policy dispatch ──────────────────────────────────────────────────────
+
+@dataclass(frozen=True)
+class LoRaPolicy:
+    """Get/load function pair for model parameter communication.
+
+    Centralises the decision of *which* state-dict extractor and loader to use
+    based on model type, LoRA flavour, and aggregation policy.  Call sites no
+    longer need their own if/elif trees.
+    """
+    get: Callable[[nn.Module], dict[str, torch.Tensor]]
+    load: Callable[[nn.Module, dict[str, torch.Tensor]], None]
+
+
+def get_lora_policy(
+    model: nn.Module,
+    *,
+    use_lora: bool = False,
+    freeze_pretrained: bool = False,
+    aggregate_head: bool = True,
+) -> LoRaPolicy:
+    """Return the correct get/load pair for the model and configuration.
+
+    Parameters
+    ----------
+    model:
+        The concrete model instance (ConvViT, ConvUNetR, etc.).  The function
+        inspects the model's attributes (e.g. ``has_dual_lora``,
+        ``hasattr(model, "decoder_dict")``) to select the right variant.
+    use_lora:
+        Whether LoRA adapters are active.
+    freeze_pretrained:
+        Whether the pretrained backbone is frozen (head-only training).
+    aggregate_head:
+        Whether prediction heads should be included.
+        - ``True`` (default): LoRA + head together (centralised training,
+          federated with ``aggregate_head=True``, or client send-back).
+        - ``False``: LoRA only — heads stay local on each client.
+
+    Returns
+    -------
+    LoRaPolicy(get=…, load=…)
+        Appropriate extractor/loader pair for the current model state.
+    """
+    is_dual: bool = has_dual_lora(model)
+    is_unetr: bool = hasattr(model, "decoder_dict")
+
+    # ── No LoRA (head-only) ──────────────────────────────────────
+    if not use_lora:
+        if freeze_pretrained:
+            return LoRaPolicy(
+                get=get_trainable_state_dict,
+                load=load_trainable_state_dict,
+            )
+        raise ValueError(
+            "Full fine-tuning (use_lora=False, freeze_pretrained=False) is "
+            "not handled by get_lora_policy. Call sites must handle it directly "
+            "with model.state_dict() / model.load_state_dict()."
+        )
+
+    # ── ConvUNetR (LoRA + decoder + heads) ─────────────────────────────────────
+    if is_unetr:
+        if aggregate_head:
+            return LoRaPolicy(
+                get=get_lora_decoder_head_state_dict,
+                load=load_lora_decoder_head_state_dict,
+            )
+        return LoRaPolicy(
+            get=get_lora_decoder_state_dict,
+            load=load_lora_decoder_state_dict,
+        )
+
+    # ── Dual LoRA (ConvViT) ────────────────────────────────────────────────────
+    if is_dual:
+        if aggregate_head:
+            return LoRaPolicy(
+                get=get_global_lora_and_head_state_dict,
+                load=load_global_lora_and_head_state_dict,
+            )
+        return LoRaPolicy(
+            get=get_global_lora_state_dict,
+            load=load_global_lora_state_dict,
+        )
+
+    # ── Standard LoRA (ConvViT) ────────────────────────────────────────────────
+    if aggregate_head:
+        return LoRaPolicy(
+            get=get_lora_and_head_state_dict,
+            load=load_lora_and_head_state_dict,
+        )
+    return LoRaPolicy(
+        get=get_lora_state_dict,
+        load=load_lora_state_dict,
+    )

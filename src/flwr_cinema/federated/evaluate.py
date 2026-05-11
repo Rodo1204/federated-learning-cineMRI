@@ -1,7 +1,6 @@
 """Federated checkpoint evaluator with unified result schema.
 
-Supports classification/regression evaluation and explicit segmentation placeholder
-until a concrete segmentation adapter is wired.
+Supports classification, regression, and segmentation evaluation.
 """
 
 from __future__ import annotations
@@ -20,10 +19,13 @@ from flwr_cinema.scripts.eval_utils import (
     filter_metadata_by_client_config,
     find_best_federated_round,
     find_last_federated_round,
-    get_task_adapter,
+    get_federated_eval_fn,
+    get_test_datasets_by_client,
     load_checkpoint_and_config,
     load_metadata,
     load_test_metadata,
+    normalize_metric_values,
+    resolve_federated_eval_task,
     resolve_federated_checkpoint_dir,
     resolve_data_dir_with_fallback,
     to_builtin,
@@ -99,12 +101,12 @@ def resolve_checkpoint_for_evaluation(
 
 def build_base_model(config: dict[str, Any], checkpoint: dict[str, Any]) -> torch.nn.Module:
     """Recreate model and load global/base checkpoint weights."""
-    from flwr_cinema.centralized.combined.train import get_model
+    from flwr_cinema.tasks.adapters import get_federated_task_adapter
     from flwr_cinema.scripts.lora import load_global_lora_state_dict, load_lora_state_dict
     from omegaconf import OmegaConf
 
     cfg = OmegaConf.create(config)
-    model = get_model(cfg)
+    model = get_federated_task_adapter(cfg).build_model(cfg)
 
     model_state = checkpoint.get("model_state_dict", checkpoint.get("model", checkpoint))
     if not isinstance(model_state, dict):
@@ -169,7 +171,7 @@ def evaluate_single_client(
     model: torch.nn.Module,
     base_state: dict[str, torch.Tensor],
     checkpoint: dict[str, Any],
-    adapter: Any,
+    evaluate_fn: Any,
     config: dict[str, Any],
     device: torch.device,
 ) -> dict[str, Any]:
@@ -183,13 +185,13 @@ def evaluate_single_client(
     model.to(device)
     model.eval()
 
-    metrics = adapter.evaluate_fn(model=model, dataloader=dataloader, config=config, device=device)
+    metrics = evaluate_fn(model=model, dataloader=dataloader, config=config, device=device)
     return {
         "client_id": str(client_id),
         "num_samples": int(n_samples),
         "model_variant": model_variant,
         "applied_private_artifacts": applied,
-        "metrics": adapter.normalize_metrics_fn(metrics),
+        "metrics": normalize_metric_values(metrics),
     }
 
 
@@ -223,12 +225,15 @@ def _build_patch_size_dict(config: dict[str, Any]) -> dict[str, Any]:
 
 
 def _resolve_regression_normalization(config: dict[str, Any]) -> tuple[float, float]:
+    from flwr_cinema.tasks.adapters import resolve_regression_stats
+    from omegaconf import OmegaConf
+
     data_dir = Path(config["data"]["combined"]["dir"]).expanduser()
     data_dir = resolve_data_dir_with_fallback(data_dir)
     train_meta_df = load_metadata(data_dir / "train_metadata.csv", metadata_type="train")
     train_meta_df = filter_metadata_by_client_config(config=config, meta_df=train_meta_df, metadata_type="train")
-    reg_col = config["data"]["regression_column"]
-    return float(train_meta_df[reg_col].mean()), float(train_meta_df[reg_col].std())
+    cfg = OmegaConf.create(config)
+    return resolve_regression_stats(cfg, train_meta_df)
 
 
 def _evaluate_personalized_global_pool_classification(
@@ -340,7 +345,7 @@ def _evaluate_personalized_global_pool_regression(
 def evaluate_global_pool(
     model: torch.nn.Module,
     checkpoint: dict[str, Any],
-    adapter: Any,
+    evaluate_fn: Any,
     config: dict[str, Any],
     task_type: str,
     datasets_by_client: dict[str, tuple[int, Any]],
@@ -374,8 +379,8 @@ def evaluate_global_pool(
     pooled_dataloader = build_eval_dataloader(pooled_dataset)
     model.to(device)
     model.eval()
-    metrics = adapter.evaluate_fn(model=model, dataloader=pooled_dataloader, config=config, device=device)
-    return "global", adapter.normalize_metrics_fn(metrics)
+    metrics = evaluate_fn(model=model, dataloader=pooled_dataloader, config=config, device=device)
+    return "global", normalize_metric_values(metrics)
 
 
 def build_per_client_payload(client_results: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
@@ -391,19 +396,20 @@ def build_per_client_payload(client_results: list[dict[str, Any]]) -> dict[str, 
     return per_client
 
 
-def load_client_datasets(config: dict[str, Any], task_type: str) -> tuple[Any, dict[str, tuple[int, Any]]]:
-    adapter = get_task_adapter(task_type)
+def load_client_datasets(config: dict[str, Any], task_type: str) -> tuple[dict[str, tuple[int, Any]], Any]:
+    resolve_federated_eval_task(task_type)
     test_meta_df = load_test_metadata(config)
-    datasets_by_client = adapter.build_datasets_fn(config, test_meta_df)
+    datasets_by_client = get_test_datasets_by_client(config, test_meta_df)
     if not datasets_by_client:
         raise ValueError("No client test datasets found for federated evaluation.")
-    return adapter, datasets_by_client
+    evaluate_fn = get_federated_eval_fn(task_type)
+    return datasets_by_client, evaluate_fn
 
 
 def evaluate_clients(
     model: torch.nn.Module,
     checkpoint: dict[str, Any],
-    adapter: Any,
+    evaluate_fn: Any,
     config: dict[str, Any],
     datasets_by_client: dict[str, tuple[int, Any]],
     base_state: dict[str, torch.Tensor],
@@ -420,7 +426,7 @@ def evaluate_clients(
                 model=model,
                 base_state=base_state,
                 checkpoint=checkpoint,
-                adapter=adapter,
+                evaluate_fn=evaluate_fn,
                 config=config,
                 device=device,
             )
@@ -507,18 +513,17 @@ def run_evaluation(
     # Reload exact checkpoint selected
     checkpoint, config = load_checkpoint_and_config(selected_checkpoint_path, output_dir=selected_checkpoint_path.parent)
     task_type = str(config.get("task", "regression"))
-    if task_type not in {"classification", "regression", "segmentation"}:
-        raise ValueError(f"Unsupported task type '{task_type}' in config.")
+    task_type = resolve_federated_eval_task(task_type)
 
     model = build_base_model(config=config, checkpoint=checkpoint)
-    adapter, datasets_by_client = load_client_datasets(config=config, task_type=task_type)
+    datasets_by_client, evaluate_fn = load_client_datasets(config=config, task_type=task_type)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     base_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
 
     client_results = evaluate_clients(
         model=model,
         checkpoint=checkpoint,
-        adapter=adapter,
+        evaluate_fn=evaluate_fn,
         config=config,
         datasets_by_client=datasets_by_client,
         base_state=base_state,
@@ -527,7 +532,7 @@ def run_evaluation(
     global_pool_model_variant, global_pool_metrics = evaluate_global_pool(
         model=model,
         checkpoint=checkpoint,
-        adapter=adapter,
+        evaluate_fn=evaluate_fn,
         config=config,
         task_type=task_type,
         datasets_by_client=datasets_by_client,

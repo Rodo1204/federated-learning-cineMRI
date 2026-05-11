@@ -1,5 +1,3 @@
-from collections import defaultdict
-
 from flwr.app import Message, ArrayRecord, ConfigRecord, MetricRecord, RecordDict
 from flwr.serverapp import Grid
 from flwr.serverapp.strategy import FedAvg
@@ -9,6 +7,9 @@ from flwr.serverapp.strategy.strategy_utils import aggregate_metricrecords
 
 from logging import INFO, DEBUG, ERROR
 from flwr.common.logger import log
+
+# Minimum aggregation weight to prevent zero-weight crash (aligned with authors implementation)
+_FEDCE_MIN_WEIGHT = 1e-3
 
 class FedCE(FedAvg):
     """Federated strategy implementing FedCE aggregation, combined with CineMA-specific logic (step-based validation, 
@@ -26,10 +27,10 @@ class FedCE(FedAvg):
         kwargs["weighted_by_key"] = "fedce_normalized_rho" # use the normalized rho as the key for weighted aggregation to reuse the existing weighted aggregation logic in FedAvg
         kwargs["train_metrics_aggr_fn"] = lambda replies, _: aggregate_metricrecords(replies, "num_samples")
         super().__init__(**kwargs)
-        self.prev_normalized_rho_by_client: defaultdict[str, float] = defaultdict(float) # Store previous normalized rho values for each client to use in the next round's calculations
+        self.prev_normalized_rho_by_client: dict[str, float] = {}  
         self._previous_global_params: ArrayRecord | None = None # Store global parameters to send to clients for FedCE calculations
         self.global_gradient: ArrayRecord | None = None # Store global gradient to send to clients for FedCE calculations
-        self.accumulated_gammas: defaultdict[str, float] = defaultdict(float) # Store accumulated gamma values for each client
+        self.accumulated_gammas: dict[str, float] = {}  
         self.first_round_uniform_rho: float | None = None # Store the uniform rho value for the first round when we don't have any previous information
 
     def compute_global_gradient(self, previous_global_params: ArrayRecord, aggregated_params: ArrayRecord) -> ArrayRecord:
@@ -130,7 +131,7 @@ class FedCE(FedAvg):
                 else: # default to "multiplication"
                     combined_gamma = normalized_cos * normalized_err
 
-                self.accumulated_gammas[client_id] += combined_gamma
+                self.accumulated_gammas[client_id] = self.accumulated_gammas.get(client_id, 0.0) + combined_gamma
             
             z_k = sum(self.accumulated_gammas.values())
 
@@ -139,9 +140,25 @@ class FedCE(FedAvg):
             for client_id, gamma_sum in self.accumulated_gammas.items():
                 self.prev_normalized_rho_by_client[client_id] = gamma_sum / z_k if z_k > 0 else 0.0
 
+            # clip minimum weight and re-normalize to prevent ZeroDivisionError in FedAvg
+            # (aligned with authors implementation: np.clip(weights, a_min=1e-3))
+            if self.prev_normalized_rho_by_client:
+                for cid in self.prev_normalized_rho_by_client:
+                    self.prev_normalized_rho_by_client[cid] = max(
+                        self.prev_normalized_rho_by_client[cid], _FEDCE_MIN_WEIGHT
+                    )
+                z_clipped = sum(self.prev_normalized_rho_by_client.values())
+                if z_clipped > 0:
+                    for cid in self.prev_normalized_rho_by_client:
+                        self.prev_normalized_rho_by_client[cid] /= z_clipped
+
             for message in replies_list:
                 client_id = str(message.metadata.src_node_id)
-                message.content.metric_records["metrics"]["fedce_normalized_rho"] = self.prev_normalized_rho_by_client[client_id]
+                rho = self.prev_normalized_rho_by_client.get(client_id)
+                if rho is None:
+                    rho = self.first_round_uniform_rho or _FEDCE_MIN_WEIGHT
+                    log(INFO, f"Client {client_id} not in prev_normalized_rho_by_client, using fallback rho={rho}")
+                message.content.metric_records["metrics"]["fedce_normalized_rho"] = rho
                 log(INFO, f"Setting normalized rho for client {client_id}: {message.content.metric_records['metrics']['fedce_normalized_rho']}")
 
             agg_arrays, agg_metrics = super().aggregate_train(server_round, replies_list)

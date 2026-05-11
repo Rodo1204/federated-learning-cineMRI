@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Evaluate centralized classification model on test set with per-client breakdown.
+"""Evaluate centralized model on test set with per-client breakdown.
 
 Produces per-client metrics, global pool metrics, Assertivity (weighted & macro
 averages), and Fairness analysis (σ, gap, min/max client).
@@ -27,13 +27,11 @@ from flwr_cinema.scripts.eval_utils import (
     resolve_data_dir_with_fallback,
 )
 from flwr_cinema.scripts.lora import load_lora_state_dict
-from models.cinema.cinema.classification.dataset import EndDiastoleEndSystoleDataset, get_image_transforms
+from flwr_cinema.tasks.adapters import get_centralized_task_adapter
 from models.cinema.cinema.classification.train import classification_eval, classification_metrics
 from models.cinema.cinema.device import get_amp_dtype_and_device
 from models.cinema.cinema.log import get_logger
 from omegaconf import OmegaConf
-
-from flwr_cinema.centralized.combined.train import get_model
 
 logger = get_logger(__name__)
 
@@ -167,7 +165,7 @@ def evaluate_centralized(
     checkpoint_epoch: int | None = None,
     output_dir: Path | None = None,
 ) -> None:
-    """Evaluate centralized classification model on test set with per-client breakdown."""
+    """Evaluate centralized classification/regression model with shared task adapter routing."""
     checkpoint_dir = Path(checkpoint_dir)
 
     # Find checkpoint
@@ -200,12 +198,15 @@ def evaluate_centralized(
     output_dir.mkdir(parents=True, exist_ok=True)
     logger.info(f"Saving results to {output_dir}")
 
-    # Load model using flwr_cinema's get_model (supports LoRA, head-only)
     cfg = OmegaConf.create(config)
+    task = getattr(cfg, "task", "classification")
+    adapter = get_centralized_task_adapter(cfg)
+    task_spec = adapter.task_spec
+    eval_dataloader_fn = task_spec.eval_fn_factory()
     use_lora = getattr(cfg.train, "use_lora", False)
 
-    # get_model() already applies LoRA if use_lora=True (see train.py get_model function)
-    model = get_model(cfg)
+    # Shared model factory is reused in federated and centralized paths.
+    model = adapter.build_model(cfg)
 
     # Detect if checkpoint has LoRA weights
     checkpoint_model_state = checkpoint.get("model", checkpoint)
@@ -248,7 +249,12 @@ def evaluate_centralized(
     # Load test metadata
     data_dir = Path(cfg.data.combined.dir).expanduser()
     data_dir = resolve_data_dir_with_fallback(data_dir)
-    class_col = cfg.data.class_column
+    if task == "classification":
+        target_col = cfg.data.class_column
+    elif task == "regression":
+        target_col = cfg.data.regression_column
+    else:
+        target_col = None
 
     train_meta_df = load_metadata(data_dir / "train_metadata.csv", metadata_type="train")
     test_meta_df = load_metadata(data_dir / "test_metadata.csv", metadata_type="test")
@@ -274,26 +280,30 @@ def evaluate_centralized(
             test_meta_df["client"].isin(cfg.federated.client_ids)
         ].reset_index(drop=True)
 
-    # Extract classes from config
-    try:
-        classes = list(cfg.data[class_col]) if cfg.data[class_col] else None
-    except (KeyError, TypeError):
-        classes = None
+    classes = None
+    if task == "classification":
+        try:
+            classes = list(cfg.data[target_col]) if cfg.data[target_col] else None
+        except (KeyError, TypeError):
+            classes = None
 
-    if not classes:
-        logger.warning(
-            f"No explicit class list found in config.data.{class_col}, using sorted unique values"
-        )
-        classes = sorted(train_meta_df[class_col].unique().tolist())
-    logger.info(f"Classes: {classes}")
+        if not classes:
+            logger.warning(
+                f"No explicit class list found in config.data.{target_col}, using sorted unique values"
+            )
+            classes = sorted(train_meta_df[target_col].unique().tolist())
+        logger.info(f"Classes: {classes}")
 
-    # Get image transforms
-    _, val_transform = get_image_transforms(cfg)
+    # Get image transforms from shared adapter contract
+    _, val_transform = task_spec.transform_factory(cfg)
 
     # Setup patch size
     views = [cfg.model.views] if isinstance(cfg.model.views, str) else cfg.model.views
     patch_size_dict = {
         v: cfg.data.sax.patch_size if v == "sax" else cfg.data.lax.patch_size for v in views
+    }
+    spacing_dict = {
+        v: cfg.data.sax.spacing if v == "sax" else cfg.data.lax.spacing for v in views
     }
 
     # ═══════════════════════════════════════════════════════════════════════════
@@ -303,13 +313,12 @@ def evaluate_centralized(
     logger.info("GLOBAL POOL EVALUATION (all test data)")
     logger.info("=" * 80)
 
-    overall_dataset = EndDiastoleEndSystoleDataset(
+    overall_dataset = task_spec.dataset_factory(
+        config=cfg,
         data_dir=data_dir / "test",
         meta_df=test_meta_df,
-        class_col=class_col,
-        classes=classes,
-        views=cfg.model.views,
         transform=val_transform,
+        train_meta_df=train_meta_df,
     )
 
     overall_dataloader = DataLoader(
@@ -321,13 +330,23 @@ def evaluate_centralized(
         num_workers=cfg.train.n_workers,
     )
 
-    global_pool_metrics, _, _ = classification_eval_dataloader_with_balanced_accuracy(
-        model=model,
-        dataloader=overall_dataloader,
-        patch_size_dict=patch_size_dict,
-        amp_dtype=amp_dtype,
-        device=device,
-    )
+    if task == "classification":
+        global_pool_metrics, _, _ = classification_eval_dataloader_with_balanced_accuracy(
+            model=model,
+            dataloader=overall_dataloader,
+            patch_size_dict=patch_size_dict,
+            amp_dtype=amp_dtype,
+            device=device,
+        )
+    else:
+        global_pool_metrics = eval_dataloader_fn(
+            model=model,
+            dataloader=overall_dataloader,
+            patch_size_dict=patch_size_dict,
+            spacing_dict=spacing_dict,
+            amp_dtype=amp_dtype,
+            device=device,
+        )
 
     logger.info(f"Global pool metrics: {global_pool_metrics}")
 
@@ -347,13 +366,12 @@ def evaluate_centralized(
 
         logger.info(f"\nClient: {client_id} ({n_samples} samples)")
 
-        client_dataset = EndDiastoleEndSystoleDataset(
+        client_dataset = task_spec.dataset_factory(
+            config=cfg,
             data_dir=data_dir / "test",
             meta_df=client_meta.reset_index(drop=True),
-            class_col=class_col,
-            classes=classes,
-            views=cfg.model.views,
             transform=val_transform,
+            train_meta_df=train_meta_df,
         )
 
         client_dataloader = DataLoader(
@@ -365,13 +383,23 @@ def evaluate_centralized(
             num_workers=cfg.train.n_workers,
         )
 
-        metrics, _, _ = classification_eval_dataloader_with_balanced_accuracy(
-            model=model,
-            dataloader=client_dataloader,
-            patch_size_dict=patch_size_dict,
-            amp_dtype=amp_dtype,
-            device=device,
-        )
+        if task == "classification":
+            metrics, _, _ = classification_eval_dataloader_with_balanced_accuracy(
+                model=model,
+                dataloader=client_dataloader,
+                patch_size_dict=patch_size_dict,
+                amp_dtype=amp_dtype,
+                device=device,
+            )
+        else:
+            metrics = eval_dataloader_fn(
+                model=model,
+                dataloader=client_dataloader,
+                patch_size_dict=patch_size_dict,
+                spacing_dict=spacing_dict,
+                amp_dtype=amp_dtype,
+                device=device,
+            )
 
         per_client_metrics[client_id] = (n_samples, metrics)
         total_samples += n_samples
@@ -436,27 +464,33 @@ def evaluate_centralized(
     logger.info("SUMMARY")
     logger.info("=" * 80)
 
-    header = f"{'Client':<15} {'N':>6} {primary_metric:>12}  {'accuracy':>12}  {'balanced_acc':>12}"
+    if task == "classification":
+        aux_1, aux_2 = "accuracy", "balanced_accuracy"
+    elif task == "regression":
+        aux_1, aux_2 = "mae", "rmse"
+    else:
+        aux_1, aux_2 = "mean_dice_score", "mean_iou_score"  # segmentation defaults
+    header = f"{'Client':<15} {'N':>6} {primary_metric:>12}  {aux_1:>12}  {aux_2:>12}"
     logger.info(header)
     logger.info("-" * len(header))
     for client_id, (n_samples, metrics) in per_client_metrics.items():
         pm_val = metrics.get(primary_metric, 0.0)
-        acc_val = metrics.get("accuracy", 0.0)
-        ba_val = metrics.get("balanced_accuracy", 0.0)
-        logger.info(f"{client_id:<15} {n_samples:>6} {pm_val:>12.4f}  {acc_val:>12.4f}  {ba_val:>12.4f}")
+        aux_1_val = metrics.get(aux_1, 0.0)
+        aux_2_val = metrics.get(aux_2, 0.0)
+        logger.info(f"{client_id:<15} {n_samples:>6} {pm_val:>12.4f}  {aux_1_val:>12.4f}  {aux_2_val:>12.4f}")
     logger.info("-" * len(header))
     gp_pm = global_pool_metrics.get(primary_metric, 0.0)
-    gp_acc = global_pool_metrics.get("accuracy", 0.0)
-    gp_ba = global_pool_metrics.get("balanced_accuracy", 0.0)
-    logger.info(f"{'Global Pool':<15} {total_samples:>6} {gp_pm:>12.4f}  {gp_acc:>12.4f}  {gp_ba:>12.4f}")
+    gp_aux_1 = global_pool_metrics.get(aux_1, 0.0)
+    gp_aux_2 = global_pool_metrics.get(aux_2, 0.0)
+    logger.info(f"{'Global Pool':<15} {total_samples:>6} {gp_pm:>12.4f}  {gp_aux_1:>12.4f}  {gp_aux_2:>12.4f}")
     w_pm = weighted_metrics.get(primary_metric, 0.0)
-    w_acc = weighted_metrics.get("accuracy", 0.0)
-    w_ba = weighted_metrics.get("balanced_accuracy", 0.0)
-    logger.info(f"{'Weighted Avg':<15} {'':>6} {w_pm:>12.4f}  {w_acc:>12.4f}  {w_ba:>12.4f}")
+    w_aux_1 = weighted_metrics.get(aux_1, 0.0)
+    w_aux_2 = weighted_metrics.get(aux_2, 0.0)
+    logger.info(f"{'Weighted Avg':<15} {'':>6} {w_pm:>12.4f}  {w_aux_1:>12.4f}  {w_aux_2:>12.4f}")
     m_pm = macro_metrics.get(primary_metric, 0.0)
-    m_acc = macro_metrics.get("accuracy", 0.0)
-    m_ba = macro_metrics.get("balanced_accuracy", 0.0)
-    logger.info(f"{'Macro Avg':<15} {'':>6} {m_pm:>12.4f}  {m_acc:>12.4f}  {m_ba:>12.4f}")
+    m_aux_1 = macro_metrics.get(aux_1, 0.0)
+    m_aux_2 = macro_metrics.get(aux_2, 0.0)
+    logger.info(f"{'Macro Avg':<15} {'':>6} {m_pm:>12.4f}  {m_aux_1:>12.4f}  {m_aux_2:>12.4f}")
     logger.info(f"\nFairness std={fairness['std']:.4f}  |  Gap={fairness['gap']:.4f}")
 
     # ═══════════════════════════════════════════════════════════════════════════
@@ -468,8 +502,8 @@ def evaluate_centralized(
             "checkpoint_epoch": checkpoint.get("epoch"),
             "use_lora": use_lora,
             "primary_metric": primary_metric,
-            "task": getattr(cfg, "task", "classification"),
-            "class_column": class_col,
+            "task": task,
+            "target_column": target_col,
             "classes": classes,
         },
         "global_pool": global_pool_metrics,
@@ -495,7 +529,7 @@ def evaluate_centralized(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Evaluate centralized classification model on test set with per-client breakdown"
+        description="Evaluate centralized classification/regression model on test set with per-client breakdown"
     )
     parser.add_argument(
         "--checkpoint-dir",
