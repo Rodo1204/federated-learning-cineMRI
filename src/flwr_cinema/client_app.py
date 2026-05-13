@@ -21,6 +21,7 @@ app = ClientApp()
 # own model object so per-client artifacts don't leak across clients sharing
 # the same Ray actor in simulation mode.
 _MODEL_CACHE: dict[str, torch.nn.Module] = {}
+_OPTIM_STATE_CACHE: dict[str, dict] = {}
 _TRAIN_DATALOADER_CACHE = None
 _VAL_DATALOADER_CACHE = None
 _STATS_CACHE = None
@@ -44,6 +45,7 @@ def get_model(config: DictConfig, client_id: str | None = None) -> torch.nn.Modu
     adapter = get_federated_task_adapter(config)
     model = adapter.build_model(config)
     _MODEL_CACHE[cid] = model
+    _OPTIM_STATE_CACHE.pop(cid, None)  # new model → stale optimizer state is invalid
     _flush_other_clients_to_cpu(cid)
     return model
 
@@ -252,8 +254,17 @@ def train(msg: Message, context: Context):
         gpu_id=gpu_id,
     )
 
+    # Persist optimizer state across rounds (dirty optimizer).
+    #for testing purposes
+    if client_id in _OPTIM_STATE_CACHE:
+        client.optimizer.load_state_dict(_OPTIM_STATE_CACHE[client_id])
+
     # Call the client's train method and send the reply message
-    return client.train(msg, context)
+    reply = client.train(msg, context)
+
+    _OPTIM_STATE_CACHE[client_id] = client.optimizer.state_dict()
+
+    return reply
 
 
 @app.evaluate()
