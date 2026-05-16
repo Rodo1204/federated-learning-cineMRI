@@ -15,7 +15,7 @@ logging:
 federated:
   server_host: "localhost"
   server_port: 8888
-  n_rounds: 500  # Number of communication rounds
+  n_rounds: 800  # Number of communication rounds
   local_epochs: 1  # Local epochs per round per client
   n_clients: 5  # Number of expected clients (ie. acdc + Siemens + GE + Canon + Philips)
   # client_ids: ["acdc", "Siemens"]  # Identifiers for each client
@@ -72,7 +72,7 @@ data:
       std: None
 
   combined:
-    dir: C:\Users\Rodo\.cache\cinema_datasets\acdc_mnms_combined
+    dir: /media/data10/users/rodolfo/data/acdc_mnms_combined_stratified
 
 # LoRA configuration
 lora:
@@ -104,7 +104,7 @@ transform:
     translate_range: [60, 60, 0]
 
 train:
-  use_lora: True # Set to True to use LoRA
+  use_lora: False # Set to True to use LoRA
   use_class_weighted_loss: False # Set to True to use class-weighted BCE loss for imbalanced classification
   n_workers: 4
   clip_grad: 5.0
@@ -114,22 +114,22 @@ train:
   label_smoothing: 0.1
   lr: 1e-3
   min_lr: 1e-5
-  n_warmup_epochs: 25
-  n_epochs: 4000
+  n_warmup_epochs: 20
+  n_epochs: 2000
   max_n_ckpts: 2
-  batch_size: 32
-  batch_size_per_device: 2
-  eval_steps: 725  # Evaluate every N optimizer steps (aligned centralized/federated)
+  batch_size: 16
+  batch_size_per_device: 4
+  eval_steps: 1450  # Evaluate every N optimizer steps (aligned centralized/federated)
   early_stopping:
     metric: "mean_dice_score"
     mode: "max"
-    patience: 5
-    min_delta: 1e-4
+    patience: 10
+    min_delta: 5e-4
 
 model:
   name: convunetr
   ckpt_path: null
-  freeze_pretrained: True
+  freeze_pretrained: False
   views: sax
   out_chans: 4
   convunetr:

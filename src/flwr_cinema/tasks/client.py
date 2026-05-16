@@ -167,11 +167,32 @@ class FederatedClient:
         log(logging.INFO, f"Client {self.client_id} - Initialized on device: {self.device}")
 
         # Optimizer for local training
-        trainable_params = [p for p in self.model.parameters() if p.requires_grad]
+        if not self.use_lora:
+            param_groups = param_groups_lr_decay(
+                model,
+                no_weight_decay_list=[],
+                weight_decay=config.train.weight_decay,
+                layer_decay=config.train.layer_decay,
+            )
+        else:
+            lora_params = []
+            head_and_other_params = []
+            for name, param in model.named_parameters():
+                if not param.requires_grad:
+                    continue
+                if "lora" in name.lower():
+                    lora_params.append(param)
+                else:
+                    head_and_other_params.append(param)
+
+            param_groups = [
+                {"params": head_and_other_params, "weight_decay": self.weight_decay,},
+                {"params": lora_params, "weight_decay": 0.0},
+            ]
         self.optimizer = torch.optim.AdamW(
-            trainable_params,
+            param_groups,
             lr=self.lr,
-            weight_decay=self.weight_decay,
+            betas=config.train.betas, #TODO: corregir esto y pasarlo por parametro
         ) # TODO: verificar con centralized
         self.loss_scaler = GradScaler()
         self.n_samples = len(self.train_loader.dataset) if self.train_loader else 0

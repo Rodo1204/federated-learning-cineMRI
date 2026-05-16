@@ -387,10 +387,12 @@ class CinemaStrategyMixin:
                 metric_for_early_stopping = -current_metric
 
             self.early_stopping.update(metric_for_early_stopping)
+            log(logging.INFO, f"Round {server_round}: Evaluated {self.primary_metric_name}={current_metric:.4f} (EarlyStopping: patience={self.early_stopping.patience_count}, has_improved={self.early_stopping.has_improved})")
 
             # Save checkpoint if improved
             # Also save on first evaluation to always have at least one checkpoint
             if self.early_stopping.has_improved or self._eval_count == 1:
+                log(logging.INFO, f"Primary metric '{self.primary_metric_name}' improved to {current_metric:.4f} at round {server_round}, saving checkpoint.")
                 self._save_checkpoint(server_round, metrics)
 
             if self.early_stopping.should_stop:

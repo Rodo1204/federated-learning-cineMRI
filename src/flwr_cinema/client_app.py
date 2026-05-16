@@ -12,6 +12,8 @@ from flwr_cinema.scripts.federated_dataset_loader import load_client_dataloaders
 from flwr_cinema.tasks.adapters import get_federated_task_adapter
 
 from flwr_cinema.utils.hydra_utils import load_hydra_config, update_config_from_config_record
+from flwr.common.logger import log
+import logging
 
 # Flower ClientApp 
 app = ClientApp()
@@ -39,14 +41,16 @@ def get_model(config: DictConfig, client_id: str | None = None) -> torch.nn.Modu
     
     cid = client_id or "__default__"
     if cid in _MODEL_CACHE:
-        _flush_other_clients_to_cpu(cid)
+        #_flush_other_clients_to_cpu(cid)
+        log(logging.INFO, f"Reusing cached model for client_id: {cid}")
         return _MODEL_CACHE[cid]
 
     adapter = get_federated_task_adapter(config)
     model = adapter.build_model(config)
     _MODEL_CACHE[cid] = model
-    _OPTIM_STATE_CACHE.pop(cid, None)  # new model → stale optimizer state is invalid
-    _flush_other_clients_to_cpu(cid)
+    # _OPTIM_STATE_CACHE.pop(cid, None)  # new model → stale optimizer state is invalid
+    #_flush_other_clients_to_cpu(cid)
+    log(logging.INFO, f"Created new model for client_id: {cid}")
     return model
 
 
@@ -143,7 +147,9 @@ def train(msg: Message, context: Context):
     in_config = msg.content.config_records.get("config", ConfigRecord())
     config = load_hydra_config(context)
     config = update_config_from_config_record(config, in_config)  # Update Hydra config with any overrides from server-sent config record
-    torch.manual_seed(config.seed)
+    
+    round_idx = int(in_config.get("server-round", 0))
+    torch.manual_seed(config.seed + round_idx)
 
     # Construct output directory using same config template structure as server
     # Use coordinated timestamp from server if available
@@ -219,8 +225,6 @@ def train(msg: Message, context: Context):
     # Dynamically load the appropriate client class based on task
     federated_client = get_client_class(config)
 
-    round_idx = int(in_config.get("server-round", 0))
-
     # Create client-specific output directory
     client_run_dir = base_output_dir / f"client_{client_id}"
     client_run_dir.mkdir(parents=True, exist_ok=True)
@@ -256,13 +260,13 @@ def train(msg: Message, context: Context):
 
     # Persist optimizer state across rounds (dirty optimizer).
     #for testing purposes
-    if client_id in _OPTIM_STATE_CACHE:
-        client.optimizer.load_state_dict(_OPTIM_STATE_CACHE[client_id])
+    # if client_id in _OPTIM_STATE_CACHE:
+    #     client.optimizer.load_state_dict(_OPTIM_STATE_CACHE[client_id])
 
     # Call the client's train method and send the reply message
     reply = client.train(msg, context)
 
-    _OPTIM_STATE_CACHE[client_id] = client.optimizer.state_dict()
+    # _OPTIM_STATE_CACHE[client_id] = client.optimizer.state_dict()
 
     return reply
 
@@ -274,7 +278,9 @@ def evaluate(msg: Message, context: Context):
     # Load server and hydra config
     in_config = msg.content.config_records.get("config", ConfigRecord())
     config = load_hydra_config(context)
-    torch.manual_seed(config.seed)
+    
+    round_idx = int(in_config.get("server-round", 0))
+    torch.manual_seed(config.seed + round_idx)
     
     # Construct output directory using same config template structure as server
     # Use coordinated timestamp from server if available
@@ -338,8 +344,6 @@ def evaluate(msg: Message, context: Context):
 
     # Dynamically load the appropriate client class based on task
     federated_client = get_client_class(config)
-
-    round_idx = int(in_config.get("server-round", 0))
 
     # Create client-specific output directory only if we persist eval artifacts
     client_run_dir = base_output_dir / f"client_{client_id}" / "eval_metrics"
