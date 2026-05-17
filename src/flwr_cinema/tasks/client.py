@@ -416,7 +416,7 @@ class FederatedClient:
         """Handle train message from server."""
         in_configs = message.content.config_records.get("config", ConfigRecord())
         round_idx = in_configs.get("server-round", 0)
-        use_fedce = in_configs.get("use_fedce", False)
+        strategy = in_configs.get("strategy", False)
         model_state_dict = None
 
         in_params = message.content.array_records.get(
@@ -425,6 +425,20 @@ class FederatedClient:
         if in_params:
             model_state_dict = in_params.to_torch_state_dict(keep_input=False)
             self.update_model(model_state_dict)
+
+        if strategy == "fedprox":
+            # ─── FedProx: wrap loss_fn with proximal term ──────────────────
+            # Called AFTER update_model (model holds w^t) but BEFORE dual
+            # LoRA loading (local adapters are not part of global consensus).
+            proximal_mu = float(in_configs.get("proximal-mu", 0.0))
+            _original_loss_fn = self.loss_fn
+            if proximal_mu > 0:
+                from flwr_cinema.utils.fedProx_utils import create_fedprox_loss_wrapper
+
+                self.loss_fn = create_fedprox_loss_wrapper(
+                    _original_loss_fn, self.model, proximal_mu
+                )
+            # ────────────────────────────────────────────────────────────────
 
         # Load local LoRA if using dual LoRA
         if self.use_lora and has_dual_lora(self.model):
@@ -436,6 +450,12 @@ class FederatedClient:
                 load_local_lora_state_dict(self.model, local_lora_state_dict)
 
         num_samples = self.train_local(round_idx)
+
+        if strategy == "fedprox":
+            # ─── FedProx: restore original loss_fn ─────────────────────────
+            if proximal_mu > 0:
+                self.loss_fn = _original_loss_fn
+            # ────────────────────────────────────────────────────────────────
 
         updated_state_dict = self.get_model_update()
 
@@ -466,7 +486,7 @@ class FederatedClient:
         out_metrics["num_samples"] = num_samples
 
         agg_metrics = None
-        if use_fedce and round_idx > 1:
+        if strategy == "fedce" and round_idx > 1:
             agg_metrics = self._compute_fedce(
                 message, model_state_dict, updated_state_dict, round_idx
             )

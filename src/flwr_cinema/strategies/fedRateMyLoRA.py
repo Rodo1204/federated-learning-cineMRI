@@ -85,6 +85,13 @@ class RateMyLoRA(FedAvg):
         Metric used for per-client accuracy tracking (paper: Dice score).
     primary_metric_direction : {"max", "min"}
         ``"max"`` if higher is better (Dice), ``"min"`` if lower is better (loss).
+    warmup_rounds : int
+        Number of initial communication rounds to skip adaptive re-weighting.
+        During warmup, the strategy behaves like plain FedAvg (no penalization,
+        no lambda decay) while still collecting per-client accuracy for the
+        first post-warmup round.  Default 0 (no warmup — adaptive from round 1).
+        Auto-computed from ``n_warmup_epochs / local_epochs`` by ``server_app``
+        unless explicitly set in the aggregation config.
     """
 
     def __init__(
@@ -93,6 +100,7 @@ class RateMyLoRA(FedAvg):
         lambda_decay: float = 0.95,
         primary_metric_name: str = "mean_dice_score",
         primary_metric_direction: str = "max",
+        warmup_rounds: int = 0,
         **kwargs,
     ):
         kwargs.setdefault("weighted_by_key", "num_samples")
@@ -103,6 +111,9 @@ class RateMyLoRA(FedAvg):
 
         # --- Diminishing schedule: λ ← λ × 0.95 each round ---
         self.lambda_decay: float = float(lambda_decay)
+
+        # --- Warmup rounds: skip adaptive re-weighting during first N rounds ---
+        self.warmup_rounds: int = warmup_rounds
 
         # --- Metric tracking for P^c_t and P^c_{t-1} ---
         self.primary_metric_name: str = primary_metric_name
@@ -129,9 +140,10 @@ class RateMyLoRA(FedAvg):
         grid: Grid,
     ) -> Iterable[Message]:
         # Algo ln 15: "Distribute B^c_{t+1}, A^c_{t+1}"
-        # From round 2 onwards, replace the default global model with the
+        # Only after warmup: replace the default global model with the
         # adaptively re-aggregated model W_t computed in the previous round.
-        if server_round > 1 and self._reaggregated_arrays is not None:
+        # During warmup rounds, standard FedAvg aggregation is used.
+        if server_round > self.warmup_rounds and self._reaggregated_arrays is not None:
             arrays = self._reaggregated_arrays
         return super().configure_train(server_round, arrays, config, grid)
 
@@ -202,90 +214,102 @@ class RateMyLoRA(FedAvg):
 
         if current_accuracy:
             # ------------------------------------------------------------------
-            # Algo ln 13 (implicit): compare P^c_t vs P^c_{t-1}
-            # Only clients present in BOTH rounds participate in drop detection.
+            # Algo ln 13-14 + Eqn 1-2: adaptive re-weighting
+            # SKIPPED during warmup rounds — the model is still converging
+            # and accuracy changes during warmup are not indicative of overfitting.
+            # During warmup, we only collect P^c_t to seed _previous_accuracy
+            # for the first post-warmup round.
             # ------------------------------------------------------------------
-            common_clients = {
-                cid for cid in current_accuracy
-                if cid in self._previous_accuracy
-            }
-            direction = getattr(self, "metric_direction", "max")
+            if server_round > self.warmup_rounds:
+                # ------------------------------------------------------------------
+                # Algo ln 13 (implicit): compare P^c_t vs P^c_{t-1}
+                # Only clients present in BOTH rounds participate in drop detection.
+                # ------------------------------------------------------------------
+                common_clients = {
+                    cid for cid in current_accuracy
+                    if cid in self._previous_accuracy
+                }
+                direction = getattr(self, "metric_direction", "max")
 
-            # --- Eqn 1: "∃ i ∈ C s.t. P^i_t < P^i_{t-1}" ---
-            # has_drop = True iff ANY client's accuracy decreased this round.
-            # This is the "guard" of the conditional in Eqn 1.
-            # In text: "When such performance drop is reported, the server
-            #           adaptively penalizes the adapter from other clients."
-            if direction == "max":
-                has_drop = any(
-                    current_accuracy[cid] < self._previous_accuracy[cid]
-                    for cid in common_clients
-                )
-            else:  # "min" — lower is better (e.g. loss, MAE)
-                has_drop = any(
-                    current_accuracy[cid] > self._previous_accuracy[cid]
-                    for cid in common_clients
-                )
-
-            # ------------------------------------------------------------------
-            # Eqn 1: compute w_t(c) for each client c
-            #
-            #         ⎧ 1-λ   if ∃i∈C s.t. P^i_t < P^i_{t-1}
-            # w_t(c) = ⎨                AND  P^c_t > P^c_{t-1}
-            #         ⎩ 1     otherwise
-            #
-            # Interpretation (from paper): "adaptively penalize clients whose
-            # adapters are contributing to the degradation of generalizability"
-            # i.e., clients that OVERFIT to local data while others suffer.
-            # ------------------------------------------------------------------
-            weights: dict[str, float] = {}
-            for cid in current_accuracy:
-                if cid not in self._previous_accuracy:
-                    weights[cid] = 1.0  # new client, no P^c_{t-1} history
-                    continue
-
-                # "P^c_t > P^c_{t-1}" — client c improved
+                # --- Eqn 1: "∃ i ∈ C s.t. P^i_t < P^i_{t-1}" ---
+                # has_drop = True iff ANY client's accuracy decreased this round.
+                # This is the "guard" of the conditional in Eqn 1.
+                # In text: "When such performance drop is reported, the server
+                #           adaptively penalizes the adapter from other clients."
                 if direction == "max":
-                    improved = current_accuracy[cid] > self._previous_accuracy[cid]
+                    has_drop = any(
+                        current_accuracy[cid] < self._previous_accuracy[cid]
+                        for cid in common_clients
+                    )
+                else:  # "min" — lower is better (e.g. loss, MAE)
+                    has_drop = any(
+                        current_accuracy[cid] > self._previous_accuracy[cid]
+                        for cid in common_clients
+                    )
+
+                # ------------------------------------------------------------------
+                # Eqn 1: compute w_t(c) for each client c
+                #
+                #         ⎧ 1-λ   if ∃i∈C s.t. P^i_t < P^i_{t-1}
+                # w_t(c) = ⎨                AND  P^c_t > P^c_{t-1}
+                #         ⎩ 1     otherwise
+                #
+                # Interpretation (from paper): "adaptively penalize clients whose
+                # adapters are contributing to the degradation of generalizability"
+                # i.e., clients that OVERFIT to local data while others suffer.
+                # ------------------------------------------------------------------
+                weights: dict[str, float] = {}
+                for cid in current_accuracy:
+                    if cid not in self._previous_accuracy:
+                        weights[cid] = 1.0  # new client, no P^c_{t-1} history
+                        continue
+
+                    # "P^c_t > P^c_{t-1}" — client c improved
+                    if direction == "max":
+                        improved = current_accuracy[cid] > self._previous_accuracy[cid]
+                    else:
+                        improved = current_accuracy[cid] < self._previous_accuracy[cid]
+
+                    # Eqn 1: w_t(c) = 1-λ iff (has_drop AND improved)
+                    weights[cid] = (1.0 - self.lambda_) if (has_drop and improved) else 1.0
+
+                    # In-text: "When such performance drop is reported, the server
+                    #           adaptively penalizes the adapter from other clients,
+                    #           as they fail to generalize."
+                    log(logging.INFO, f"Client {cid}: current weight {weights[cid]:.3f}")
+
+                # ------------------------------------------------------------------
+                # Eqn 2 — Re-aggregation with adaptive weights
+                #
+                #   W_t = W_{t-1} + (1 / Σ|D^c|) * Σ w_t(c) * |D^c| * B^c_t A^c_t
+                #         └───────────┬───────────┘   └────────────┬────────────┘
+                #              raw dataset size sum        per-client contribution
+                #              (denominator, NOT Σ w·|D^c|)
+                #
+                # This replaces the model for the NEXT round's configure_train().
+                # ------------------------------------------------------------------
+                if self._stored_adapters:
+                    self._reaggregated_arrays = self._adaptive_aggregate(weights)
                 else:
-                    improved = current_accuracy[cid] < self._previous_accuracy[cid]
+                    # No adapters stored → clear stale reference so the next round
+                    # doesn't distribute an outdated W_{t-1}.
+                    self._reaggregated_arrays = None
 
-                # Eqn 1: w_t(c) = 1-λ iff (has_drop AND improved)
-                weights[cid] = (1.0 - self.lambda_) if (has_drop and improved) else 1.0
-
-                # In-text: "When such performance drop is reported, the server
-                #           adaptively penalizes the adapter from other clients,
-                #           as they fail to generalize."
-                log(logging.INFO, f"Client {cid}: current weight {weights[cid]:.3f}")
-
-            # ------------------------------------------------------------------
-            # Eqn 2 — Re-aggregation with adaptive weights
-            #
-            #   W_t = W_{t-1} + (1 / Σ|D^c|) * Σ w_t(c) * |D^c| * B^c_t A^c_t
-            #         └───────────┬───────────┘   └────────────┬────────────┘
-            #              raw dataset size sum        per-client contribution
-            #              (denominator, NOT Σ w·|D^c|)
-            #
-            # This replaces the model for the NEXT round's configure_train().
-            # ------------------------------------------------------------------
-            if self._stored_adapters:
-                self._reaggregated_arrays = self._adaptive_aggregate(weights)
-            else:
-                # No adapters stored → clear stale reference so the next round
-                # doesn't distribute an outdated W_{t-1}.
-                self._reaggregated_arrays = None
-
-            # Update P^c_{t-1} ← P^c_t for the next round's drop detection
+            # Update P^c_{t-1} ← P^c_t for the next round's drop detection.
+            # ALWAYS updated — even during warmup — so the first post-warmup
+            # round has a valid previous accuracy to compare against.
             self._previous_accuracy = current_accuracy
 
         # ----------------------------------------------------------------------
         # Algo ln 16: λ = λ × 0.95
         # Paper: "To ensure convergence, we apply a diminishing schedule to λ,
         #         reducing it by 5% each communication round."
-        # UNCONDITIONAL — must decay even when no metrics are reported.
+        # UNCONDITIONAL in the paper, but we skip it during warmup rounds
+        # to keep λ at its initial value until adaptive re-weighting begins.
         # When λ → 0, w_t(c) → 1 ∀c, and the method reverts to FedAVG.
         # ----------------------------------------------------------------------
-        self.lambda_ *= self.lambda_decay
+        if server_round > self.warmup_rounds:
+            self.lambda_ *= self.lambda_decay
 
         # Clear adapters unconditionally to prevent stale reuse across rounds
         self._stored_adapters = []
@@ -295,7 +319,6 @@ class RateMyLoRA(FedAvg):
         # model rather than distributing an outdated re-aggregation.
         if not current_accuracy:
             self._reaggregated_arrays = None
-
         return super().aggregate_evaluate(server_round, replies_list)
 
     def get_final_arrays(self) -> ArrayRecord | None:
@@ -433,7 +456,13 @@ class RateMyLoraStrategy(CinemaStrategyMixin, RateMyLoRA):
         # Pop RateMyLoRA params before passing to MRO super chain
         lambda_init = kwargs.pop("lambda_init", 0.2)
         lambda_decay = kwargs.pop("lambda_decay", 0.95)
-        super().__init__(lambda_init=lambda_init, lambda_decay=lambda_decay, **kwargs)
+        warmup_rounds = kwargs.pop("warmup_rounds", 0)
+        super().__init__(
+            lambda_init=lambda_init,
+            lambda_decay=lambda_decay,
+            warmup_rounds=warmup_rounds,
+            **kwargs,
+        )
 
     def configure_evaluate(
         self,

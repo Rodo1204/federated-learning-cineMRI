@@ -54,9 +54,6 @@ class FedCE(FedAvg):
     ) -> Iterable[Message]:
         """Override configure_train to include FedCE-specific data (global gradients, previous rhos) in the messages sent to clients."""
     
-        # Set flags and shared data in the config to indicate to clients that they should perform FedCE-specific calculations
-        config["use_fedce"] = True # Flag to indicate to clients that they should perform FedCE-specific calculations
-
         self._previous_global_params = arrays
 
         # First call the parent method to get the base messages with global weights

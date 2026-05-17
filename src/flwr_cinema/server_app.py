@@ -99,9 +99,18 @@ def get_strategy(
         })
     elif agg_name == "fedratemylora":
         from flwr_cinema.strategies.fedRateMyLoRA import RateMyLoraStrategy as FedStrategy
+        import math
         kwargs.update({
             "lambda_init": getattr(agg_config, "lambda_init", 0.2),
             "lambda_decay": getattr(agg_config, "lambda_decay", 0.95),
+        })
+        n_warmup_epochs = getattr(config.train, "n_warmup_epochs", 0)
+        local_epochs = getattr(config.federated, "local_epochs", 1)
+        kwargs["warmup_rounds"] = math.ceil(n_warmup_epochs / max(local_epochs, 1))
+    elif agg_name == "fedprox":
+        from flwr_cinema.strategies.fedProx import FedProxStrategy as FedStrategy
+        kwargs.update({
+            "proximal_mu": getattr(agg_config, "proximal_mu", 0.1),
         })
     else:
         raise ValueError(f"Unknown aggregation method: {agg_name}")
@@ -294,6 +303,7 @@ def main(grid: Grid, context: Context) -> None:
             "federated.local_epochs": config.federated.local_epochs,
             "federated.aggregate_head": getattr(config.federated, "aggregate_head", True),
             "federated.aggregate_decoder": getattr(config.federated, "aggregate_decoder", True),
+            "strategy": getattr(config.federated.aggregation_method, "name", "fedavg").lower(),
         }),
         evaluate_config=ConfigRecord({
             "federated_timestamp": timestamp_str,
