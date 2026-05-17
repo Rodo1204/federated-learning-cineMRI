@@ -24,6 +24,7 @@ from flwr.app import (
 )
 from flwr.common.logger import log
 
+from models.cinema.cinema.convvit import param_groups_lr_decay
 from models.cinema.cinema.device import get_amp_dtype_and_device
 from models.cinema.cinema.optim import GradScaler
 from models.cinema.cinema.train import train_one_epoch
