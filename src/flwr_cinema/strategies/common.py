@@ -294,11 +294,11 @@ class CinemaStrategyMixin:
         # 2. Call the base strategy (FedAvg, FedAdam, etc.) — heads & decoder already stripped
         agg_arrays, agg_metrics = super().aggregate_train(server_round, replies_list)
         
-        # 3. Accumulate average optimizer steps
+        # 3. Accumulate total optimizer steps (sum, not average — matches centralized
+        # semantics where one epoch contributes ALL optimizer steps across the dataset)
         if n_clients_with_steps > 0:
-            avg_steps = round_steps / n_clients_with_steps
-            self.total_optimizer_steps += avg_steps
-            log(logging.INFO, f"Round {server_round}: Received optimizer steps from {n_clients_with_steps} clients, total_optimizer_steps updated to {self.total_optimizer_steps}")
+            self.total_optimizer_steps += round_steps
+            log(logging.INFO, f"Round {server_round}: Received optimizer steps from {n_clients_with_steps} clients (sum={round_steps:.0f}), total_optimizer_steps updated to {self.total_optimizer_steps}")
 
         self.round_metadata[round_key] = {
             "participants": sorted(round_client_steps.keys()),

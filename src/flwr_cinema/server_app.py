@@ -229,7 +229,7 @@ def save_final_model(
             "validation_round": round_key in evaluate_metrics or round_key in evaluate_metrics_serverapp,
             "participants": metadata.get("participants", []),
             "client_steps": metadata.get("client_steps", {}),
-            "total_optimizer_steps_avg": metadata.get("total_optimizer_steps"),
+            "total_optimizer_steps": metadata.get("total_optimizer_steps"),
             "train_metrics": train_metrics.get(round_key, {}),
             "evaluate_metrics": evaluate_metrics.get(round_key, {}),
             "evaluate_metrics_serverapp": evaluate_metrics_serverapp.get(round_key, {}),

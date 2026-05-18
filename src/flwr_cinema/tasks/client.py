@@ -472,13 +472,12 @@ class FederatedClient:
             context.state.array_records["local_lora"] = local_lora_record
             out_record["local_lora_params"] = local_lora_record
 
-        # Estimate optimizer steps this round
+        # Estimate optimizer steps this round (floor division, matching centralized:
+        # only complete accumulation groups produce an optimizer step)
         optimizer_steps_this_round = 0
         if self.train_loader is not None:
             batches_per_epoch = len(self.train_loader)
-            steps_per_epoch = (
-                batches_per_epoch + self.n_accum_steps - 1
-            ) // self.n_accum_steps
+            steps_per_epoch = batches_per_epoch // self.n_accum_steps
             optimizer_steps_this_round = steps_per_epoch * self.local_epochs
 
         out_configs["optimizer_steps_this_round"] = int(optimizer_steps_this_round)
