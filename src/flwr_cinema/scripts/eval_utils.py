@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 import logging
 from pathlib import Path
@@ -999,15 +1000,64 @@ def normalize_metric_values(metrics: dict[str, Any]) -> dict[str, float]:
     return normalized
 
 
+def classification_eval_dataloader_with_balanced_accuracy(
+    model,
+    dataloader: DataLoader,
+    patch_size_dict: dict[str, tuple[int, ...]],
+    amp_dtype: torch.dtype,
+    device: torch.device,
+) -> tuple[dict[str, float], np.ndarray, np.ndarray]:
+    """Evaluate classification model and return metrics with balanced accuracy + predictions."""
+    import torch.nn.functional as F
+    from sklearn.metrics import balanced_accuracy_score
+
+    from models.cinema.cinema.classification.train import classification_eval, classification_metrics
+
+    pred_labels_list = []
+    true_labels_list = []
+    pred_logits_list = []
+
+    model.eval()
+    with torch.no_grad():
+        for _, batch in enumerate(dataloader):
+            logits, _ = classification_eval(
+                model=model,
+                batch=batch,
+                patch_size_dict=patch_size_dict,
+                amp_dtype=amp_dtype,
+                device=device,
+            )
+            pred_labels_list.append(torch.argmax(logits, dim=1))
+            true_labels_list.append(batch["label"])
+            pred_logits_list.append(logits)
+
+    pred_labels_np = (
+        torch.cat(pred_labels_list, dim=0).cpu().to(dtype=torch.float32).numpy()
+    )
+    true_labels_np = (
+        torch.cat(true_labels_list, dim=0).cpu().to(dtype=torch.float32).numpy()
+    )
+    pred_logits = torch.cat(pred_logits_list, dim=0).cpu().to(dtype=torch.float32)
+    pred_probs = F.softmax(pred_logits, dim=1).numpy()
+
+    metrics = classification_metrics(
+        true_labels=true_labels_np,
+        pred_labels=pred_labels_np,
+        pred_probs=pred_probs,
+    )
+
+    balanced_acc = balanced_accuracy_score(y_true=true_labels_np, y_pred=pred_labels_np)
+    metrics["balanced_accuracy"] = float(balanced_acc)
+
+    return metrics, true_labels_np, pred_labels_np
+
+
 def _evaluate_classification(
     model: torch.nn.Module,
     dataloader: DataLoader,
     config: dict,
     device: torch.device,
 ) -> dict[str, float]:
-    from flwr_cinema.centralized.combined.evaluate import (
-        classification_eval_dataloader_with_balanced_accuracy,
-    )
     from omegaconf import OmegaConf
 
     if get_amp_dtype_and_device is None:
@@ -1067,11 +1117,48 @@ def _evaluate_regression(
     return normalize_metric_values(metrics)
 
 
+def _evaluate_segmentation(
+    model: torch.nn.Module,
+    dataloader: DataLoader,
+    config: dict,
+    device: torch.device,
+) -> dict[str, float]:
+    """Wrap segmentation_eval_dataloader with the same interface as other _evaluate_* functions."""
+    from omegaconf import OmegaConf
+
+    from models.cinema.cinema.device import get_amp_dtype_and_device as _get_amp_device
+    from models.cinema.cinema.segmentation.train import segmentation_eval_dataloader
+
+    cfg = OmegaConf.create(config)
+    amp_dtype, _ = _get_amp_device()
+    views = cfg.model.views if isinstance(cfg.model.views, list) else [cfg.model.views]
+    patch_size_dict = {
+        v: cfg.data.sax.patch_size if v == "sax" else cfg.data.lax.patch_size
+        for v in views
+    }
+    spacing_dict = {
+        v: cfg.data.sax.spacing if v == "sax" else cfg.data.lax.spacing
+        for v in views
+    }
+
+    metrics = segmentation_eval_dataloader(
+        model=model,
+        dataloader=dataloader,
+        patch_size_dict=patch_size_dict,
+        spacing_dict=spacing_dict,
+        amp_dtype=amp_dtype,
+        device=device,
+    )
+    return normalize_metric_values(metrics)
+
+
 def get_federated_eval_fn(task: str | dict[str, Any] | Any) -> Callable[..., dict[str, float]]:
     """Return federated evaluation function for supported tasks."""
     task_name = resolve_federated_eval_task(task)
     if task_name == "classification":
         return _evaluate_classification
+    if task_name == "segmentation":
+        return _evaluate_segmentation
     return _evaluate_regression
 
 
@@ -1318,3 +1405,730 @@ def format_results_json_csv(
             logger.info(f"Saved cross-center metrics to {cross_center_csv_path}")
     
     return results_dict_serializable, metrics_df, cross_center_df
+
+
+# ============================================================================
+# Task 1.3 — Shared argument parser
+# ============================================================================
+
+def build_shared_argument_parser() -> argparse.ArgumentParser:
+    """Build a shared argparse.ArgumentParser with unified evaluation CLI flags.
+
+    Returns a parser pre-configured with:
+    - --checkpoint-dir (type=Path, default=None)
+    - --checkpoint-path (type=Path, default=None)
+    - --checkpoint-epoch (type=int, default=None)
+    - --output-dir (type=Path, default=None)
+    - --output-file-name (type=str, default="evaluation_results.json")
+    - --mc-dropout (action="store_true", default=False)
+    - --mc-dropout-passes (type=int, default=30)
+
+    Validation: at least one of --checkpoint-dir or --checkpoint-path is required.
+    """
+    parser = argparse.ArgumentParser(
+        description="Unified evaluation for centralized and federated models."
+    )
+    parser.add_argument(
+        "--checkpoint-dir",
+        type=Path,
+        default=None,
+        help="Directory containing checkpoints",
+    )
+    parser.add_argument(
+        "--checkpoint-path",
+        type=Path,
+        default=None,
+        help="Direct checkpoint path. If set, directory-based selection is skipped.",
+    )
+    parser.add_argument(
+        "--checkpoint-epoch",
+        type=int,
+        default=None,
+        help="Specific epoch to evaluate (centralized only; overrides best selection)",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=None,
+        help="Output directory for results (auto-generated if not specified)",
+    )
+    parser.add_argument(
+        "--output-file-name",
+        type=str,
+        default="evaluation_results.json",
+        help="Output filename for results JSON",
+    )
+    parser.add_argument(
+        "--mc-dropout",
+        action="store_true",
+        default=False,
+        help="Enable Monte Carlo Dropout uncertainty estimation",
+    )
+    parser.add_argument(
+        "--mc-dropout-passes",
+        type=int,
+        default=30,
+        help="Number of MC Dropout forward passes",
+    )
+
+    # Override parse_args to enforce checkpoint source validation
+    _original_parse_args = parser.parse_args
+
+    def _validated_parse_args(args=None, namespace=None):
+        parsed = _original_parse_args(args, namespace)
+        if parsed.checkpoint_dir is None and parsed.checkpoint_path is None:
+            parser.error("At least one of --checkpoint-dir or --checkpoint-path is required.")
+        return parsed
+
+    parser.parse_args = _validated_parse_args  # type: ignore[assignment]
+    return parser
+
+
+# ============================================================================
+# Task 1.7 — Unified result payload builder (schema)
+# ============================================================================
+
+def _compute_fairness_from_per_client(
+    per_client_metrics: dict[str, tuple[int, dict[str, float]]],
+    primary_metric: str,
+) -> dict[str, Any]:
+    """Compute fairness analysis metrics across clients.
+
+    Args:
+        per_client_metrics: Dict mapping client_id to (n_samples, metrics_dict).
+        primary_metric: The metric key to use for fairness analysis.
+
+    Returns:
+        Dictionary with fairness statistics: std, gap, min/max client, per-client values.
+    """
+    per_client_primary: dict[str, float] = {}
+    for client_id, (_, metrics) in per_client_metrics.items():
+        if primary_metric in metrics:
+            per_client_primary[client_id] = float(metrics[primary_metric])
+        else:
+            logger.warning(
+                f"Primary metric '{primary_metric}' not found for client '{client_id}', "
+                f"available: {list(metrics.keys())}. Using 0.0."
+            )
+            per_client_primary[client_id] = 0.0
+
+    values = list(per_client_primary.values())
+    clients = list(per_client_primary.keys())
+
+    if len(values) < 2:
+        logger.warning("Less than 2 clients - fairness metrics are degenerate.")
+        return {
+            "primary_metric": primary_metric,
+            "std": 0.0,
+            "gap": 0.0,
+            "min_client": clients[0] if clients else None,
+            "min_value": values[0] if values else 0.0,
+            "max_client": clients[0] if clients else None,
+            "max_value": values[0] if values else 0.0,
+            "per_client_primary": per_client_primary,
+        }
+
+    std = float(np.std(values))
+    gap = float(max(values) - min(values))
+    min_idx = int(np.argmin(values))
+    max_idx = int(np.argmax(values))
+
+    return {
+        "primary_metric": primary_metric,
+        "std": std,
+        "gap": gap,
+        "min_client": clients[min_idx],
+        "min_value": values[min_idx],
+        "max_client": clients[max_idx],
+        "max_value": values[max_idx],
+        "per_client_primary": per_client_primary,
+    }
+
+
+def build_unified_result_payload(
+    config: dict[str, Any],
+    global_pool_metrics: dict[str, float],
+    per_client_metrics: dict[str, tuple[int, dict[str, float]]],
+    primary_metric: str,
+    is_federated: bool = False,
+    checkpoint_selection_mode: str | None = None,
+    checkpoint_round: int | None = None,
+    global_pool_model_variant: str | None = None,
+) -> dict[str, Any]:
+    """Build unified result payload with new schema.
+
+    New schema:
+    {
+        "config": {...},
+        "overall": {
+            "global_pool": {...},
+            "weighted_avg": {...},
+            "macro_avg": {...},
+        },
+        "per_client": {...},
+        "fairness": {...},
+    }
+
+    Federated mode adds: checkpoint_selection_mode, checkpoint_round, global_pool_model_variant to config.
+    """
+    # Compute weighted and macro averages
+    weighted_metrics: dict[str, float] = {}
+    macro_metrics: dict[str, float] = {}
+    total_samples = sum(n for n, _ in per_client_metrics.values())
+
+    if per_client_metrics:
+        first_client_metrics = list(per_client_metrics.values())[0][1]
+        n_clients = len(per_client_metrics)
+
+        for metric_key in first_client_metrics.keys():
+            # Weighted average (sample-weighted)
+            weighted_sum = sum(
+                n_samples * per_client_metrics[client_id][1][metric_key]
+                for client_id, (n_samples, _) in per_client_metrics.items()
+            )
+            weighted_metrics[metric_key] = weighted_sum / total_samples if total_samples > 0 else 0.0
+
+            # Macro average (unweighted)
+            macro_sum = sum(
+                per_client_metrics[client_id][1][metric_key]
+                for client_id in per_client_metrics
+            )
+            macro_metrics[metric_key] = macro_sum / n_clients
+
+    # Build per_client output
+    per_client_output: dict[str, dict[str, Any]] = {}
+    for client_id, (n_samples, metrics) in per_client_metrics.items():
+        entry: dict[str, Any] = {
+            "n_samples": n_samples,
+            "metrics": to_builtin(metrics),
+        }
+        per_client_output[client_id] = entry
+
+    # Build config
+    output_config: dict[str, Any] = to_builtin(config)
+    if is_federated:
+        if checkpoint_selection_mode is not None:
+            output_config["checkpoint_selection_mode"] = checkpoint_selection_mode
+        if checkpoint_round is not None:
+            output_config["checkpoint_round"] = checkpoint_round
+        if global_pool_model_variant is not None:
+            output_config["global_pool_model_variant"] = global_pool_model_variant
+
+    # Build fairness
+    fairness = _compute_fairness_from_per_client(per_client_metrics, primary_metric)
+
+    payload = {
+        "config": output_config,
+        "overall": {
+            "global_pool": to_builtin(global_pool_metrics),
+            "weighted_avg": to_builtin(weighted_metrics),
+            "macro_avg": to_builtin(macro_metrics),
+        },
+        "per_client": per_client_output,
+        "fairness": to_builtin(fairness),
+    }
+    return payload
+
+
+# ============================================================================
+# Task 1.4 — Unified evaluation orchestrator
+# ============================================================================
+
+def run_unified_evaluation(
+    checkpoint_dir: Path | None,
+    checkpoint_path: Path | None,
+    checkpoint_epoch: int | None,
+    output_dir: Path | None,
+    output_file_name: str,
+    mc_dropout: bool,
+    mc_dropout_passes: int,
+    is_federated: bool,
+) -> Path:
+    """Unified evaluation orchestrator for centralized and federated modes.
+
+    Handles:
+    a. Checkpoint resolution
+    b. Model building via task adapters
+    c. Weight loading
+    d. Global pool evaluation
+    e. Per-client evaluation
+    f. Weighted average + macro average (overall)
+    g. Fairness metrics
+    h. JSON output with new schema
+
+    MC Dropout integration is deferred to PR #2 — params accepted but no-op.
+    """
+    from flwr_cinema.scripts.lora import load_lora_state_dict
+    from models.cinema.cinema.device import get_amp_dtype_and_device
+    from models.cinema.cinema.log import get_logger
+    from omegaconf import OmegaConf
+
+    orc_logger = get_logger(__name__)
+
+    # MC Dropout warning (deferred to PR #2)
+    if mc_dropout:
+        orc_logger.warning(
+            "MC Dropout is requested but not yet implemented. "
+            "Running deterministic evaluation only. MC Dropout will be available in a future release."
+        )
+
+    # ── a. Checkpoint resolution ──────────────────────────────────────────
+    if is_federated:
+        ckpt_path, selection_meta = _resolve_federated_checkpoint(
+            checkpoint_dir=checkpoint_dir,
+            checkpoint_path=checkpoint_path,
+        )
+    else:
+        ckpt_path, selection_meta = _resolve_centralized_checkpoint(
+            checkpoint_dir=checkpoint_dir,
+            checkpoint_epoch=checkpoint_epoch,
+        )
+
+    # Load checkpoint and config
+    checkpoint, config = load_checkpoint_and_config(ckpt_path, output_dir=ckpt_path.parent)
+    cfg = OmegaConf.create(config)
+    task = str(getattr(cfg, "task", "classification"))
+    task = resolve_federated_eval_task(task)
+
+    # ── b. Model building ─────────────────────────────────────────────────
+    if is_federated:
+        from flwr_cinema.tasks.adapters import get_federated_task_adapter
+        adapter = get_federated_task_adapter(cfg)
+    else:
+        from flwr_cinema.tasks.adapters import get_centralized_task_adapter
+        adapter = get_centralized_task_adapter(cfg)
+
+    model = adapter.build_model(cfg)
+
+    # ── c. Weight loading ─────────────────────────────────────────────────
+    use_lora = bool(getattr(cfg.train, "use_lora", False)) if hasattr(cfg, "train") else False
+    checkpoint_model_state = checkpoint.get("model", checkpoint.get("model_state_dict", checkpoint))
+
+    if "model" in checkpoint:
+        model.load_state_dict(checkpoint["model"], strict=not use_lora)
+        if use_lora and "lora_state_dict" in checkpoint:
+            load_lora_state_dict(model, checkpoint["lora_state_dict"])
+            orc_logger.info("Loaded LoRA weights from checkpoint")
+    elif "model_state_dict" in checkpoint:
+        model.load_state_dict(checkpoint["model_state_dict"], strict=not use_lora)
+    else:
+        model.load_state_dict(checkpoint_model_state, strict=not use_lora)
+
+    amp_dtype, device = get_amp_dtype_and_device()
+    model.to(device)
+    model.eval()
+    orc_logger.info(f"Loaded model on device {device} (use_lora={use_lora})")
+
+    # ── d. Global pool evaluation ─────────────────────────────────────────
+    if is_federated:
+        global_pool_metrics, global_pool_variant = _run_federated_global_pool(
+            model=model,
+            checkpoint=checkpoint,
+            config=config,
+            task_type=task,
+            device=device,
+            base_state={k: v.detach().cpu().clone() for k, v in model.state_dict().items()},
+        )
+    else:
+        global_pool_metrics = _run_centralized_global_pool(
+            model=model,
+            config=config,
+            task_type=task,
+            device=device,
+            amp_dtype=amp_dtype,
+        )
+        global_pool_variant = None
+
+    orc_logger.info(f"Global pool metrics: {global_pool_metrics}")
+
+    # ── e. Per-client evaluation ──────────────────────────────────────────
+    if is_federated:
+        per_client_metrics = _run_federated_per_client(
+            model=model,
+            checkpoint=checkpoint,
+            config=config,
+            task_type=task,
+            device=device,
+            base_state={k: v.detach().cpu().clone() for k, v in model.state_dict().items()},
+        )
+    else:
+        per_client_metrics = _run_centralized_per_client(
+            model=model,
+            config=config,
+            task_type=task,
+            device=device,
+            amp_dtype=amp_dtype,
+        )
+
+    # ── f-h. Build payload and save ───────────────────────────────────────
+    primary_metric = _extract_primary_metric(config)
+
+    payload = build_unified_result_payload(
+        config={
+            "checkpoint": ckpt_path.name,
+            "checkpoint_epoch": checkpoint.get("epoch") if not is_federated else None,
+            "use_lora": use_lora,
+            "primary_metric": primary_metric,
+            "task": task,
+        },
+        global_pool_metrics=global_pool_metrics,
+        per_client_metrics=per_client_metrics,
+        primary_metric=primary_metric,
+        is_federated=is_federated,
+        checkpoint_selection_mode=selection_meta.get("mode"),
+        checkpoint_round=selection_meta.get("selected_round"),
+        global_pool_model_variant=global_pool_variant,
+    )
+
+    # Determine output directory
+    if output_dir is None:
+        if is_federated:
+            effective_dir = selection_meta.get("checkpoint_dir", ckpt_path.parent)
+        else:
+            effective_dir = checkpoint_dir if checkpoint_dir else ckpt_path.parent
+        output_dir = effective_dir / "test_evaluation"
+
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    result_path = output_dir / output_file_name
+    with open(result_path, "w", encoding="utf-8") as f:
+        json.dump(to_builtin(payload), f, indent=2)
+    orc_logger.info(f"Saved results to {result_path}")
+
+    return result_path
+
+
+# ── Internal helpers for run_unified_evaluation ────────────────────────────
+
+def _extract_primary_metric(config: dict[str, Any]) -> str:
+    """Extract primary metric name from config."""
+    train_cfg = config.get("train", {}) if isinstance(config, dict) else {}
+    es_cfg = train_cfg.get("early_stopping", {}) if isinstance(train_cfg, dict) else {}
+    metric = es_cfg.get("metric", "mcc")
+    return str(metric)
+
+
+def _resolve_centralized_checkpoint(
+    checkpoint_dir: Path | None,
+    checkpoint_epoch: int | None,
+) -> tuple[Path, dict[str, Any]]:
+    """Resolve checkpoint for centralized evaluation."""
+    if checkpoint_dir is None:
+        raise ValueError("--checkpoint-dir is required for centralized evaluation.")
+
+    checkpoint_dir = Path(checkpoint_dir)
+
+    if checkpoint_epoch is not None:
+        ckpt_files = sorted(checkpoint_dir.glob("**/*.pt"))
+        matching = [
+            p for p in ckpt_files
+            if f"epoch_{checkpoint_epoch}" in p.name or f"_{checkpoint_epoch}" in p.name
+        ]
+        if matching:
+            ckpt_path = matching[0]
+            logger.info(f"Selected checkpoint for epoch {checkpoint_epoch}")
+        else:
+            logger.warning(
+                f"No checkpoint found for epoch {checkpoint_epoch}, using best instead"
+            )
+            ckpt_path, _ = find_best_checkpoint(checkpoint_dir)
+    else:
+        ckpt_path, _ = find_best_checkpoint(checkpoint_dir)
+
+    return ckpt_path, {"mode": "centralized", "selected_round": None, "checkpoint_dir": checkpoint_dir}
+
+
+def _resolve_federated_checkpoint(
+    checkpoint_dir: Path | None,
+    checkpoint_path: Path | None,
+) -> tuple[Path, dict[str, Any]]:
+    """Resolve checkpoint for federated evaluation."""
+    from flwr_cinema.federated.evaluate import (
+        resolve_checkpoint_for_evaluation,
+    )
+
+    if checkpoint_dir is None:
+        raise ValueError("--checkpoint-dir is required for federated evaluation.")
+
+    if checkpoint_path is not None:
+        ckpt_path = Path(checkpoint_path)
+        if not ckpt_path.exists() or not ckpt_path.is_file():
+            raise FileNotFoundError(f"Checkpoint file not found: {ckpt_path}")
+        return ckpt_path, {
+            "mode": "direct",
+            "selected_round": _extract_round_from_path(ckpt_path),
+            "checkpoint_dir": ckpt_path.parent,
+        }
+
+    resolved_checkpoint_dir = resolve_federated_checkpoint_dir(checkpoint_dir)
+    # Load provisional config from last round to get primary metric
+    last_ckpt, _ = find_last_federated_round(resolved_checkpoint_dir)
+    _, provisional_config = load_checkpoint_and_config(last_ckpt, output_dir=resolved_checkpoint_dir)
+    primary_metric, direction = _extract_primary_metric_meta(provisional_config)
+
+    ckpt_path, round_num = find_best_federated_round(
+        checkpoint_dir=resolved_checkpoint_dir,
+        primary_metric=primary_metric,
+        direction=direction,
+    )
+    return ckpt_path, {
+        "mode": "best",
+        "selected_round": round_num,
+        "checkpoint_dir": resolved_checkpoint_dir,
+    }
+
+
+def _extract_round_from_path(path: Path) -> int | None:
+    parts = path.stem.split("_")
+    for idx, token in enumerate(parts):
+        if token == "round" and idx + 1 < len(parts):
+            try:
+                return int(parts[idx + 1])
+            except ValueError:
+                return None
+    return None
+
+
+def _extract_primary_metric_meta(config: dict[str, Any]) -> tuple[str, str]:
+    train_cfg = config.get("train", {}) if isinstance(config, dict) else {}
+    es_cfg = train_cfg.get("early_stopping", {}) if isinstance(train_cfg, dict) else {}
+    metric = es_cfg.get("metric")
+    mode = es_cfg.get("mode")
+    if not isinstance(metric, str) or not metric.strip():
+        raise ValueError("Missing train.early_stopping.metric required for federated evaluation.")
+    if not isinstance(mode, str) or mode.strip().lower() not in {"min", "max"}:
+        raise ValueError("Missing or invalid train.early_stopping.mode (expected 'min' or 'max').")
+    return metric.strip(), mode.strip().lower()
+
+
+def _run_centralized_global_pool(
+    model: torch.nn.Module,
+    config: dict[str, Any],
+    task_type: str,
+    device: torch.device,
+    amp_dtype: torch.dtype,
+) -> dict[str, float]:
+    """Run global pool evaluation for centralized mode."""
+    from flwr_cinema.tasks.adapters import get_centralized_task_adapter
+    from omegaconf import OmegaConf
+
+    cfg = OmegaConf.create(config)
+    adapter = get_centralized_task_adapter(cfg)
+    task_spec = adapter.task_spec
+    eval_dataloader_fn = task_spec.eval_fn_factory()
+
+    data_dir = Path(cfg.data.combined.dir).expanduser()
+    data_dir = resolve_data_dir_with_fallback(data_dir)
+
+    if task_type == "classification":
+        target_col = cfg.data.class_column
+    elif task_type == "regression":
+        target_col = cfg.data.regression_column
+    else:
+        target_col = None
+
+    train_meta_df = load_metadata(data_dir / "train_metadata.csv", metadata_type="train")
+    test_meta_df = load_metadata(data_dir / "test_metadata.csv", metadata_type="test")
+
+    # Apply client filtering
+    test_meta_df = filter_metadata_by_client_config(config=config, meta_df=test_meta_df, metadata_type="test")
+
+    _, val_transform = task_spec.transform_factory(cfg)
+
+    views = [cfg.model.views] if isinstance(cfg.model.views, str) else cfg.model.views
+    patch_size_dict = {
+        v: cfg.data.sax.patch_size if v == "sax" else cfg.data.lax.patch_size for v in views
+    }
+    spacing_dict = {
+        v: cfg.data.sax.spacing if v == "sax" else cfg.data.lax.spacing for v in views
+    }
+
+    overall_dataset = task_spec.dataset_factory(
+        config=cfg,
+        data_dir=data_dir / "test",
+        meta_df=test_meta_df,
+        transform=val_transform,
+        train_meta_df=train_meta_df,
+    )
+
+    overall_dataloader = DataLoader(
+        dataset=overall_dataset,
+        sampler=SequentialSampler(overall_dataset),
+        batch_size=1,
+        drop_last=False,
+        pin_memory=True,
+        num_workers=cfg.train.n_workers,
+    )
+
+    if task_type == "classification":
+        metrics, _, _ = classification_eval_dataloader_with_balanced_accuracy(
+            model=model,
+            dataloader=overall_dataloader,
+            patch_size_dict=patch_size_dict,
+            amp_dtype=amp_dtype,
+            device=device,
+        )
+    else:
+        metrics = eval_dataloader_fn(
+            model=model,
+            dataloader=overall_dataloader,
+            patch_size_dict=patch_size_dict,
+            spacing_dict=spacing_dict,
+            amp_dtype=amp_dtype,
+            device=device,
+        )
+
+    return normalize_metric_values(metrics)
+
+
+def _run_centralized_per_client(
+    model: torch.nn.Module,
+    config: dict[str, Any],
+    task_type: str,
+    device: torch.device,
+    amp_dtype: torch.dtype,
+) -> dict[str, tuple[int, dict[str, float]]]:
+    """Run per-client evaluation for centralized mode."""
+    from flwr_cinema.tasks.adapters import get_centralized_task_adapter
+    from omegaconf import OmegaConf
+
+    cfg = OmegaConf.create(config)
+    adapter = get_centralized_task_adapter(cfg)
+    task_spec = adapter.task_spec
+    eval_dataloader_fn = task_spec.eval_fn_factory()
+
+    data_dir = Path(cfg.data.combined.dir).expanduser()
+    data_dir = resolve_data_dir_with_fallback(data_dir)
+
+    train_meta_df = load_metadata(data_dir / "train_metadata.csv", metadata_type="train")
+    test_meta_df = load_metadata(data_dir / "test_metadata.csv", metadata_type="test")
+    test_meta_df = filter_metadata_by_client_config(config=config, meta_df=test_meta_df, metadata_type="test")
+
+    _, val_transform = task_spec.transform_factory(cfg)
+
+    views = [cfg.model.views] if isinstance(cfg.model.views, str) else cfg.model.views
+    patch_size_dict = {
+        v: cfg.data.sax.patch_size if v == "sax" else cfg.data.lax.patch_size for v in views
+    }
+    spacing_dict = {
+        v: cfg.data.sax.spacing if v == "sax" else cfg.data.lax.spacing for v in views
+    }
+
+    per_client_metrics: dict[str, tuple[int, dict[str, float]]] = {}
+
+    for client_id in sorted(test_meta_df["client"].unique()):
+        client_meta = test_meta_df[test_meta_df["client"] == client_id]
+        n_samples = len(client_meta)
+
+        client_dataset = task_spec.dataset_factory(
+            config=cfg,
+            data_dir=data_dir / "test",
+            meta_df=client_meta.reset_index(drop=True),
+            transform=val_transform,
+            train_meta_df=train_meta_df,
+        )
+
+        client_dataloader = DataLoader(
+            dataset=client_dataset,
+            sampler=SequentialSampler(client_dataset),
+            batch_size=1,
+            drop_last=False,
+            pin_memory=True,
+            num_workers=cfg.train.n_workers,
+        )
+
+        if task_type == "classification":
+            metrics, _, _ = classification_eval_dataloader_with_balanced_accuracy(
+                model=model,
+                dataloader=client_dataloader,
+                patch_size_dict=patch_size_dict,
+                amp_dtype=amp_dtype,
+                device=device,
+            )
+        else:
+            metrics = eval_dataloader_fn(
+                model=model,
+                dataloader=client_dataloader,
+                patch_size_dict=patch_size_dict,
+                spacing_dict=spacing_dict,
+                amp_dtype=amp_dtype,
+                device=device,
+            )
+
+        per_client_metrics[client_id] = (n_samples, normalize_metric_values(metrics))
+
+    return per_client_metrics
+
+
+def _run_federated_global_pool(
+    model: torch.nn.Module,
+    checkpoint: dict[str, Any],
+    config: dict[str, Any],
+    task_type: str,
+    device: torch.device,
+    base_state: dict[str, torch.Tensor],
+) -> tuple[dict[str, float], str]:
+    """Run global pool evaluation for federated mode (reuses existing federated helpers)."""
+    from flwr_cinema.federated.evaluate import (
+        evaluate_global_pool,
+        has_private_artifacts,
+    )
+
+    datasets_by_client, evaluate_fn = _load_federated_client_datasets(config, task_type)
+
+    variant, metrics = evaluate_global_pool(
+        model=model,
+        checkpoint=checkpoint,
+        evaluate_fn=evaluate_fn,
+        config=config,
+        task_type=task_type,
+        datasets_by_client=datasets_by_client,
+        base_state=base_state,
+        device=device,
+    )
+    return metrics, variant
+
+
+def _run_federated_per_client(
+    model: torch.nn.Module,
+    checkpoint: dict[str, Any],
+    config: dict[str, Any],
+    task_type: str,
+    device: torch.device,
+    base_state: dict[str, torch.Tensor],
+) -> dict[str, tuple[int, dict[str, float]]]:
+    """Run per-client evaluation for federated mode (reuses existing federated helpers)."""
+    from flwr_cinema.federated.evaluate import evaluate_single_client
+
+    datasets_by_client, evaluate_fn = _load_federated_client_datasets(config, task_type)
+
+    per_client_metrics: dict[str, tuple[int, dict[str, float]]] = {}
+
+    for client_id, (n_samples, dataset) in sorted(datasets_by_client.items(), key=lambda kv: str(kv[0])):
+        result = evaluate_single_client(
+            client_id=str(client_id),
+            n_samples=int(n_samples),
+            dataset=dataset,
+            model=model,
+            base_state=base_state,
+            checkpoint=checkpoint,
+            evaluate_fn=evaluate_fn,
+            config=config,
+            device=device,
+        )
+        per_client_metrics[client_id] = (
+            int(result["num_samples"]),
+            result["metrics"],
+        )
+
+    return per_client_metrics
+
+
+def _load_federated_client_datasets(
+    config: dict[str, Any],
+    task_type: str,
+) -> tuple[dict[str, tuple[int, Any]], Callable]:
+    """Load federated client datasets and evaluation function."""
+    from flwr_cinema.federated.evaluate import load_client_datasets
+    return load_client_datasets(config=config, task_type=task_type)

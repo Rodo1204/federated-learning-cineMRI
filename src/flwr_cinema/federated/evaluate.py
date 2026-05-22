@@ -1,5 +1,8 @@
 """Federated checkpoint evaluator with unified result schema.
 
+Thin wrapper around the unified evaluation orchestrator.
+Keeps federated-specific helpers for use by the orchestrator.
+
 Supports classification, regression, and segmentation evaluation.
 """
 
@@ -15,6 +18,7 @@ import torch
 from torch.utils.data import ConcatDataset, DataLoader, SequentialSampler
 
 from flwr_cinema.scripts.eval_utils import (
+    build_shared_argument_parser,
     compute_primary_metric_fairness,
     filter_metadata_by_client_config,
     find_best_federated_round,
@@ -28,6 +32,7 @@ from flwr_cinema.scripts.eval_utils import (
     resolve_federated_eval_task,
     resolve_federated_checkpoint_dir,
     resolve_data_dir_with_fallback,
+    run_unified_evaluation,
     to_builtin,
 )
 
@@ -517,91 +522,32 @@ def run_evaluation(
     output_name: str,
     output_dir: Path | None = None,
 ) -> Path:
-    checkpoint_dir = Path(checkpoint_dir)
-    resolved_checkpoint_dir: Path | None = None
-
-    if checkpoint_path is None:
-        # Metrics-based checkpoint selection depends on federated output structure.
-        resolved_checkpoint_dir = resolve_federated_checkpoint_dir(checkpoint_dir)
-        last_ckpt, _ = find_last_federated_round(resolved_checkpoint_dir)
-        _, provisional_config = load_checkpoint_and_config(last_ckpt, output_dir=resolved_checkpoint_dir)
-        selected_checkpoint_path, selection = resolve_checkpoint_for_evaluation(
-            checkpoint_dir=resolved_checkpoint_dir,
-            checkpoint_path=None,
-            config=provisional_config,
-        )
-    else:
-        # Direct checkpoint selection must work without fragile directory assumptions.
-        selected_checkpoint_path, selection = resolve_checkpoint_for_evaluation(
-            checkpoint_dir=checkpoint_dir,
-            checkpoint_path=checkpoint_path,
-            config={},
-        )
-
-    effective_checkpoint_dir = (
-        resolved_checkpoint_dir if resolved_checkpoint_dir is not None else selected_checkpoint_path.parent
+    """Thin wrapper around run_unified_evaluation for backward compatibility."""
+    return run_unified_evaluation(
+        checkpoint_dir=checkpoint_dir,
+        checkpoint_path=checkpoint_path,
+        checkpoint_epoch=None,
+        output_dir=output_dir,
+        output_file_name=output_name,
+        mc_dropout=False,
+        mc_dropout_passes=30,
+        is_federated=True,
     )
-
-    # Reload exact checkpoint selected
-    checkpoint, config = load_checkpoint_and_config(selected_checkpoint_path, output_dir=selected_checkpoint_path.parent)
-    task_type = str(config.get("task", "regression"))
-    task_type = resolve_federated_eval_task(task_type)
-
-    model = build_base_model(config=config, checkpoint=checkpoint)
-    datasets_by_client, evaluate_fn = load_client_datasets(config=config, task_type=task_type)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    base_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
-
-    client_results = evaluate_clients(
-        model=model,
-        checkpoint=checkpoint,
-        evaluate_fn=evaluate_fn,
-        config=config,
-        datasets_by_client=datasets_by_client,
-        base_state=base_state,
-        device=device,
-    )
-    global_pool_model_variant, global_pool_metrics = evaluate_global_pool(
-        model=model,
-        checkpoint=checkpoint,
-        evaluate_fn=evaluate_fn,
-        config=config,
-        task_type=task_type,
-        datasets_by_client=datasets_by_client,
-        base_state=base_state,
-        device=device,
-    )
-    payload = build_result_payload(
-        checkpoint_name=selected_checkpoint_path.name,
-        selection=selection,
-        config=config,
-        global_pool_metrics=global_pool_metrics,
-        global_pool_model_variant=global_pool_model_variant,
-        client_results=client_results,
-    )
-    validate_result_payload(payload)
-
-    results_dir = Path(output_dir) if output_dir is not None else effective_checkpoint_dir / "test_evaluation"
-    results_dir.mkdir(parents=True, exist_ok=True)
-    result_path = results_dir / output_name
-    with open(result_path, "w", encoding="utf-8") as f:
-        json.dump(to_builtin(payload), f, indent=2)
-    return result_path
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Evaluate federated checkpoints with unified schema.")
-    parser.add_argument("--checkpoint-dir", required=True, type=Path, help="Directory containing federated checkpoints")
-    parser.add_argument("--checkpoint-path", type=Path, default=None, help="Direct checkpoint path. If set, metrics-based selection is skipped.")
-    parser.add_argument("--output-name", default="federated_eval.json")
-    parser.add_argument("--output-dir", type=Path, default=None, help="Output directory for results (defaults to checkpoint_dir/test_evaluation)")
+    parser = build_shared_argument_parser()
     args = parser.parse_args()
 
-    run_evaluation(
+    run_unified_evaluation(
         checkpoint_dir=args.checkpoint_dir,
         checkpoint_path=args.checkpoint_path,
-        output_name=args.output_name,
+        checkpoint_epoch=None,
         output_dir=args.output_dir,
+        output_file_name=args.output_file_name,
+        mc_dropout=args.mc_dropout,
+        mc_dropout_passes=args.mc_dropout_passes,
+        is_federated=True,
     )
 
 
