@@ -1,25 +1,22 @@
-task: classification
+task: regression
 model_name: cinema
 mode: federated  # federated or centralized
 seed: 0
 grad_ckpt: True
 
 logging:
-  dir: ./outputs/${model_name}_${task}/${mode}/${data.name}/${data.class_column}/${federated.aggregation_method.name}/lora_${train.use_lora}/seed${seed}/${now:%Y-%m-%d}/${now:%H-%M-%S}
+  dir: ./outputs/${model_name}_${task}/${mode}/${data.name}/${data.regression_column}/client_${federated.client_tag}/lora_${train.use_lora}/seed${seed}/${now:%Y-%m-%d}/${now:%H-%M-%S}
   wandb:
     project: null
     entity: null
 
 # Federated learning configuration
 federated:
-  server_host: "localhost"
-  server_port: 8888
   n_rounds: 800  # Number of communication rounds
-  local_epochs: 1  # Local epochs per round per client 2
+  local_epochs: 1  # Local epochs per round per client
   n_clients: 5  # Number of expected clients (ie. acdc + Siemens + GE + Canon + Philips)
   # client_ids: ["acdc", "Siemens"]  # Identifiers for each client
   client_ids: ["acdc", "Siemens", "GE", "Canon", "Philips"]  # Identifiers for each client
-  # client_ids: ["acdc", "Siemens", "GE"]  # For debugging with fewer clients
   aggregate_head: True  # Whether to aggregate classification/regression head across clients (True) or keep locally trained (False)
   aggregate_decoder: True  # Only relevant for ConvUNetR segmentation. Set False to keep decoder local (saves ~30% bandwidth).
   # gpu_mapping:
@@ -39,15 +36,16 @@ federated:
   #    lambda_decay: 0.95
   aggregation_method:
     name: fedavg  # fedavg, fedce, or custom
-    
 
 
 # Data configuration
 data:
   name: acdc_mnms_combined
-  class_column: "binary_label"  # Column name in metadata CSV that contains class labels (e.g., "pathology" for multi-class, "binary_label" for binary classification)
-  pathology: ["DCM", "HCM", "MINF", "NOR", "RV", "LV", "HHD", "Other", "ARV", "LVNC", "IHD", "ARR", "FALL", "CIA", "TRI"]
-  binary_label: ["NOR", "DISEASED"] # For binary classification, specify the two classes (e.g., "abnormal" vs "normal")
+  # client_name: acdc  # Client name for centralized training. Options: "all", "acdc", "Siemens", "GE", "Canon", "Philips". Use "all" to train on combined data.
+  regression_column: "lv_ef"
+  bmi:
+      mean: 25.561040294207242
+      std: 4.732639548868183
 
   # Datasets to include
   use_acdc: True
@@ -64,7 +62,7 @@ data:
   
   # ACDC dataset
   acdc:
-    dir: /media/data10/users/rodolfo/data/acdc_mnms_combined_stratified
+    dir: ~/.cache/cinema_datasets/acdc/processed
     lv_ef:
       mean: 46.466146
       std: 19.972946
@@ -93,8 +91,10 @@ data:
       std: None
 
   combined:
-    #dir: C:\Users\Rodo\.cache\cinema_datasets\acdc_mnms_combined
-    dir: /media/data10/users/rodolfo/data/acdc_mnms_combined_stratified # for UB GPU server use
+    dir: /media/data10/users/rodolfo/data/acdc_mnms_combined_stratified
+    lv_ef: 
+      mean: 48.9331235965377 # Mean and std will be computed from combined data
+      std: 15.2362102199619
 
 # LoRA configuration
 lora:
@@ -102,16 +102,7 @@ lora:
   alpha: 8  # LoRA alpha scaling (typically 1x-4x of rank)
   dropout: 0.0  # LoRA dropout
   target_modules: ["q", "kv"]  # Attention modules to adapt: q, kv, proj
-  # Ablation Study: Specify which transformer blocks to apply LoRA to
-  # Default: null or omitted (applies to all blocks 0-11 for ViT-B)
-  # Examples for ablations:
-  #   - Full model (all 12 blocks): null or []
-  #   - Last 4 blocks: [8, 9, 10, 11]
-  #   - Last 2 blocks: [10, 11]
-  #   - Early blocks: [0, 1, 2, 3]
-  #   - Middle blocks: [4, 5, 6, 7]
-  blocks_to_lora: null  # Set to specific indices for ablation, null/omitted for all blocks
-  # blocks_to_lora: [10, 11]
+  blocks_to_lora: null
 
 # Dual LoRA configuration (personalized federated learning)
 # Set dual_lora.enabled=True to use Dual LoRA with global + local adapters
@@ -122,8 +113,9 @@ dual_lora:
   global_rank: 4  # Rank of global adapters (aggregated via FedAvg across clients)
   local_rank: 4   # Rank of local adapters (client-specific, never aggregated)
   alpha: 8        # Scaling factor for both global and local adapters
-  dropout: 0.0    # Dropout rate for LoRA path
+  dropout: 0.1    # Dropout rate for LoRA path
   target_modules: ["q", "kv"]  # Which attention projections to adapt
+
 
 transform:
   prob: 0.5
@@ -135,7 +127,7 @@ transform:
 
 train:
   use_lora: True # Set to True to use LoRA
-  use_class_weighted_loss: True # Set to True to use class-weighted BCE loss for imbalanced classification
+  use_class_weighted_loss: False # Set to True to use class-weighted BCE loss for imbalanced classification
   n_workers: 4
   clip_grad: 5.0
   weight_decay: 0.05
@@ -147,14 +139,14 @@ train:
   n_warmup_epochs: 10
   n_epochs: 800
   max_n_ckpts: 2
-  batch_size: 32 
+  batch_size: 32
   batch_size_per_device: 16
-  eval_steps: 80 #80  # Evaluate every N optimizer steps (aligned centralized/federated)
+  eval_steps: 280  # Evaluate every N optimizer steps (aligned centralized/federated)
   early_stopping:
-    metric: "roc_auc"
-    mode: "max"
-    patience: 10
-    min_delta: 5e-4
+    metric: "mae" #"roc_auc"
+    mode: "min"
+    patience: 10 #10
+    min_delta: 5e-4 #5e-4
 
 model:
   name: convvit # convvit, resnet
@@ -162,7 +154,7 @@ model:
   freeze_pretrained: True
   views: sax
   n_frames: 2
-  out_chans: null
+  out_chans: 1
   convvit:
     size: base # tiny, base, large, huge
     enc_patch_size: [4, 4, 1]

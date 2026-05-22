@@ -108,7 +108,7 @@ transform:
     translate_range: [60, 60, 0]
 
 train:
-  use_lora: False # Set to True to use LoRA
+  use_lora: True # Set to True to use LoRA
   use_class_weighted_loss: False # Set to True to use class-weighted BCE loss for imbalanced classification
   n_workers: 4
   clip_grad: 5.0
@@ -133,7 +133,7 @@ train:
 model:
   name: convvit # convvit, resnet
   ckpt_path: null
-  freeze_pretrained: False
+  freeze_pretrained: True
   views: sax
   n_frames: 2
   out_chans: null

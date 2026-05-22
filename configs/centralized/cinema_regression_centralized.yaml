@@ -3,7 +3,7 @@ model_name: cinema
 mode: centralized  # federated or centralized
 seed: 0
 grad_ckpt: True
-eval_mode: "centralized" # client, centralized or server for early stopping evaluation
+eval_mode: "client" # client, centralized or server for early stopping evaluation
 
 logging:
   dir: ./outputs/${model_name}_${task}/${mode}/${data.name}/${data.regression_column}/client_${federated.client_tag}/lora_${train.use_lora}/seed${seed}/${now:%Y-%m-%d}/${now:%H-%M-%S}
@@ -18,16 +18,16 @@ federated:
   n_rounds: 500  # Number of communication rounds
   local_epochs: 1  # Local epochs per round per client
   n_clients: 5  # Number of expected clients (ie. acdc + Siemens + GE + Canon + Philips)
-  client_ids: ["acdc", "Siemens"]  # Identifiers for each client
-  # client_ids: ["acdc", "Siemens", "GE", "Canon", "Philips"]  # Identifiers for each client
-  client_tag: "acdc_siemens"
+  # client_ids: ["acdc", "Siemens"]  # Identifiers for each client
+  client_ids: ["acdc", "Siemens", "GE", "Canon", "Philips"]  # Identifiers for each client
+  client_tag: "acdc_siemens_ge_canon_philips"
 
 
 # Data configuration
 data:
   name: acdc_mnms_combined
-  client_name: acdc  # Client name for centralized training. Options: "all", "acdc", "Siemens", "GE", "Canon", "Philips". Use "all" to train on combined data.
-  regression_column: "bmi"
+  # client_name: acdc  # Client name for centralized training. Options: "all", "acdc", "Siemens", "GE", "Canon", "Philips". Use "all" to train on combined data.
+  regression_column: "lv_ef"
   bmi:
       mean: 25.561040294207242
       std: 4.732639548868183
@@ -76,14 +76,17 @@ data:
       std: None
 
   combined:
-    dir: C:\Users\Rodo\.cache\cinema_datasets\acdc_mnms_combined
+    dir: /media/data10/users/rodolfo/data/acdc_mnms_combined_stratified
+    lv_ef: 
+      mean: 48.9331235965377 # Mean and std will be computed from combined data
+      std: 15.2362102199619
 
 # LoRA configuration
 lora:
-  rank: 8  # LoRA rank (typically 4-16)
-  alpha: 16  # LoRA alpha scaling (typically 1x-4x of rank)
-  dropout: 0.1  # LoRA dropout
-  target_modules: ["q", "kv", "proj"]  # Attention modules to adapt: q, kv, proj
+  rank: 4  # LoRA rank (typically 4-16)
+  alpha: 8  # LoRA alpha scaling (typically 1x-4x of rank)
+  dropout: 0.0  # LoRA dropout
+  target_modules: ["q", "kv"]  # Attention modules to adapt: q, kv, proj
   blocks_to_lora: null
 
 # Dual LoRA configuration (personalized federated learning)
@@ -108,7 +111,7 @@ transform:
     translate_range: [60, 60, 0]
 
 train:
-  use_lora: False # Set to True to use LoRA
+  use_lora: True # Set to True to use LoRA
   use_class_weighted_loss: False # Set to True to use class-weighted BCE loss for imbalanced classification
   n_workers: 4
   clip_grad: 5.0
@@ -122,18 +125,18 @@ train:
   n_epochs: 800
   max_n_ckpts: 2
   batch_size: 32
-  batch_size_per_device: 2
-  eval_steps: 20  # Evaluate every N optimizer steps (aligned centralized/federated)
+  batch_size_per_device: 16
+  eval_steps: 280  # Evaluate every N optimizer steps (aligned centralized/federated)
   early_stopping:
     metric: "mae" #"roc_auc"
     mode: "min"
-    patience: 5 #10
-    min_delta: 1e-4 #5e-4
+    patience: 10 #10
+    min_delta: 5e-4 #5e-4
 
 model:
   name: convvit # convvit, resnet
   ckpt_path: null
-  freeze_pretrained: False
+  freeze_pretrained: True
   views: sax
   n_frames: 2
   out_chans: 1
