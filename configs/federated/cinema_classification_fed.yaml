@@ -22,12 +22,6 @@ federated:
   # client_ids: ["acdc", "Siemens", "GE"]  # For debugging with fewer clients
   aggregate_head: True  # Whether to aggregate classification/regression head across clients (True) or keep locally trained (False)
   aggregate_decoder: True  # Only relevant for ConvUNetR segmentation. Set False to keep decoder local (saves ~30% bandwidth).
-  # gpu_mapping:
-  #   acdc: 0
-  #   Siemens: 0
-  #   Philips: 1
-  #   GE: 1
-  #   Canon: 1
   # aggregation_method:
   #   name: fedce  # fedavg, fedce, or custom
   #   config:

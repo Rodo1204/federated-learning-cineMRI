@@ -130,7 +130,6 @@ class FederatedClient:
         eval_dataloader_fn: Callable | None = None,
         config: object | None = None,
         n_accum_steps: int = 1,
-        gpu_id: int | None = None,
     ) -> None:
         self.client_id = client_id
         self.model = model
@@ -153,17 +152,9 @@ class FederatedClient:
         self.eval_dataloader_fn = eval_dataloader_fn
         self.config = config
         self.n_accum_steps = n_accum_steps
-        self.gpu_id = gpu_id
 
         # Cinema sets up amp_dtype, cudnn.benchmark, empty_cache
         self.amp_dtype, self.device = get_amp_dtype_and_device()
-
-        # Override device with explicit GPU mapping when provided
-        self.device = (
-            torch.device(f"cuda:{self.gpu_id}")
-            if self.gpu_id is not None and torch.cuda.is_available()
-            else self.device
-        )
         self.model.to(self.device)
         log(logging.INFO, f"Client {self.client_id} - Initialized on device: {self.device}")
 

@@ -193,9 +193,6 @@ def train(msg: Message, context: Context):
 
     vendor = getattr(config, "vendor", None)
 
-    # Resolve GPU mapping for this client
-    gpu_id = getattr(config.federated, "gpu_mapping", {}).get(client_id)
-
     # Initialize model
     model = get_model(config, client_id)
     
@@ -255,7 +252,6 @@ def train(msg: Message, context: Context):
         config=config, # TODO: maybe client doesn't need full config, could just pass necessary fields or a subset of config related to training/evaluation
         run_dir=str(client_run_dir),
         n_accum_steps=n_accum_steps,
-        gpu_id=gpu_id,
     )
 
     # Persist optimizer state across rounds (dirty optimizer).
@@ -321,9 +317,6 @@ def evaluate(msg: Message, context: Context):
 
     vendor = getattr(config, "vendor", None)
 
-    # Resolve GPU mapping for this client
-    gpu_id = getattr(config.federated, "gpu_mapping", {}).get(client_id)
-
     # Initialize model
     model = get_model(config, client_id)
     
@@ -372,7 +365,6 @@ def evaluate(msg: Message, context: Context):
         config=config,
         run_dir=str(client_run_dir),
         n_accum_steps=1,
-        gpu_id=gpu_id,
     )
 
     # Call the client's evaluate method and send the reply message
