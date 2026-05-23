@@ -939,6 +939,8 @@ def to_builtin(obj: Any) -> Any:
         return [to_builtin(v) for v in obj]
     if isinstance(obj, tuple):
         return [to_builtin(v) for v in obj]
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
     if isinstance(obj, np.generic):
         return obj.item()
     if isinstance(obj, torch.Tensor):
@@ -1408,6 +1410,281 @@ def format_results_json_csv(
 
 
 # ============================================================================
+# PR #2 — Monte Carlo Dropout Uncertainty Estimation
+# ============================================================================
+
+def enable_mc_dropout(model: torch.nn.Module) -> list[str]:
+    """Set only ``nn.Dropout`` layers to train mode; leave all others in eval.
+
+    Does NOT touch DropPath, BatchNorm, LayerNorm, or any timm stochastic layers.
+
+    Args:
+        model: PyTorch model already in eval mode.
+
+    Returns:
+        List of activated dropout module names (for logging).
+    """
+    activated: list[str] = []
+    for name, module in model.named_modules():
+        if isinstance(module, torch.nn.Dropout):
+            module.train()
+            activated.append(name)
+    return activated
+
+
+def mc_dropout_predict(
+    model: torch.nn.Module,
+    dataloader: torch.utils.data.DataLoader,
+    task_type: str,
+    patch_size_dict: dict[str, tuple[int, ...]],
+    spacing_dict: dict[str, tuple[float, ...]] | None,
+    amp_dtype: torch.dtype,
+    device: torch.device,
+    n_passes: int = 30,
+) -> tuple[np.ndarray, np.ndarray, list]:
+    """Run N stochastic forward passes with dropout enabled.
+
+    Args:
+        model: Model with dropout layers already set to train mode.
+        dataloader: Evaluation dataloader (batch_size=1 for patching support).
+        task_type: One of "classification", "regression", "segmentation".
+        patch_size_dict: Patch size per view.
+        spacing_dict: Spacing per view (used for segmentation).
+        amp_dtype: dtype for mixed precision.
+        device: Device to run on.
+        n_passes: Number of stochastic forward passes.
+
+    Returns:
+        Tuple of (mean, std, all_outputs) where:
+        - classification: mean/std are (n_samples, n_classes), all_outputs is list of (n_samples, n_classes) probs
+        - regression: mean/std are (n_samples,), all_outputs is list of (n_samples,) preds
+        - segmentation: mean/std are per-sample dice arrays, all_outputs is list of dicts with logits/labels
+    """
+    import torch.nn.functional as F
+
+    from models.cinema.cinema.classification.train import classification_eval
+    from models.cinema.cinema.regression.train import regression_eval
+    from models.cinema.cinema.segmentation.train import segmentation_eval, segmentation_metrics
+
+    all_outputs: list = []
+
+    for pass_idx in range(n_passes):
+        pass_results: list = []
+        for batch in dataloader:
+            with torch.autocast("cuda", dtype=amp_dtype, enabled=torch.cuda.is_available()):
+                if task_type == "classification":
+                    logits, _ = classification_eval(
+                        model=model,
+                        batch=batch,
+                        patch_size_dict=patch_size_dict,
+                        amp_dtype=amp_dtype,
+                        device=device,
+                    )
+                    probs = F.softmax(logits, dim=1).cpu().to(dtype=torch.float32).numpy()
+                    pass_results.append(probs)
+                elif task_type == "regression":
+                    preds, _ = regression_eval(
+                        model=model,
+                        batch=batch,
+                        patch_size_dict=patch_size_dict,
+                        amp_dtype=amp_dtype,
+                        device=device,
+                    )
+                    pass_results.append(preds.cpu().to(dtype=torch.float32).numpy())
+                elif task_type == "segmentation":
+                    if spacing_dict is None:
+                        raise ValueError("spacing_dict is required for segmentation MC Dropout.")
+                    logits_dict, _ = segmentation_eval(
+                        model=model,
+                        batch=batch,
+                        patch_size_dict=patch_size_dict,
+                        spacing_dict=spacing_dict,
+                        amp_dtype=amp_dtype,
+                        device=device,
+                        metrics_fn=segmentation_metrics,
+                    )
+                    # Store on CPU to avoid OOM
+                    cpu_logits = {v: log.cpu() for v, log in logits_dict.items()}
+                    labels_cpu = {v: batch[f"{v}_label"].cpu() for v in logits_dict}
+                    pass_results.append({"logits": cpu_logits, "labels": labels_cpu})
+                else:
+                    raise ValueError(f"Unknown task_type: {task_type}")
+
+        # Offload pass results to CPU / numpy to free GPU memory
+        if task_type == "classification":
+            all_outputs.append(np.concatenate(pass_results, axis=0))
+        elif task_type == "regression":
+            all_outputs.append(np.concatenate(pass_results, axis=0))
+        elif task_type == "segmentation":
+            all_outputs.extend(pass_results)
+
+    # Stack and compute mean/std
+    if task_type == "classification":
+        stacked = np.stack(all_outputs, axis=0)  # (n_passes, n_samples, n_classes)
+        return stacked.mean(axis=0), stacked.std(axis=0), all_outputs
+    elif task_type == "regression":
+        stacked = np.stack(all_outputs, axis=0)  # (n_passes, n_samples, 1)
+        stacked = stacked.squeeze(-1)  # (n_passes, n_samples)
+        return stacked.mean(axis=0), stacked.std(axis=0), all_outputs
+    elif task_type == "segmentation":
+        # For segmentation, all_outputs is a list of dicts — mean/std computed later
+        return np.array([]), np.array([]), all_outputs
+
+    raise ValueError(f"Unknown task_type: {task_type}")
+
+
+def compute_classification_uncertainty(
+    all_probs: np.ndarray,
+) -> dict[str, float | np.ndarray]:
+    """Compute uncertainty metrics from MC Dropout classification outputs.
+
+    Args:
+        all_probs: Stacked softmax probabilities of shape (n_passes, n_samples, n_classes).
+
+    Returns:
+        Dict with:
+        - mean_entropy: mean predictive entropy per sample
+        - mutual_info: mutual information (epistemic uncertainty) per sample
+        - per_class_std: std of predictions per class across passes
+    """
+    # Predictive entropy: H = -sum(p_mean * log(p_mean)) per sample
+    mean_probs = all_probs.mean(axis=0)  # (n_samples, n_classes)
+    mean_probs_clipped = np.clip(mean_probs, 1e-10, 1.0)
+    predictive_entropy = -np.sum(mean_probs * np.log(mean_probs_clipped), axis=1)  # (n_samples,)
+    mean_entropy = float(np.mean(predictive_entropy))
+
+    # Expected entropy: mean of per-pass entropies
+    probs_clipped = np.clip(all_probs, 1e-10, 1.0)
+    per_pass_entropy = -np.sum(all_probs * np.log(probs_clipped), axis=2)  # (n_passes, n_samples)
+    expected_entropy = per_pass_entropy.mean(axis=0)  # (n_samples,)
+
+    # Mutual information = predictive_entropy - expected_entropy
+    mutual_info = predictive_entropy - expected_entropy
+    mean_mutual_info = float(np.mean(mutual_info))
+
+    # Per-class standard deviation across passes
+    per_class_std = all_probs.std(axis=0).mean(axis=0)  # (n_classes,)
+
+    return {
+        "mean_entropy": mean_entropy,
+        "mutual_info": mean_mutual_info,
+        "per_class_std": per_class_std,
+    }
+
+
+def compute_regression_uncertainty(
+    all_preds: np.ndarray,
+    reg_mean: float,
+    reg_std: float,
+) -> dict[str, float | np.ndarray]:
+    """Compute uncertainty metrics from MC Dropout regression outputs.
+
+    Args:
+        all_preds: Stacked predictions of shape (n_passes, n_samples).
+        reg_mean: Normalization mean for restoring scales.
+        reg_std: Normalization std for restoring scales.
+
+    Returns:
+        Dict with:
+        - std: per-sample std (normalized scale)
+        - ci_lower: lower bound of 95% CI (normalized)
+        - ci_upper: upper bound of 95% CI (normalized)
+        - restored_std: per-sample std (original scale)
+        - restored_ci_lower: lower bound of 95% CI (original scale)
+        - restored_ci_upper: upper bound of 95% CI (original scale)
+    """
+    sample_std = all_preds.std(axis=0)  # (n_samples,)
+    sample_mean = all_preds.mean(axis=0)  # (n_samples,)
+
+    ci_lower = sample_mean - 1.96 * sample_std
+    ci_upper = sample_mean + 1.96 * sample_std
+
+    restored_std = sample_std * reg_std
+    restored_ci_lower = ci_lower * reg_std + reg_mean
+    restored_ci_upper = ci_upper * reg_std + reg_mean
+
+    return {
+        "std": sample_std,
+        "ci_lower": ci_lower,
+        "ci_upper": ci_upper,
+        "restored_std": restored_std,
+        "restored_ci_lower": restored_ci_lower,
+        "restored_ci_upper": restored_ci_upper,
+    }
+
+
+def compute_segmentation_uncertainty(
+    all_outputs: list[dict[str, dict[str, torch.Tensor]]],
+    output_dir: Path | None = None,
+) -> dict[str, float | np.ndarray | str]:
+    """Compute uncertainty metrics from MC Dropout segmentation outputs.
+
+    Args:
+        all_outputs: List of dicts from each MC pass, each containing:
+            {"logits": {view: tensor}, "labels": {view: tensor}}
+        output_dir: Directory to save per-voxel entropy map (.npy sidecar).
+
+    Returns:
+        Dict with:
+        - mean_dice_std: mean std of Dice scores across passes
+        - mean_predictive_variance: mean predictive variance across voxels
+        - per_voxel_entropy_map_path: path to saved .npy entropy map
+    """
+    from models.cinema.cinema.segmentation.train import segmentation_metrics
+
+    # Collect per-pass Dice scores
+    dice_per_pass: list[dict[str, float]] = []
+    all_logits_list: list[torch.Tensor] = []
+    all_labels_list: list[torch.Tensor] = []
+
+    for output in all_outputs:
+        logits_dict = output["logits"]
+        labels_dict = output["labels"]
+        # Use first view for aggregation (typically "sax")
+        first_view = next(iter(logits_dict))
+        logits = logits_dict[first_view]
+        labels = labels_dict[first_view]
+        all_logits_list.append(logits)
+        all_labels_list.append(labels)
+
+        # Compute Dice for this pass
+        pass_metrics = segmentation_metrics(logits, labels, spacing=(1.0, 1.0, 1.0))
+        dice_scores = {k: v.item() for k, v in pass_metrics.items() if "dice" in k}
+        dice_per_pass.append(dice_scores)
+
+    # Mean Dice std across classes
+    dice_keys = sorted(dice_per_pass[0].keys())
+    dice_array = np.array([[d.get(k, 0.0) for k in dice_keys] for d in dice_per_pass])  # (n_passes, n_dice_metrics)
+    mean_dice_std = float(np.mean(dice_array.std(axis=0)))
+
+    # Per-voxel entropy map from stacked logits
+    stacked_logits = torch.stack(all_logits_list, dim=0)  # (n_passes, batch, n_classes, H, W, D)
+    # Average softmax across passes → predictive distribution
+    softmax_passes = torch.softmax(stacked_logits, dim=2)  # (n_passes, batch, n_classes, ...)
+    mean_softmax = softmax_passes.mean(dim=0)  # (batch, n_classes, ...)
+    mean_softmax_clipped = torch.clamp(mean_softmax, min=1e-10)
+    per_voxel_entropy = -torch.sum(mean_softmax * torch.log(mean_softmax_clipped), dim=1)  # (batch, H, W, D)
+
+    # Mean predictive variance
+    predictive_variance = softmax_passes.var(dim=0).mean()  # scalar
+    mean_predictive_variance = float(predictive_variance.item())
+
+    # Save per-voxel entropy map
+    entropy_map_path = ""
+    if output_dir is not None:
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        entropy_map_path = str(output_dir / "mc_dropout_entropy_map.npy")
+        np.save(entropy_map_path, per_voxel_entropy.squeeze(0).cpu().numpy())
+
+    return {
+        "mean_dice_std": mean_dice_std,
+        "mean_predictive_variance": mean_predictive_variance,
+        "per_voxel_entropy_map_path": entropy_map_path,
+    }
+
+
+# ============================================================================
 # Task 1.3 — Shared argument parser
 # ============================================================================
 
@@ -1417,12 +1694,12 @@ def build_shared_argument_parser() -> argparse.ArgumentParser:
     Returns a parser pre-configured with:
     - --checkpoint-dir (type=Path, default=None)
     - --checkpoint-path (type=Path, default=None)
-    - --checkpoint-epoch (type=int, default=None)
     - --output-dir (type=Path, default=None)
     - --output-file-name (type=str, default="evaluation_results.json")
     - --mc-dropout (action="store_true", default=False)
     - --mc-dropout-passes (type=int, default=30)
 
+    Note: --checkpoint-epoch is centralized-only and added by the centralized wrapper.
     Validation: at least one of --checkpoint-dir or --checkpoint-path is required.
     """
     parser = argparse.ArgumentParser(
@@ -1439,12 +1716,6 @@ def build_shared_argument_parser() -> argparse.ArgumentParser:
         type=Path,
         default=None,
         help="Direct checkpoint path. If set, directory-based selection is skipped.",
-    )
-    parser.add_argument(
-        "--checkpoint-epoch",
-        type=int,
-        default=None,
-        help="Specific epoch to evaluate (centralized only; overrides best selection)",
     )
     parser.add_argument(
         "--output-dir",
@@ -1656,7 +1927,8 @@ def run_unified_evaluation(
     g. Fairness metrics
     h. JSON output with new schema
 
-    MC Dropout integration is deferred to PR #2 — params accepted but no-op.
+    MC Dropout (PR #2): when ``mc_dropout=True``, runs stochastic forward passes
+    and appends uncertainty metrics under ``mc_dropout_uncertainty`` key.
     """
     from flwr_cinema.scripts.lora import load_lora_state_dict
     from models.cinema.cinema.device import get_amp_dtype_and_device
@@ -1665,11 +1937,10 @@ def run_unified_evaluation(
 
     orc_logger = get_logger(__name__)
 
-    # MC Dropout warning (deferred to PR #2)
     if mc_dropout:
-        orc_logger.warning(
-            "MC Dropout is requested but not yet implemented. "
-            "Running deterministic evaluation only. MC Dropout will be available in a future release."
+        orc_logger.info(
+            f"MC Dropout enabled with {mc_dropout_passes} passes. "
+            "Uncertainty metrics will be included in output."
         )
 
     # ── a. Checkpoint resolution ──────────────────────────────────────────
@@ -1681,6 +1952,7 @@ def run_unified_evaluation(
     else:
         ckpt_path, selection_meta = _resolve_centralized_checkpoint(
             checkpoint_dir=checkpoint_dir,
+            checkpoint_path=checkpoint_path,
             checkpoint_epoch=checkpoint_epoch,
         )
 
@@ -1760,17 +2032,74 @@ def run_unified_evaluation(
             amp_dtype=amp_dtype,
         )
 
+    # ── e2. MC Dropout uncertainty (PR #2) ────────────────────────────────
+    mc_dropout_results: dict[str, Any] = {}
+    if mc_dropout:
+        # Enable dropout layers for stochastic passes
+        activated = enable_mc_dropout(model)
+        orc_logger.info(f"MC Dropout activated {len(activated)} dropout layers")
+
+        if is_federated:
+            mc_dropout_results = _run_mc_dropout_federated(
+                model=model,
+                checkpoint=checkpoint,
+                config=config,
+                task_type=task,
+                device=device,
+                amp_dtype=amp_dtype,
+                n_passes=mc_dropout_passes,
+                base_state={k: v.detach().cpu().clone() for k, v in model.state_dict().items()},
+                output_dir=output_dir,
+            )
+        else:
+            mc_dropout_results = _run_mc_dropout_centralized(
+                model=model,
+                config=config,
+                task_type=task,
+                device=device,
+                amp_dtype=amp_dtype,
+                n_passes=mc_dropout_passes,
+                output_dir=output_dir,
+            )
+
+        # Set model back to eval mode
+        model.eval()
+        orc_logger.info("MC Dropout evaluation complete, model restored to eval mode")
+
     # ── f-h. Build payload and save ───────────────────────────────────────
     primary_metric = _extract_primary_metric(config)
 
+    # Extract target_column and classes from config for experiment insights
+    target_column = None
+    classes = None
+    if task == "classification":
+        target_column = str(getattr(cfg.data, "class_column", "")) or None
+        if target_column:
+            try:
+                raw_classes = getattr(cfg.data, target_column, None)
+                if raw_classes and not isinstance(raw_classes, str):
+                    classes = list(raw_classes)
+            except Exception:
+                classes = None
+    elif task == "regression":
+        target_column = str(getattr(cfg.data, "regression_column", "")) or None
+
+    # Build mode-specific config dict — centralized gets checkpoint_epoch,
+    # federated gets checkpoint_round / selection_mode / model_variant.
+    # No nulls from the wrong mode.
+    payload_config: dict[str, Any] = {
+        "checkpoint": ckpt_path.name,
+        "use_lora": use_lora,
+        "primary_metric": primary_metric,
+        "task": task,
+        "target_column": target_column,
+        "classes": classes,
+    }
+    if not is_federated:
+        payload_config["checkpoint_epoch"] = checkpoint.get("epoch")
+
     payload = build_unified_result_payload(
-        config={
-            "checkpoint": ckpt_path.name,
-            "checkpoint_epoch": checkpoint.get("epoch") if not is_federated else None,
-            "use_lora": use_lora,
-            "primary_metric": primary_metric,
-            "task": task,
-        },
+        config=payload_config,
         global_pool_metrics=global_pool_metrics,
         per_client_metrics=per_client_metrics,
         primary_metric=primary_metric,
@@ -1779,6 +2108,10 @@ def run_unified_evaluation(
         checkpoint_round=selection_meta.get("selected_round"),
         global_pool_model_variant=global_pool_variant,
     )
+
+    # Add MC Dropout uncertainty results to payload
+    if mc_dropout and mc_dropout_results:
+        payload["mc_dropout_uncertainty"] = to_builtin(mc_dropout_results)
 
     # Determine output directory
     if output_dir is None:
@@ -1811,11 +2144,26 @@ def _extract_primary_metric(config: dict[str, Any]) -> str:
 
 def _resolve_centralized_checkpoint(
     checkpoint_dir: Path | None,
+    checkpoint_path: Path | None,
     checkpoint_epoch: int | None,
 ) -> tuple[Path, dict[str, Any]]:
     """Resolve checkpoint for centralized evaluation."""
+    # Direct path takes precedence
+    if checkpoint_path is not None:
+        ckpt_path = Path(checkpoint_path)
+        if not ckpt_path.exists() or not ckpt_path.is_file():
+            raise FileNotFoundError(f"Checkpoint file not found: {ckpt_path}")
+        return ckpt_path, {
+            "mode": "direct",
+            "selected_round": None,
+            "checkpoint_dir": ckpt_path.parent,
+        }
+
     if checkpoint_dir is None:
-        raise ValueError("--checkpoint-dir is required for centralized evaluation.")
+        raise ValueError(
+            "At least one of --checkpoint-dir or --checkpoint-path is required "
+            "for centralized evaluation."
+        )
 
     checkpoint_dir = Path(checkpoint_dir)
 
@@ -2132,3 +2480,226 @@ def _load_federated_client_datasets(
     """Load federated client datasets and evaluation function."""
     from flwr_cinema.federated.evaluate import load_client_datasets
     return load_client_datasets(config=config, task_type=task_type)
+
+
+# ── MC Dropout helpers for run_unified_evaluation ─────────────────────────
+
+def _build_centralized_dataloader(
+    config: dict[str, Any],
+    task_type: str,
+    amp_dtype: torch.dtype,
+    client_id: str | None = None,
+) -> tuple[DataLoader, dict[str, tuple[int, ...]], dict[str, tuple[float, ...]] | None]:
+    """Build a dataloader for centralized MC Dropout evaluation."""
+    from flwr_cinema.tasks.adapters import get_centralized_task_adapter
+    from omegaconf import OmegaConf
+
+    cfg = OmegaConf.create(config)
+    adapter = get_centralized_task_adapter(cfg)
+    task_spec = adapter.task_spec
+
+    data_dir = Path(cfg.data.combined.dir).expanduser()
+    data_dir = resolve_data_dir_with_fallback(data_dir)
+
+    train_meta_df = load_metadata(data_dir / "train_metadata.csv", metadata_type="train")
+    test_meta_df = load_metadata(data_dir / "test_metadata.csv", metadata_type="test")
+
+    if client_id is not None:
+        test_meta_df = test_meta_df[test_meta_df["client"] == client_id].reset_index(drop=True)
+    else:
+        test_meta_df = filter_metadata_by_client_config(config=config, meta_df=test_meta_df, metadata_type="test")
+
+    _, val_transform = task_spec.transform_factory(cfg)
+
+    views = [cfg.model.views] if isinstance(cfg.model.views, str) else cfg.model.views
+    patch_size_dict = {
+        v: cfg.data.sax.patch_size if v == "sax" else cfg.data.lax.patch_size for v in views
+    }
+    spacing_dict = {
+        v: cfg.data.sax.spacing if v == "sax" else cfg.data.lax.spacing for v in views
+    }
+
+    dataset = task_spec.dataset_factory(
+        config=cfg,
+        data_dir=data_dir / "test",
+        meta_df=test_meta_df,
+        transform=val_transform,
+        train_meta_df=train_meta_df,
+    )
+
+    dataloader = DataLoader(
+        dataset=dataset,
+        sampler=SequentialSampler(dataset),
+        batch_size=1,
+        drop_last=False,
+        pin_memory=True,
+        num_workers=cfg.train.n_workers,
+    )
+
+    return dataloader, patch_size_dict, spacing_dict
+
+
+def _run_mc_dropout_centralized(
+    model: torch.nn.Module,
+    config: dict[str, Any],
+    task_type: str,
+    device: torch.device,
+    amp_dtype: torch.dtype,
+    n_passes: int,
+    output_dir: Path | None,
+) -> dict[str, Any]:
+    """Run MC Dropout uncertainty for centralized: global pool + per-client."""
+    from omegaconf import OmegaConf
+    from flwr_cinema.scripts.eval_utils import load_metadata, resolve_data_dir_with_fallback, filter_metadata_by_client_config
+
+    cfg = OmegaConf.create(config)
+    data_dir = Path(cfg.data.combined.dir).expanduser()
+    data_dir = resolve_data_dir_with_fallback(data_dir)
+    test_meta_df = load_metadata(data_dir / "test_metadata.csv", metadata_type="test")
+    test_meta_df = filter_metadata_by_client_config(config=config, meta_df=test_meta_df, metadata_type="test")
+
+    result: dict[str, Any] = {"task_type": task_type, "n_passes": n_passes}
+
+    # ── Global pool ────────────────────────────────────────────────────
+    dataloader, patch_size_dict, spacing_dict = _build_centralized_dataloader(
+        config=config, task_type=task_type, amp_dtype=amp_dtype
+    )
+    mean, std, all_outputs = mc_dropout_predict(
+        model=model, dataloader=dataloader, task_type=task_type,
+        patch_size_dict=patch_size_dict, spacing_dict=spacing_dict,
+        amp_dtype=amp_dtype, device=device, n_passes=n_passes,
+    )
+    result["global_pool"] = _build_mc_uncertainty_entry(
+        task_type=task_type, all_outputs=all_outputs, mean=mean,
+        dataloader=dataloader, output_dir=output_dir,
+    )
+
+    # ── Per-client ─────────────────────────────────────────────────────
+    if "client" in test_meta_df.columns:
+        per_client: dict[str, Any] = {}
+        for client_id in sorted(test_meta_df["client"].unique()):
+            client_dl, client_ps, client_sp = _build_centralized_dataloader(
+                config=config, task_type=task_type, amp_dtype=amp_dtype,
+                client_id=client_id,
+            )
+            c_mean, c_std, c_outputs = mc_dropout_predict(
+                model=model, dataloader=client_dl, task_type=task_type,
+                patch_size_dict=client_ps, spacing_dict=client_sp,
+                amp_dtype=amp_dtype, device=device, n_passes=n_passes,
+            )
+            per_client[client_id] = _build_mc_uncertainty_entry(
+                task_type=task_type, all_outputs=c_outputs, mean=c_mean,
+                dataloader=client_dl, output_dir=output_dir,
+                client_id=client_id,
+            )
+        result["per_client"] = per_client
+
+    return result
+
+
+def _build_mc_uncertainty_entry(
+    task_type: str,
+    all_outputs: list,
+    mean: np.ndarray,
+    dataloader: DataLoader,
+    output_dir: Path | None,
+    client_id: str | None = None,
+) -> dict[str, Any]:
+    """Build task-specific MC uncertainty dict from prediction outputs."""
+    entry: dict[str, Any] = {"n_passes": len(all_outputs)}
+
+    if task_type == "classification":
+        unc = compute_classification_uncertainty(all_probs=np.stack(all_outputs, axis=0))
+        entry["classification"] = {
+            "mean_entropy": float(unc["mean_entropy"]),
+            "mutual_info": float(unc["mutual_info"]),
+            "per_class_std": to_builtin(unc["per_class_std"]),
+        }
+    elif task_type == "regression":
+        reg_mean = getattr(dataloader.dataset, "reg_mean", 0.0)
+        reg_std = getattr(dataloader.dataset, "reg_std", 1.0)
+        stacked = np.stack(all_outputs, axis=0).squeeze(-1) if all_outputs[0].ndim == 2 else np.stack(all_outputs, axis=0)
+        unc = compute_regression_uncertainty(all_preds=stacked, reg_mean=reg_mean, reg_std=reg_std)
+        entry["regression"] = {
+            "mean_std": float(np.mean(unc["std"])),
+            "ci_lower": to_builtin(unc["ci_lower"]),
+            "ci_upper": to_builtin(unc["ci_upper"]),
+            "restored_mean_std": float(np.mean(unc["restored_std"])),
+        }
+    elif task_type == "segmentation":
+        eff_output_dir = Path(output_dir) if output_dir else Path(".")
+        eff_output_dir.mkdir(parents=True, exist_ok=True)
+        suffix = f"_{client_id}" if client_id else ""
+        unc = compute_segmentation_uncertainty(all_outputs=all_outputs, output_dir=eff_output_dir)
+        entry["segmentation"] = {
+            "mean_dice_std": float(unc["mean_dice_std"]),
+            "mean_predictive_variance": float(unc["mean_predictive_variance"]),
+            "per_voxel_entropy_map_path": str(unc["per_voxel_entropy_map_path"]),
+        }
+
+    return entry
+
+
+def _run_mc_dropout_federated(
+    model: torch.nn.Module,
+    checkpoint: dict[str, Any],
+    config: dict[str, Any],
+    task_type: str,
+    device: torch.device,
+    amp_dtype: torch.dtype,
+    n_passes: int,
+    base_state: dict[str, torch.Tensor],
+    output_dir: Path | None,
+) -> dict[str, Any]:
+    """Run MC Dropout for federated: per-client (with private artifacts) + global pool."""
+    from flwr_cinema.federated.evaluate import apply_private_artifacts, build_eval_dataloader
+    from torch.utils.data import ConcatDataset
+
+    datasets_by_client, _ = _load_federated_client_datasets(config, task_type)
+
+    cfg = OmegaConf.create(config)
+    views = [cfg.model.views] if isinstance(cfg.model.views, str) else cfg.model.views
+    patch_size_dict = {
+        v: cfg.data.sax.patch_size if v == "sax" else cfg.data.lax.patch_size for v in views
+    }
+    spacing_dict = {
+        v: cfg.data.sax.spacing if v == "sax" else cfg.data.lax.spacing for v in views
+    }
+
+    result: dict[str, Any] = {"task_type": task_type, "n_passes": n_passes}
+
+    # ── Per-client (with private artifacts) ─────────────────────────────
+    per_client_uncertainty: dict[str, Any] = {}
+    for client_id, (n_samples, dataset) in sorted(datasets_by_client.items(), key=lambda kv: str(kv[0])):
+        model.load_state_dict(base_state, strict=False)
+        apply_private_artifacts(model=model, checkpoint=checkpoint, client_id=str(client_id))
+        model.to(device)
+
+        dataloader = build_eval_dataloader(dataset)
+        mean, std, all_outputs = mc_dropout_predict(
+            model=model, dataloader=dataloader, task_type=task_type,
+            patch_size_dict=patch_size_dict, spacing_dict=spacing_dict,
+            amp_dtype=amp_dtype, device=device, n_passes=n_passes,
+        )
+        per_client_uncertainty[client_id] = _build_mc_uncertainty_entry(
+            task_type=task_type, all_outputs=all_outputs, mean=mean,
+            dataloader=dataloader, output_dir=output_dir, client_id=client_id,
+        )
+    result["per_client"] = per_client_uncertainty
+
+    # ── Global pool (base model, no private artifacts) ──────────────────
+    model.load_state_dict(base_state, strict=False)
+    model.to(device)
+    pooled_dataset = ConcatDataset([ds for _, ds in datasets_by_client.values()])
+    pooled_dataloader = build_eval_dataloader(pooled_dataset)
+    gp_mean, gp_std, gp_outputs = mc_dropout_predict(
+        model=model, dataloader=pooled_dataloader, task_type=task_type,
+        patch_size_dict=patch_size_dict, spacing_dict=spacing_dict,
+        amp_dtype=amp_dtype, device=device, n_passes=n_passes,
+    )
+    result["global_pool"] = _build_mc_uncertainty_entry(
+        task_type=task_type, all_outputs=gp_outputs, mean=gp_mean,
+        dataloader=pooled_dataloader, output_dir=output_dir,
+    )
+
+    return result
