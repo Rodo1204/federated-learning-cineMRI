@@ -1441,7 +1441,7 @@ def mc_dropout_predict(
     amp_dtype: torch.dtype,
     device: torch.device,
     n_passes: int = 30,
-) -> tuple[np.ndarray, np.ndarray, list]:
+) -> tuple[np.ndarray, np.ndarray, list, np.ndarray | None]:
     """Run N stochastic forward passes with dropout enabled.
 
     Args:
@@ -1455,10 +1455,10 @@ def mc_dropout_predict(
         n_passes: Number of stochastic forward passes.
 
     Returns:
-        Tuple of (mean, std, all_outputs) where:
-        - classification: mean/std are (n_samples, n_classes), all_outputs is list of (n_samples, n_classes) probs
-        - regression: mean/std are (n_samples,), all_outputs is list of (n_samples,) preds
-        - segmentation: mean/std are per-sample dice arrays, all_outputs is list of dicts with logits/labels
+        Tuple of (mean, std, all_outputs, all_labels) where:
+        - classification: mean/std are (n_samples, n_classes), all_outputs is list of (n_samples, n_classes) probs, labels is (n_samples,)
+        - regression: mean/std are (n_samples,), all_outputs is list of (n_samples,) preds, labels is (n_samples,)
+        - segmentation: mean/std are empty, all_outputs is list of dicts, labels is None (labels inside dicts)
     """
     import torch.nn.functional as F
 
@@ -1467,45 +1467,55 @@ def mc_dropout_predict(
     from models.cinema.cinema.segmentation.train import segmentation_eval, segmentation_metrics
 
     all_outputs: list = []
+    all_labels_list: list[np.ndarray] | None = None if task_type == "segmentation" else []
 
     for pass_idx in range(n_passes):
         pass_results: list = []
+        if all_labels_list is not None and pass_idx == 0:
+            all_labels_list = []
         for batch in dataloader:
             with torch.autocast("cuda", dtype=amp_dtype, enabled=torch.cuda.is_available()):
                 if task_type == "classification":
                     logits, _ = classification_eval(
-                        model=model,
-                        batch=batch,
-                        patch_size_dict=patch_size_dict,
-                        amp_dtype=amp_dtype,
-                        device=device,
+                        model=model, batch=batch, patch_size_dict=patch_size_dict,
+                        amp_dtype=amp_dtype, device=device,
                     )
                     probs = F.softmax(logits, dim=1).cpu().to(dtype=torch.float32).numpy()
                     pass_results.append(probs)
+                    if pass_idx == 0:
+                        all_labels_list.append(batch["label"].cpu().numpy())
                 elif task_type == "regression":
                     preds, _ = regression_eval(
-                        model=model,
-                        batch=batch,
-                        patch_size_dict=patch_size_dict,
-                        amp_dtype=amp_dtype,
-                        device=device,
+                        model=model, batch=batch, patch_size_dict=patch_size_dict,
+                        amp_dtype=amp_dtype, device=device,
                     )
                     pass_results.append(preds.cpu().to(dtype=torch.float32).numpy())
+                    if pass_idx == 0:
+                        all_labels_list.append(batch["label"].cpu().numpy())
                 elif task_type == "segmentation":
                     if spacing_dict is None:
                         raise ValueError("spacing_dict is required for segmentation MC Dropout.")
                     logits_dict, _ = segmentation_eval(
-                        model=model,
-                        batch=batch,
-                        patch_size_dict=patch_size_dict,
-                        spacing_dict=spacing_dict,
-                        amp_dtype=amp_dtype,
-                        device=device,
+                        model=model, batch=batch,
+                        patch_size_dict=patch_size_dict, spacing_dict=spacing_dict,
+                        amp_dtype=amp_dtype, device=device,
                         metrics_fn=segmentation_metrics,
                     )
-                    # Store on CPU to avoid OOM
-                    cpu_logits = {v: log.cpu() for v, log in logits_dict.items()}
-                    labels_cpu = {v: batch[f"{v}_label"].cpu() for v in logits_dict}
+                    # Crop labels to match cropped logits (same logic as segmentation_eval)
+                    from models.cinema.cinema.transform import crop_start
+                    cpu_logits = {}
+                    labels_cpu = {}
+                    for v in logits_dict:
+                        width = int(batch[f"{v}_width"][0])
+                        height = int(batch[f"{v}_height"][0])
+                        label = batch[f"{v}_label"]
+                        if len(patch_size_dict[v]) == 3:
+                            n_slices = int(batch["n_slices"][0])
+                            label = crop_start(label, (*label.shape[:2], width, height, n_slices))
+                        elif len(patch_size_dict[v]) == 2:
+                            label = crop_start(label, (*label.shape[:2], width, height))
+                        cpu_logits[v] = logits_dict[v].cpu()
+                        labels_cpu[v] = label.cpu()
                     pass_results.append({"logits": cpu_logits, "labels": labels_cpu})
                 else:
                     raise ValueError(f"Unknown task_type: {task_type}")
@@ -1516,19 +1526,20 @@ def mc_dropout_predict(
         elif task_type == "regression":
             all_outputs.append(np.concatenate(pass_results, axis=0))
         elif task_type == "segmentation":
-            all_outputs.extend(pass_results)
+            all_outputs.append(pass_results)
 
     # Stack and compute mean/std
     if task_type == "classification":
         stacked = np.stack(all_outputs, axis=0)  # (n_passes, n_samples, n_classes)
-        return stacked.mean(axis=0), stacked.std(axis=0), all_outputs
+        labels = np.concatenate(all_labels_list, axis=0) if all_labels_list else None
+        return stacked.mean(axis=0), stacked.std(axis=0), all_outputs, labels
     elif task_type == "regression":
         stacked = np.stack(all_outputs, axis=0)  # (n_passes, n_samples, 1)
         stacked = stacked.squeeze(-1)  # (n_passes, n_samples)
-        return stacked.mean(axis=0), stacked.std(axis=0), all_outputs
+        labels = np.concatenate(all_labels_list, axis=0) if all_labels_list else None
+        return stacked.mean(axis=0), stacked.std(axis=0), all_outputs, labels
     elif task_type == "segmentation":
-        # For segmentation, all_outputs is a list of dicts — mean/std computed later
-        return np.array([]), np.array([]), all_outputs
+        return np.array([]), np.array([]), all_outputs, None
 
     raise ValueError(f"Unknown task_type: {task_type}")
 
@@ -1614,73 +1625,108 @@ def compute_regression_uncertainty(
 
 
 def compute_segmentation_uncertainty(
-    all_outputs: list[dict[str, dict[str, torch.Tensor]]],
+    all_outputs: list[list[dict[str, dict[str, torch.Tensor]]]],
     output_dir: Path | None = None,
+    spacing_dict: dict[str, tuple[float, ...]] | None = None,
 ) -> dict[str, float | np.ndarray | str]:
     """Compute uncertainty metrics from MC Dropout segmentation outputs.
 
     Args:
-        all_outputs: List of dicts from each MC pass, each containing:
-            {"logits": {view: tensor}, "labels": {view: tensor}}
-        output_dir: Directory to save per-voxel entropy map (.npy sidecar).
+        all_outputs: Per-pass lists of dicts [{logits, labels}_p0_s0, ...].
+        output_dir: Directory (unused, kept for API compatibility).
+        spacing_dict: Per-view voxel spacing for accurate Hausdorff metrics.
 
     Returns:
         Dict with:
         - mean_dice_std: mean std of Dice scores across passes
         - mean_predictive_variance: mean predictive variance across voxels
-        - per_voxel_entropy_map_path: path to saved .npy entropy map
     """
     from models.cinema.cinema.segmentation.train import segmentation_metrics
 
-    # Collect per-pass Dice scores
-    dice_per_pass: list[dict[str, float]] = []
-    all_logits_list: list[torch.Tensor] = []
-    all_labels_list: list[torch.Tensor] = []
+    # Collect per-pass Dice scores. all_outputs is list of per-pass lists of dicts.
+    dice_per_pass: list[dict[str, float]] = []       # one entry per pass
+    all_logits_per_pass: list[list[torch.Tensor]] = []  # per-pass list of logit tensors
 
-    for output in all_outputs:
-        logits_dict = output["logits"]
-        labels_dict = output["labels"]
-        # Use first view for aggregation (typically "sax")
-        first_view = next(iter(logits_dict))
-        logits = logits_dict[first_view]
-        labels = labels_dict[first_view]
-        all_logits_list.append(logits)
-        all_labels_list.append(labels)
+    for pass_outputs in all_outputs:  # each is list of dicts for one pass
+        pass_logits: list[torch.Tensor] = []
+        pass_dice: dict[str, list[float]] = {}
+        for output in pass_outputs:
+            logits_dict = output["logits"]
+            labels_dict = output["labels"]
+            first_view = next(iter(logits_dict))
+            logits = logits_dict[first_view]
+            labels = labels_dict[first_view]
+            pass_logits.append(logits)
 
-        # Compute Dice for this pass
-        pass_metrics = segmentation_metrics(logits, labels, spacing=(1.0, 1.0, 1.0))
-        dice_scores = {k: v.item() for k, v in pass_metrics.items() if "dice" in k}
-        dice_per_pass.append(dice_scores)
+            pass_metrics = segmentation_metrics(logits, labels, spacing=spacing_dict.get(first_view, (1.0, 1.0, 1.0)))
+            for k, v in pass_metrics.items():
+                if "dice" in k:
+                    pass_dice.setdefault(k, []).append(v.item())
 
-    # Mean Dice std across classes
+        all_logits_per_pass.append(pass_logits)
+        # Average dice scores across samples for this pass
+        dice_per_pass.append({k: float(np.mean(v)) for k, v in pass_dice.items()})
+
+    # Mean Dice std across classes + per-class breakdown
     dice_keys = sorted(dice_per_pass[0].keys())
-    dice_array = np.array([[d.get(k, 0.0) for k in dice_keys] for d in dice_per_pass])  # (n_passes, n_dice_metrics)
-    mean_dice_std = float(np.mean(dice_array.std(axis=0)))
+    dice_array = np.array([[d.get(k, 0.0) for k in dice_keys] for d in dice_per_pass])
+    dice_std_per_class = dice_array.std(axis=0)  # (n_dice_metrics,)
+    mean_dice_std = float(np.mean(dice_std_per_class))
+    per_class_dice_std = {k: float(v) for k, v in zip(dice_keys, dice_std_per_class)}
 
-    # Per-voxel entropy map from stacked logits
-    stacked_logits = torch.stack(all_logits_list, dim=0)  # (n_passes, batch, n_classes, H, W, D)
-    # Average softmax across passes → predictive distribution
-    softmax_passes = torch.softmax(stacked_logits, dim=2)  # (n_passes, batch, n_classes, ...)
-    mean_softmax = softmax_passes.mean(dim=0)  # (batch, n_classes, ...)
-    mean_softmax_clipped = torch.clamp(mean_softmax, min=1e-10)
-    per_voxel_entropy = -torch.sum(mean_softmax * torch.log(mean_softmax_clipped), dim=1)  # (batch, H, W, D)
+    # Mean predictive variance — per-sample, per-class + global
+    n_passes_total = len(dice_per_pass)
+    n_samples = len(all_logits_per_pass[0]) if all_logits_per_pass else 0
+    per_sample_variance: list[np.ndarray] = []
 
-    # Mean predictive variance
-    predictive_variance = softmax_passes.var(dim=0).mean()  # scalar
-    mean_predictive_variance = float(predictive_variance.item())
+    if n_samples > 0:
+        for sample_idx in range(n_samples):
+            sample_logits = [all_logits_per_pass[p][sample_idx] for p in range(n_passes_total)
+                           if sample_idx < len(all_logits_per_pass[p])]
+            if sample_logits:
+                shapes = {tuple(s.shape) for s in sample_logits}
+                if len(shapes) == 1:
+                    stacked = torch.stack(sample_logits, dim=0)  # (n_passes, 1, n_classes, H, W, D)
+                    softmax_passes = torch.softmax(stacked.float(), dim=2)
+                    var_per_class = softmax_passes.var(dim=0).mean(dim=(-1, -2, -3)).squeeze(0)  # (n_classes,)
+                    per_sample_variance.append(var_per_class.float().cpu().numpy())
+                else:
+                    # Variable-sized volumes between passes — cannot compute inter-pass variance
+                    per_sample_variance.append(np.full(sample_logits[0].shape[1], np.nan))
 
-    # Save per-voxel entropy map
-    entropy_map_path = ""
-    if output_dir is not None:
-        output_dir = Path(output_dir)
-        output_dir.mkdir(parents=True, exist_ok=True)
-        entropy_map_path = str(output_dir / "mc_dropout_entropy_map.npy")
-        np.save(entropy_map_path, per_voxel_entropy.squeeze(0).cpu().numpy())
+    if per_sample_variance:
+        stacked_vars = np.stack(per_sample_variance, axis=0)  # (n_samples, n_classes)
+        per_class_predictive_variance = stacked_vars.mean(axis=0)  # (n_classes,)
+        mean_predictive_variance = float(np.mean(per_class_predictive_variance))
+    else:
+        per_class_predictive_variance = np.array([])
+        mean_predictive_variance = 0.0
+
+    # Mean predictive entropy (per-voxel, averaged) — Jungo & Reyes 2019, eq. (4)
+    per_sample_entropy: list[float] = []
+    if n_samples > 0:
+        for sample_idx in range(n_samples):
+            sample_logits = [all_logits_per_pass[p][sample_idx] for p in range(n_passes_total)
+                           if sample_idx < len(all_logits_per_pass[p])]
+            if sample_logits and len({tuple(s.shape) for s in sample_logits}) == 1:
+                stacked = torch.stack(sample_logits, dim=0)
+                mean_softmax = torch.softmax(stacked.float(), dim=2).mean(dim=0)
+                mean_softmax_clipped = torch.clamp(mean_softmax, min=1e-10)
+                entropy = -torch.sum(mean_softmax * torch.log(mean_softmax_clipped), dim=1)
+                per_sample_entropy.append(float(entropy.mean().item()))
+    mean_predictive_entropy = float(np.mean(per_sample_entropy)) if per_sample_entropy else 0.0
+    # Normalize by ln(n_classes) → range [0, 1]
+    if all_logits_per_pass and all_logits_per_pass[0]:
+        n_classes = all_logits_per_pass[0][0].shape[1]
+        if n_classes > 1:
+            mean_predictive_entropy = mean_predictive_entropy / np.log(n_classes)
 
     return {
         "mean_dice_std": mean_dice_std,
+        "per_class_dice_std": per_class_dice_std,
         "mean_predictive_variance": mean_predictive_variance,
-        "per_voxel_entropy_map_path": entropy_map_path,
+        "per_class_predictive_variance": per_class_predictive_variance.tolist() if per_class_predictive_variance.size > 0 else [],
+        "mean_predictive_entropy": mean_predictive_entropy,
     }
 
 
@@ -2489,8 +2535,15 @@ def _build_centralized_dataloader(
     task_type: str,
     amp_dtype: torch.dtype,
     client_id: str | None = None,
+    preloaded_train_meta: pd.DataFrame | None = None,
+    preloaded_test_meta: pd.DataFrame | None = None,
 ) -> tuple[DataLoader, dict[str, tuple[int, ...]], dict[str, tuple[float, ...]] | None]:
-    """Build a dataloader for centralized MC Dropout evaluation."""
+    """Build a dataloader for centralized MC Dropout evaluation.
+
+    Args:
+        preloaded_train_meta: Pre-loaded train metadata (avoids reloading per client).
+        preloaded_test_meta: Pre-loaded test metadata (avoids reloading per client).
+    """
     from flwr_cinema.tasks.adapters import get_centralized_task_adapter
     from omegaconf import OmegaConf
 
@@ -2501,8 +2554,8 @@ def _build_centralized_dataloader(
     data_dir = Path(cfg.data.combined.dir).expanduser()
     data_dir = resolve_data_dir_with_fallback(data_dir)
 
-    train_meta_df = load_metadata(data_dir / "train_metadata.csv", metadata_type="train")
-    test_meta_df = load_metadata(data_dir / "test_metadata.csv", metadata_type="test")
+    train_meta_df = preloaded_train_meta if preloaded_train_meta is not None else load_metadata(data_dir / "train_metadata.csv", metadata_type="train")
+    test_meta_df = preloaded_test_meta if preloaded_test_meta is not None else load_metadata(data_dir / "test_metadata.csv", metadata_type="test")
 
     if client_id is not None:
         test_meta_df = test_meta_df[test_meta_df["client"] == client_id].reset_index(drop=True)
@@ -2557,21 +2610,23 @@ def _run_mc_dropout_centralized(
     data_dir = resolve_data_dir_with_fallback(data_dir)
     test_meta_df = load_metadata(data_dir / "test_metadata.csv", metadata_type="test")
     test_meta_df = filter_metadata_by_client_config(config=config, meta_df=test_meta_df, metadata_type="test")
+    train_meta_df = load_metadata(data_dir / "train_metadata.csv", metadata_type="train")
 
-    result: dict[str, Any] = {"task_type": task_type, "n_passes": n_passes}
+    result: dict[str, Any] = {"task_type": task_type}
 
     # ── Global pool ────────────────────────────────────────────────────
     dataloader, patch_size_dict, spacing_dict = _build_centralized_dataloader(
         config=config, task_type=task_type, amp_dtype=amp_dtype
     )
-    mean, std, all_outputs = mc_dropout_predict(
+    _, _, all_outputs, all_labels = mc_dropout_predict(
         model=model, dataloader=dataloader, task_type=task_type,
         patch_size_dict=patch_size_dict, spacing_dict=spacing_dict,
         amp_dtype=amp_dtype, device=device, n_passes=n_passes,
     )
     result["global_pool"] = _build_mc_uncertainty_entry(
-        task_type=task_type, all_outputs=all_outputs, mean=mean,
-        dataloader=dataloader, output_dir=output_dir,
+        task_type=task_type, all_outputs=all_outputs, mean=np.array([]),
+        dataloader=dataloader, output_dir=output_dir, all_labels=all_labels,
+        spacing_dict=spacing_dict,
     )
 
     # ── Per-client ─────────────────────────────────────────────────────
@@ -2581,18 +2636,73 @@ def _run_mc_dropout_centralized(
             client_dl, client_ps, client_sp = _build_centralized_dataloader(
                 config=config, task_type=task_type, amp_dtype=amp_dtype,
                 client_id=client_id,
+                preloaded_train_meta=train_meta_df,
+                preloaded_test_meta=test_meta_df,
             )
-            c_mean, c_std, c_outputs = mc_dropout_predict(
+            _, _, c_outputs, c_labels = mc_dropout_predict(
                 model=model, dataloader=client_dl, task_type=task_type,
                 patch_size_dict=client_ps, spacing_dict=client_sp,
                 amp_dtype=amp_dtype, device=device, n_passes=n_passes,
             )
             per_client[client_id] = _build_mc_uncertainty_entry(
-                task_type=task_type, all_outputs=c_outputs, mean=c_mean,
+                task_type=task_type, all_outputs=c_outputs, mean=np.array([]),
                 dataloader=client_dl, output_dir=output_dir,
-                client_id=client_id,
+                client_id=client_id, all_labels=c_labels,
             )
         result["per_client"] = per_client
+
+    return result
+
+
+def compute_clinical_metrics_uncertainty(
+    all_outputs: list[np.ndarray],
+    all_labels: np.ndarray,
+    task_type: str,
+) -> dict[str, dict[str, float]]:
+    """Compute mean and std of clinical metrics across MC Dropout passes.
+
+    Args:
+        all_outputs: List of per-pass outputs. For classification: list of (n_samples, n_classes) probs.
+                     For regression: list of (n_samples,) preds.
+        all_labels: Ground truth labels, shape (n_samples,).
+        task_type: "classification" or "regression".
+
+    Returns:
+        Dict mapping metric name to {"mean": float, "std": float}.
+    """
+    import torch.nn.functional as F
+
+    metrics_per_pass: list[dict[str, float]] = []
+
+    for pass_outputs in all_outputs:
+        if task_type == "classification":
+            from models.cinema.cinema.classification.train import classification_metrics
+            probs = torch.from_numpy(pass_outputs).to(dtype=torch.float32)
+            pred_labels = torch.argmax(probs, dim=1).numpy()
+            metrics = classification_metrics(
+                true_labels=all_labels, pred_labels=pred_labels, pred_probs=pass_outputs,
+            )
+            # Add balanced accuracy
+            from sklearn.metrics import balanced_accuracy_score
+            metrics["balanced_accuracy"] = float(
+                balanced_accuracy_score(y_true=all_labels, y_pred=pred_labels)
+            )
+            metrics_per_pass.append({k: float(v) for k, v in metrics.items()})
+        elif task_type == "regression":
+            from models.cinema.cinema.regression.train import regression_metrics
+            metrics = regression_metrics(true_labels=all_labels, pred_labels=pass_outputs)
+            metrics_per_pass.append({k: float(v) for k, v in metrics.items()})
+
+    if not metrics_per_pass:
+        return {}
+
+    result: dict[str, dict[str, float]] = {}
+    for metric_name in metrics_per_pass[0].keys():
+        values = [m[metric_name] for m in metrics_per_pass]
+        result[metric_name] = {
+            "mean": float(np.mean(values)),
+            "std": float(np.std(values)),
+        }
 
     return result
 
@@ -2604,13 +2714,21 @@ def _build_mc_uncertainty_entry(
     dataloader: DataLoader,
     output_dir: Path | None,
     client_id: str | None = None,
+    all_labels: np.ndarray | None = None,
+    spacing_dict: dict[str, tuple[float, ...]] | None = None,
 ) -> dict[str, Any]:
-    """Build task-specific MC uncertainty dict from prediction outputs."""
+    """Build MC uncertainty dict with probabilistic + clinical metrics sections.
+
+    Returns a dict with two sub-keys:
+    - ``probabilistic``: entropy, MI, per-class std (classification), std+CI (regression), Dice std (seg)
+    - ``clinical_metrics``: mean and std of each clinical metric across passes
+    """
     entry: dict[str, Any] = {"n_passes": len(all_outputs)}
+    probabilistic: dict[str, Any] = {}
 
     if task_type == "classification":
         unc = compute_classification_uncertainty(all_probs=np.stack(all_outputs, axis=0))
-        entry["classification"] = {
+        probabilistic["classification"] = {
             "mean_entropy": float(unc["mean_entropy"]),
             "mutual_info": float(unc["mutual_info"]),
             "per_class_std": to_builtin(unc["per_class_std"]),
@@ -2620,7 +2738,7 @@ def _build_mc_uncertainty_entry(
         reg_std = getattr(dataloader.dataset, "reg_std", 1.0)
         stacked = np.stack(all_outputs, axis=0).squeeze(-1) if all_outputs[0].ndim == 2 else np.stack(all_outputs, axis=0)
         unc = compute_regression_uncertainty(all_preds=stacked, reg_mean=reg_mean, reg_std=reg_std)
-        entry["regression"] = {
+        probabilistic["regression"] = {
             "mean_std": float(np.mean(unc["std"])),
             "ci_lower": to_builtin(unc["ci_lower"]),
             "ci_upper": to_builtin(unc["ci_upper"]),
@@ -2629,15 +2747,69 @@ def _build_mc_uncertainty_entry(
     elif task_type == "segmentation":
         eff_output_dir = Path(output_dir) if output_dir else Path(".")
         eff_output_dir.mkdir(parents=True, exist_ok=True)
-        suffix = f"_{client_id}" if client_id else ""
-        unc = compute_segmentation_uncertainty(all_outputs=all_outputs, output_dir=eff_output_dir)
-        entry["segmentation"] = {
+        unc = compute_segmentation_uncertainty(all_outputs=all_outputs, output_dir=eff_output_dir, spacing_dict=spacing_dict)
+        probabilistic["segmentation"] = {
             "mean_dice_std": float(unc["mean_dice_std"]),
+            "per_class_dice_std": to_builtin(unc["per_class_dice_std"]),
             "mean_predictive_variance": float(unc["mean_predictive_variance"]),
-            "per_voxel_entropy_map_path": str(unc["per_voxel_entropy_map_path"]),
+            "per_class_predictive_variance": to_builtin(unc["per_class_predictive_variance"]),
+            "mean_predictive_entropy": float(unc["mean_predictive_entropy"]),
         }
 
+    entry["probabilistic"] = probabilistic
+
+    # ── Clinical metrics uncertainty (mean ± std per metric across passes) ─
+    if task_type == "segmentation" and all_outputs:
+        entry["clinical_metrics"] = _compute_segmentation_clinical_uncertainty(all_outputs, spacing_dict=spacing_dict)
+    elif all_labels is not None and task_type in ("classification", "regression"):
+        entry["clinical_metrics"] = compute_clinical_metrics_uncertainty(
+            all_outputs=all_outputs, all_labels=all_labels, task_type=task_type,
+        )
+
     return entry
+
+
+def _compute_segmentation_clinical_uncertainty(
+    all_outputs: list[list[dict[str, dict[str, torch.Tensor]]]],
+    spacing_dict: dict[str, tuple[float, ...]] | None = None,
+) -> dict[str, dict[str, float]]:
+    """Compute mean and std of segmentation clinical metrics across MC passes.
+
+    all_outputs is a list of per-pass lists of dicts:
+    [[{logits, labels}_p0_s0, ...], [{logits, labels}_p1_s0, ...]].
+    """
+    from models.cinema.cinema.segmentation.train import segmentation_metrics
+
+    # Collect per-pass aggregate metrics
+    metrics_per_pass: list[dict[str, float]] = []
+
+    for pass_outputs in all_outputs:
+        pass_metrics_accum: dict[str, list[float]] = {}
+        for output in pass_outputs:
+            logits_dict = output["logits"]
+            labels_dict = output["labels"]
+            first_view = next(iter(logits_dict))
+            logits = logits_dict[first_view]
+            labels = labels_dict[first_view]
+            sp = spacing_dict.get(first_view, (1.0, 1.0, 1.0)) if spacing_dict else (1.0, 1.0, 1.0)
+            m = segmentation_metrics(logits, labels, spacing=sp)
+            for k, v in m.items():
+                pass_metrics_accum.setdefault(k, []).append(float(v.item()))
+        # Average across samples for this pass
+        metrics_per_pass.append({k: float(np.mean(v)) for k, v in pass_metrics_accum.items()})
+
+    if not metrics_per_pass:
+        return {}
+
+    result: dict[str, dict[str, float]] = {}
+    for metric_name in metrics_per_pass[0].keys():
+        values = [m[metric_name] for m in metrics_per_pass]
+        result[metric_name] = {
+            "mean": float(np.mean(values)),
+            "std": float(np.std(values)),
+        }
+
+    return result
 
 
 def _run_mc_dropout_federated(
@@ -2652,6 +2824,7 @@ def _run_mc_dropout_federated(
     output_dir: Path | None,
 ) -> dict[str, Any]:
     """Run MC Dropout for federated: per-client (with private artifacts) + global pool."""
+    from omegaconf import OmegaConf
     from flwr_cinema.federated.evaluate import apply_private_artifacts, build_eval_dataloader
     from torch.utils.data import ConcatDataset
 
@@ -2666,7 +2839,7 @@ def _run_mc_dropout_federated(
         v: cfg.data.sax.spacing if v == "sax" else cfg.data.lax.spacing for v in views
     }
 
-    result: dict[str, Any] = {"task_type": task_type, "n_passes": n_passes}
+    result: dict[str, Any] = {"task_type": task_type}
 
     # ── Per-client (with private artifacts) ─────────────────────────────
     per_client_uncertainty: dict[str, Any] = {}
@@ -2676,14 +2849,15 @@ def _run_mc_dropout_federated(
         model.to(device)
 
         dataloader = build_eval_dataloader(dataset)
-        mean, std, all_outputs = mc_dropout_predict(
+        _, _, all_outputs, all_labels = mc_dropout_predict(
             model=model, dataloader=dataloader, task_type=task_type,
             patch_size_dict=patch_size_dict, spacing_dict=spacing_dict,
             amp_dtype=amp_dtype, device=device, n_passes=n_passes,
         )
         per_client_uncertainty[client_id] = _build_mc_uncertainty_entry(
-            task_type=task_type, all_outputs=all_outputs, mean=mean,
+            task_type=task_type, all_outputs=all_outputs, mean=np.array([]),
             dataloader=dataloader, output_dir=output_dir, client_id=client_id,
+            all_labels=all_labels,
         )
     result["per_client"] = per_client_uncertainty
 
@@ -2692,14 +2866,14 @@ def _run_mc_dropout_federated(
     model.to(device)
     pooled_dataset = ConcatDataset([ds for _, ds in datasets_by_client.values()])
     pooled_dataloader = build_eval_dataloader(pooled_dataset)
-    gp_mean, gp_std, gp_outputs = mc_dropout_predict(
+    _, _, gp_outputs, gp_labels = mc_dropout_predict(
         model=model, dataloader=pooled_dataloader, task_type=task_type,
         patch_size_dict=patch_size_dict, spacing_dict=spacing_dict,
         amp_dtype=amp_dtype, device=device, n_passes=n_passes,
     )
     result["global_pool"] = _build_mc_uncertainty_entry(
-        task_type=task_type, all_outputs=gp_outputs, mean=gp_mean,
-        dataloader=pooled_dataloader, output_dir=output_dir,
+        task_type=task_type, all_outputs=gp_outputs, mean=np.array([]),
+        dataloader=pooled_dataloader, output_dir=output_dir, all_labels=gp_labels,
     )
 
     return result
