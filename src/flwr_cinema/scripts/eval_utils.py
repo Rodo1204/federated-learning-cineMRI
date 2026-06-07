@@ -876,7 +876,12 @@ def compute_metrics_on_dataloader(
     
     # Compute metrics on normalized scale
     metrics = regression_metrics(true_labels=true_labels, pred_labels=pred_labels)
-    
+
+    # R² (scale-invariant — computed here instead of regression_metrics to keep cinema untouched)
+    ss_res = float(np.sum((true_labels - pred_labels) ** 2))
+    ss_tot = float(np.sum((true_labels - np.mean(true_labels)) ** 2))
+    metrics["r2"] = 1.0 - (ss_res / ss_tot) if ss_tot > 0 else 0.0
+
     # Denormalize and compute metrics on original scale
     restored_pred_labels = (pred_labels * reg_std) + reg_mean
     restored_true_labels = (true_labels * reg_std) + reg_mean
@@ -884,7 +889,7 @@ def compute_metrics_on_dataloader(
         true_labels=restored_true_labels,
         pred_labels=restored_pred_labels,
     )
-    restored_metrics = {f"restored_{k}": v for k, v in restored_metrics.items()}
+    restored_metrics = {f"restored_{k}": v for k, v in restored_metrics.items() if k != "r2"}
     metrics.update(restored_metrics)
     
     return metrics
@@ -1108,12 +1113,16 @@ def _evaluate_regression(
         for v in views
     }
 
-    metrics = eval_dataloader_fn(
+    # Use eval_utils compute_metrics_on_dataloader for R² support (cinema's
+    # regression_eval_dataloader is equivalent but doesn't include R²).
+    reg_mean = getattr(dataloader.dataset, "reg_mean", 0.0)
+    reg_std = getattr(dataloader.dataset, "reg_std", 1.0)
+    metrics = compute_metrics_on_dataloader(
         model=model,
         dataloader=dataloader,
-        patch_size_dict=patch_size_dict,
-        spacing_dict=spacing_dict,
-        amp_dtype=amp_dtype,
+        reg_mean=reg_mean,
+        reg_std=reg_std,
+        config=config,
         device=device,
     )
     return normalize_metric_values(metrics)
@@ -1464,7 +1473,7 @@ def mc_dropout_predict(
 
     from models.cinema.cinema.classification.train import classification_eval
     from models.cinema.cinema.regression.train import regression_eval
-    from models.cinema.cinema.segmentation.train import segmentation_eval, segmentation_metrics
+    from models.cinema.cinema.segmentation.train import segmentation_eval
 
     all_outputs: list = []
     all_labels_list: list[np.ndarray] | None = None if task_type == "segmentation" else []
@@ -1495,11 +1504,12 @@ def mc_dropout_predict(
                 elif task_type == "segmentation":
                     if spacing_dict is None:
                         raise ValueError("spacing_dict is required for segmentation MC Dropout.")
+                    # metrics_fn=None: skip metrics during passes (computed later in clinical_metrics)
                     logits_dict, _ = segmentation_eval(
                         model=model, batch=batch,
                         patch_size_dict=patch_size_dict, spacing_dict=spacing_dict,
                         amp_dtype=amp_dtype, device=device,
-                        metrics_fn=segmentation_metrics,
+                        metrics_fn=None,
                     )
                     # Crop labels to match cropped logits (same logic as segmentation_eval)
                     from models.cinema.cinema.transform import crop_start
@@ -1522,9 +1532,11 @@ def mc_dropout_predict(
 
         # Offload pass results to CPU / numpy to free GPU memory
         if task_type == "classification":
-            all_outputs.append(np.concatenate(pass_results, axis=0))
+            pass_array = np.concatenate(pass_results, axis=0)
+            all_outputs.append(pass_array)
         elif task_type == "regression":
-            all_outputs.append(np.concatenate(pass_results, axis=0))
+            pass_array = np.concatenate(pass_results, axis=0)
+            all_outputs.append(pass_array)
         elif task_type == "segmentation":
             all_outputs.append(pass_results)
 
@@ -1563,6 +1575,10 @@ def compute_classification_uncertainty(
     mean_probs_clipped = np.clip(mean_probs, 1e-10, 1.0)
     predictive_entropy = -np.sum(mean_probs * np.log(mean_probs_clipped), axis=1)  # (n_samples,)
     mean_entropy = float(np.mean(predictive_entropy))
+    # Normalize by ln(n_classes) → range [0, 1] (Jungo & Reyes 2019)
+    n_classes = all_probs.shape[2]
+    if n_classes > 1:
+        mean_entropy = mean_entropy / np.log(n_classes)
 
     # Expected entropy: mean of per-pass entropies
     probs_clipped = np.clip(all_probs, 1e-10, 1.0)
@@ -1624,6 +1640,175 @@ def compute_regression_uncertainty(
     }
 
 
+def compute_regression_clinical_metrics_uncertainty(
+    all_preds: np.ndarray,
+    labels: np.ndarray,
+    reg_mean: float,
+    reg_std: float,
+) -> dict[str, float]:
+    """Compute flat-scalar clinical metrics for regression MC Dropout.
+
+    Computes metrics on the predictive mean mu = mean(all_preds, axis=0),
+    NOT per-pass averages. Returns flat floats only — no descriptive fields.
+
+    Args:
+        all_preds: Stacked predictions of shape (n_passes, n_samples).
+        labels: Ground truth labels, shape (n_samples,).
+        reg_mean: Normalization mean for restoring scales.
+        reg_std: Normalization std for restoring scales.
+
+    Returns:
+        Dict with flat float scalars:
+        rmse, restored_rmse, mae, restored_mae, r2,
+        picp, mpiw, restored_mpiw, nll.
+    """
+    # Squeeze labels to (n_samples,) to prevent NumPy broadcasting bug:
+    # labels from DataLoader are (n_samples, 1), mu is (n_samples,).
+    # (n_samples, 1) - (n_samples,) broadcasts to (n_samples, n_samples).
+    labels = labels.squeeze()
+
+    mu = all_preds.mean(axis=0)  # predictive mean (n_samples,)
+    sample_std = all_preds.std(axis=0)
+
+    # RMSE / MAE on predictive mean
+    abs_error = np.abs(labels - mu)
+    rmse = float(np.sqrt(np.mean(abs_error ** 2)))
+    mae = float(np.mean(abs_error))
+    restored_rmse = rmse * reg_std
+    restored_mae = mae * reg_std
+
+    # R² on predictive mean
+    ss_res = float(np.sum((labels - mu) ** 2))
+    ss_tot = float(np.sum((labels - np.mean(labels)) ** 2))
+    r2 = 1.0 - (ss_res / ss_tot) if ss_tot > 0 else 0.0
+
+    # PICP
+    ci_lower = mu - 1.96 * sample_std
+    ci_upper = mu + 1.96 * sample_std
+    within = (labels >= ci_lower) & (labels <= ci_upper)
+    picp = float(np.mean(within))
+
+    # MPIW
+    mpiw = 3.92 * float(np.mean(sample_std))
+    restored_mpiw = mpiw * reg_std
+
+    # NLL (normalized scale only, no restored variant)
+    eps = 1e-3
+    sigma_clamped = np.maximum(sample_std, eps)
+    nll = float(np.mean(
+        0.5 * (np.log(2 * np.pi * sigma_clamped ** 2) + (labels - mu) ** 2 / sigma_clamped ** 2)
+    ))
+
+    return {
+        "rmse": rmse,
+        "restored_rmse": restored_rmse,
+        "mae": mae,
+        "restored_mae": restored_mae,
+        "r2": float(r2),
+        "picp": picp,
+        "mpiw": mpiw,
+        "restored_mpiw": restored_mpiw,
+        "nll": nll,
+        "ss_res": ss_res,
+        "ss_tot": ss_tot,
+        "mean_y": float(np.mean(labels)),
+    }
+
+
+def compute_classification_clinical_metrics_uncertainty(
+    all_outputs: list[np.ndarray],
+    all_labels: np.ndarray,
+) -> dict[str, dict[str, float] | dict[str, dict[str, float]]]:
+    """Compute classification clinical metrics with consensus and per-pass sections.
+
+    Consensus metrics are computed on ``argmax(mean_t(probs_t))`` — the Bayesian
+    model's averaged prediction.  Per-pass metrics capture variability across
+    dropout realisations using ``{mean, std}`` envelopes.
+
+    Args:
+        all_outputs: List of per-pass probability arrays, each (n_samples, n_classes).
+        all_labels: Ground truth labels, shape (n_samples,) or (n_samples, 1).
+
+    Returns:
+        Dict with two top-level keys:
+        - ``consensus``: flat float scalars (accuracy, balanced_accuracy, f1, mcc,
+          roc_auc, cross_entropy, [specificity, sensitivity,] n_samples).
+        - ``per_pass``: ``{metric: {"mean": float, "std": float}}`` for each
+          metric (same keys minus n_samples).
+    """
+    from models.cinema.cinema.classification.train import classification_metrics
+    from sklearn.metrics import balanced_accuracy_score
+
+    # Defensive squeeze — DataLoader yields (n_samples, 1).
+    labels = all_labels.squeeze()
+
+    stacked = np.stack(all_outputs, axis=0)  # (n_passes, n_samples, n_classes)
+    n_passes = stacked.shape[0]
+
+    # ── Consensus ───────────────────────────────────────────────────────
+    consensus_probs = stacked.mean(axis=0)  # (n_samples, n_classes)
+    consensus_labels = np.argmax(consensus_probs, axis=1)
+
+    consensus_metrics = classification_metrics(
+        true_labels=labels,
+        pred_labels=consensus_labels,
+        pred_probs=consensus_probs,
+    )
+    consensus_metrics["balanced_accuracy"] = float(
+        balanced_accuracy_score(y_true=labels, y_pred=consensus_labels)
+    )
+
+    # Cross-entropy on consensus probs: -mean(sum(onehot * log(probs)))
+    eps = 1e-6
+    n_classes = consensus_probs.shape[1]
+    onehot = np.eye(n_classes)[labels.astype(int)]
+    cross_entropy = float(-np.mean(np.sum(onehot * np.log(consensus_probs + eps), axis=1)))
+
+    # Discard the per-pass 'entropy' from classification_metrics; use our cross_entropy.
+    consensus_metrics.pop("entropy", None)
+    consensus_metrics["cross_entropy"] = cross_entropy
+    consensus_metrics["n_samples"] = float(len(labels))
+
+    consensus_flat = {k: float(v) for k, v in consensus_metrics.items()}
+
+    # ── Per-pass ────────────────────────────────────────────────────────
+    metrics_per_pass: list[dict[str, float]] = []
+    for t in range(n_passes):
+        pred_labels_t = np.argmax(stacked[t], axis=1)
+        metrics_t = classification_metrics(
+            true_labels=labels,
+            pred_labels=pred_labels_t,
+            pred_probs=stacked[t],
+        )
+        metrics_t["balanced_accuracy"] = float(
+            balanced_accuracy_score(y_true=labels, y_pred=pred_labels_t)
+        )
+        # Rename entropy → cross_entropy per pass.
+        metrics_t.pop("entropy", None)
+        metrics_t["cross_entropy"] = float(
+            -np.mean(np.sum(onehot * np.log(stacked[t] + eps), axis=1))
+        )
+        metrics_per_pass.append({k: float(v) for k, v in metrics_t.items()})
+
+    # Aggregate: NaN-skipping mean/std per metric.
+    per_pass_agg: dict[str, dict[str, float]] = {}
+    if metrics_per_pass:
+        for metric_name in metrics_per_pass[0]:
+            if metric_name == "n_samples":
+                continue
+            values = np.array([m[metric_name] for m in metrics_per_pass], dtype=float)
+            valid = values[~np.isnan(values)]
+            if len(valid) == 0:
+                per_pass_agg[metric_name] = {"mean": float("nan"), "std": float("nan")}
+            else:
+                per_pass_agg[metric_name] = {
+                    "mean": float(np.mean(valid)),
+                    "std": float(np.std(valid)),
+                }
+
+    return {"consensus": consensus_flat, "per_pass": per_pass_agg}
+
+
 def compute_segmentation_uncertainty(
     all_outputs: list[list[dict[str, dict[str, torch.Tensor]]]],
     output_dir: Path | None = None,
@@ -1641,8 +1826,6 @@ def compute_segmentation_uncertainty(
         - mean_dice_std: mean std of Dice scores across passes
         - mean_predictive_variance: mean predictive variance across voxels
     """
-    from models.cinema.cinema.segmentation.train import segmentation_metrics
-
     # Collect per-pass Dice scores. all_outputs is list of per-pass lists of dicts.
     dice_per_pass: list[dict[str, float]] = []       # one entry per pass
     all_logits_per_pass: list[list[torch.Tensor]] = []  # per-pass list of logit tensors
@@ -1658,10 +1841,11 @@ def compute_segmentation_uncertainty(
             labels = labels_dict[first_view]
             pass_logits.append(logits)
 
-            pass_metrics = segmentation_metrics(logits, labels, spacing=spacing_dict.get(first_view, (1.0, 1.0, 1.0)))
+            sp = spacing_dict.get(first_view, (1.0, 1.0, 1.0)) if spacing_dict else (1.0, 1.0, 1.0)
+            pass_metrics = _segmentation_clinical_metrics(logits, labels, spacing=sp)
             for k, v in pass_metrics.items():
                 if "dice" in k:
-                    pass_dice.setdefault(k, []).append(v.item())
+                    pass_dice.setdefault(k, []).append(v)
 
         all_logits_per_pass.append(pass_logits)
         # Average dice scores across samples for this pass
@@ -1688,7 +1872,7 @@ def compute_segmentation_uncertainty(
                 if len(shapes) == 1:
                     stacked = torch.stack(sample_logits, dim=0)  # (n_passes, 1, n_classes, H, W, D)
                     softmax_passes = torch.softmax(stacked.float(), dim=2)
-                    var_per_class = softmax_passes.var(dim=0).mean(dim=(-1, -2, -3)).squeeze(0)  # (n_classes,)
+                    var_per_class = softmax_passes.var(dim=0, unbiased=False).mean(dim=(-1, -2, -3)).squeeze(0)  # (n_classes,)
                     per_sample_variance.append(var_per_class.float().cpu().numpy())
                 else:
                     # Variable-sized volumes between passes — cannot compute inter-pass variance
@@ -1704,6 +1888,7 @@ def compute_segmentation_uncertainty(
 
     # Mean predictive entropy (per-voxel, averaged) — Jungo & Reyes 2019, eq. (4)
     per_sample_entropy: list[float] = []
+    per_sample_entropy_fg: list[float] = []  # foreground only (predicted labels > 0)
     if n_samples > 0:
         for sample_idx in range(n_samples):
             sample_logits = [all_logits_per_pass[p][sample_idx] for p in range(n_passes_total)
@@ -1714,20 +1899,40 @@ def compute_segmentation_uncertainty(
                 mean_softmax_clipped = torch.clamp(mean_softmax, min=1e-10)
                 entropy = -torch.sum(mean_softmax * torch.log(mean_softmax_clipped), dim=1)
                 per_sample_entropy.append(float(entropy.mean().item()))
+                # Foreground uncertainty should be prediction-derived, not label-derived.
+                predicted_foreground = torch.argmax(mean_softmax, dim=1).squeeze(0) > 0
+                fg_entropy = entropy.squeeze(0)[predicted_foreground]
+                if fg_entropy.numel() > 0:
+                    per_sample_entropy_fg.append(float(fg_entropy.mean().item()))
     mean_predictive_entropy = float(np.mean(per_sample_entropy)) if per_sample_entropy else 0.0
+    mean_predictive_entropy_fg = float(np.mean(per_sample_entropy_fg)) if per_sample_entropy_fg else 0.0
     # Normalize by ln(n_classes) → range [0, 1]
     if all_logits_per_pass and all_logits_per_pass[0]:
         n_classes = all_logits_per_pass[0][0].shape[1]
         if n_classes > 1:
             mean_predictive_entropy = mean_predictive_entropy / np.log(n_classes)
+            mean_predictive_entropy_fg = mean_predictive_entropy_fg / np.log(n_classes)
 
     return {
         "mean_dice_std": mean_dice_std,
         "per_class_dice_std": per_class_dice_std,
         "mean_predictive_variance": mean_predictive_variance,
-        "per_class_predictive_variance": per_class_predictive_variance.tolist() if per_class_predictive_variance.size > 0 else [],
+        "per_class_predictive_variance": _label_predictive_variance(per_class_predictive_variance),
         "mean_predictive_entropy": mean_predictive_entropy,
+        "mean_predictive_entropy_foreground": mean_predictive_entropy_fg,
     }
+
+
+def _label_predictive_variance(values: np.ndarray) -> dict[str, float]:
+    """Label per-class predictive variance with channel names.
+
+    Channel 0 = background, then class_1, class_2, ...
+    """
+    n = len(values)
+    if n == 0:
+        return {}
+    labels = ["background"] + [f"class_{i}" for i in range(1, n)]
+    return {labels[i]: float(values[i]) for i in range(min(n, len(labels)))}
 
 
 # ============================================================================
@@ -1864,13 +2069,11 @@ def _compute_fairness_from_per_client(
 
 def build_unified_result_payload(
     config: dict[str, Any],
-    global_pool_metrics: dict[str, float],
     per_client_metrics: dict[str, tuple[int, dict[str, float]]],
     primary_metric: str,
     is_federated: bool = False,
     checkpoint_selection_mode: str | None = None,
     checkpoint_round: int | None = None,
-    global_pool_model_variant: str | None = None,
 ) -> dict[str, Any]:
     """Build unified result payload with new schema.
 
@@ -1878,7 +2081,6 @@ def build_unified_result_payload(
     {
         "config": {...},
         "overall": {
-            "global_pool": {...},
             "weighted_avg": {...},
             "macro_avg": {...},
         },
@@ -1886,7 +2088,7 @@ def build_unified_result_payload(
         "fairness": {...},
     }
 
-    Federated mode adds: checkpoint_selection_mode, checkpoint_round, global_pool_model_variant to config.
+    Federated mode adds: checkpoint_selection_mode and checkpoint_round to config.
     """
     # Compute weighted and macro averages
     weighted_metrics: dict[str, float] = {}
@@ -1928,8 +2130,6 @@ def build_unified_result_payload(
             output_config["checkpoint_selection_mode"] = checkpoint_selection_mode
         if checkpoint_round is not None:
             output_config["checkpoint_round"] = checkpoint_round
-        if global_pool_model_variant is not None:
-            output_config["global_pool_model_variant"] = global_pool_model_variant
 
     # Build fairness
     fairness = _compute_fairness_from_per_client(per_client_metrics, primary_metric)
@@ -1937,7 +2137,6 @@ def build_unified_result_payload(
     payload = {
         "config": output_config,
         "overall": {
-            "global_pool": to_builtin(global_pool_metrics),
             "weighted_avg": to_builtin(weighted_metrics),
             "macro_avg": to_builtin(macro_metrics),
         },
@@ -1967,11 +2166,10 @@ def run_unified_evaluation(
     a. Checkpoint resolution
     b. Model building via task adapters
     c. Weight loading
-    d. Global pool evaluation
-    e. Per-client evaluation
-    f. Weighted average + macro average (overall)
-    g. Fairness metrics
-    h. JSON output with new schema
+    d. Per-client evaluation
+    e. Weighted average + macro average (overall)
+    f. Fairness metrics
+    g. JSON output with new schema
 
     MC Dropout (PR #2): when ``mc_dropout=True``, runs stochastic forward passes
     and appends uncertainty metrics under ``mc_dropout_uncertainty`` key.
@@ -2037,29 +2235,7 @@ def run_unified_evaluation(
     model.eval()
     orc_logger.info(f"Loaded model on device {device} (use_lora={use_lora})")
 
-    # ── d. Global pool evaluation ─────────────────────────────────────────
-    if is_federated:
-        global_pool_metrics, global_pool_variant = _run_federated_global_pool(
-            model=model,
-            checkpoint=checkpoint,
-            config=config,
-            task_type=task,
-            device=device,
-            base_state={k: v.detach().cpu().clone() for k, v in model.state_dict().items()},
-        )
-    else:
-        global_pool_metrics = _run_centralized_global_pool(
-            model=model,
-            config=config,
-            task_type=task,
-            device=device,
-            amp_dtype=amp_dtype,
-        )
-        global_pool_variant = None
-
-    orc_logger.info(f"Global pool metrics: {global_pool_metrics}")
-
-    # ── e. Per-client evaluation ──────────────────────────────────────────
+    # ── d. Per-client evaluation ──────────────────────────────────────────
     if is_federated:
         per_client_metrics = _run_federated_per_client(
             model=model,
@@ -2146,13 +2322,11 @@ def run_unified_evaluation(
 
     payload = build_unified_result_payload(
         config=payload_config,
-        global_pool_metrics=global_pool_metrics,
         per_client_metrics=per_client_metrics,
         primary_metric=primary_metric,
         is_federated=is_federated,
         checkpoint_selection_mode=selection_meta.get("mode"),
         checkpoint_round=selection_meta.get("selected_round"),
-        global_pool_model_variant=global_pool_variant,
     )
 
     # Add MC Dropout uncertainty results to payload
@@ -2296,86 +2470,6 @@ def _extract_primary_metric_meta(config: dict[str, Any]) -> tuple[str, str]:
     return metric.strip(), mode.strip().lower()
 
 
-def _run_centralized_global_pool(
-    model: torch.nn.Module,
-    config: dict[str, Any],
-    task_type: str,
-    device: torch.device,
-    amp_dtype: torch.dtype,
-) -> dict[str, float]:
-    """Run global pool evaluation for centralized mode."""
-    from flwr_cinema.tasks.adapters import get_centralized_task_adapter
-    from omegaconf import OmegaConf
-
-    cfg = OmegaConf.create(config)
-    adapter = get_centralized_task_adapter(cfg)
-    task_spec = adapter.task_spec
-    eval_dataloader_fn = task_spec.eval_fn_factory()
-
-    data_dir = Path(cfg.data.combined.dir).expanduser()
-    data_dir = resolve_data_dir_with_fallback(data_dir)
-
-    if task_type == "classification":
-        target_col = cfg.data.class_column
-    elif task_type == "regression":
-        target_col = cfg.data.regression_column
-    else:
-        target_col = None
-
-    train_meta_df = load_metadata(data_dir / "train_metadata.csv", metadata_type="train")
-    test_meta_df = load_metadata(data_dir / "test_metadata.csv", metadata_type="test")
-
-    # Apply client filtering
-    test_meta_df = filter_metadata_by_client_config(config=config, meta_df=test_meta_df, metadata_type="test")
-
-    _, val_transform = task_spec.transform_factory(cfg)
-
-    views = [cfg.model.views] if isinstance(cfg.model.views, str) else cfg.model.views
-    patch_size_dict = {
-        v: cfg.data.sax.patch_size if v == "sax" else cfg.data.lax.patch_size for v in views
-    }
-    spacing_dict = {
-        v: cfg.data.sax.spacing if v == "sax" else cfg.data.lax.spacing for v in views
-    }
-
-    overall_dataset = task_spec.dataset_factory(
-        config=cfg,
-        data_dir=data_dir / "test",
-        meta_df=test_meta_df,
-        transform=val_transform,
-        train_meta_df=train_meta_df,
-    )
-
-    overall_dataloader = DataLoader(
-        dataset=overall_dataset,
-        sampler=SequentialSampler(overall_dataset),
-        batch_size=1,
-        drop_last=False,
-        pin_memory=True,
-        num_workers=cfg.train.n_workers,
-    )
-
-    if task_type == "classification":
-        metrics, _, _ = classification_eval_dataloader_with_balanced_accuracy(
-            model=model,
-            dataloader=overall_dataloader,
-            patch_size_dict=patch_size_dict,
-            amp_dtype=amp_dtype,
-            device=device,
-        )
-    else:
-        metrics = eval_dataloader_fn(
-            model=model,
-            dataloader=overall_dataloader,
-            patch_size_dict=patch_size_dict,
-            spacing_dict=spacing_dict,
-            amp_dtype=amp_dtype,
-            device=device,
-        )
-
-    return normalize_metric_values(metrics)
-
-
 def _run_centralized_per_client(
     model: torch.nn.Module,
     config: dict[str, Any],
@@ -2441,47 +2535,22 @@ def _run_centralized_per_client(
                 device=device,
             )
         else:
-            metrics = eval_dataloader_fn(
+            # Use eval_utils compute_metrics_on_dataloader for R² support (cinema's
+            # regression_eval_dataloader is equivalent but doesn't include R²).
+            reg_mean = getattr(client_dataset, "reg_mean", 0.0)
+            reg_std = getattr(client_dataset, "reg_std", 1.0)
+            metrics = compute_metrics_on_dataloader(
                 model=model,
                 dataloader=client_dataloader,
-                patch_size_dict=patch_size_dict,
-                spacing_dict=spacing_dict,
-                amp_dtype=amp_dtype,
+                reg_mean=reg_mean,
+                reg_std=reg_std,
+                config=config,
                 device=device,
             )
 
         per_client_metrics[client_id] = (n_samples, normalize_metric_values(metrics))
 
     return per_client_metrics
-
-
-def _run_federated_global_pool(
-    model: torch.nn.Module,
-    checkpoint: dict[str, Any],
-    config: dict[str, Any],
-    task_type: str,
-    device: torch.device,
-    base_state: dict[str, torch.Tensor],
-) -> tuple[dict[str, float], str]:
-    """Run global pool evaluation for federated mode (reuses existing federated helpers)."""
-    from flwr_cinema.federated.evaluate import (
-        evaluate_global_pool,
-        has_private_artifacts,
-    )
-
-    datasets_by_client, evaluate_fn = _load_federated_client_datasets(config, task_type)
-
-    variant, metrics = evaluate_global_pool(
-        model=model,
-        checkpoint=checkpoint,
-        evaluate_fn=evaluate_fn,
-        config=config,
-        task_type=task_type,
-        datasets_by_client=datasets_by_client,
-        base_state=base_state,
-        device=device,
-    )
-    return metrics, variant
 
 
 def _run_federated_per_client(
@@ -2585,8 +2654,8 @@ def _build_centralized_dataloader(
         sampler=SequentialSampler(dataset),
         batch_size=1,
         drop_last=False,
-        pin_memory=True,
-        num_workers=cfg.train.n_workers,
+        pin_memory=False,  # MC dropout: avoid CUDA pinned memory exhaustion
+        num_workers=0,
     )
 
     return dataloader, patch_size_dict, spacing_dict
@@ -2601,7 +2670,7 @@ def _run_mc_dropout_centralized(
     n_passes: int,
     output_dir: Path | None,
 ) -> dict[str, Any]:
-    """Run MC Dropout uncertainty for centralized: global pool + per-client."""
+    """Run MC Dropout uncertainty for centralized per-client evaluation."""
     from omegaconf import OmegaConf
     from flwr_cinema.scripts.eval_utils import load_metadata, resolve_data_dir_with_fallback, filter_metadata_by_client_config
 
@@ -2614,21 +2683,6 @@ def _run_mc_dropout_centralized(
 
     result: dict[str, Any] = {"task_type": task_type}
 
-    # ── Global pool ────────────────────────────────────────────────────
-    dataloader, patch_size_dict, spacing_dict = _build_centralized_dataloader(
-        config=config, task_type=task_type, amp_dtype=amp_dtype
-    )
-    _, _, all_outputs, all_labels = mc_dropout_predict(
-        model=model, dataloader=dataloader, task_type=task_type,
-        patch_size_dict=patch_size_dict, spacing_dict=spacing_dict,
-        amp_dtype=amp_dtype, device=device, n_passes=n_passes,
-    )
-    result["global_pool"] = _build_mc_uncertainty_entry(
-        task_type=task_type, all_outputs=all_outputs, mean=np.array([]),
-        dataloader=dataloader, output_dir=output_dir, all_labels=all_labels,
-        spacing_dict=spacing_dict,
-    )
-
     # ── Per-client ─────────────────────────────────────────────────────
     if "client" in test_meta_df.columns:
         per_client: dict[str, Any] = {}
@@ -2639,16 +2693,24 @@ def _run_mc_dropout_centralized(
                 preloaded_train_meta=train_meta_df,
                 preloaded_test_meta=test_meta_df,
             )
-            _, _, c_outputs, c_labels = mc_dropout_predict(
-                model=model, dataloader=client_dl, task_type=task_type,
-                patch_size_dict=client_ps, spacing_dict=client_sp,
-                amp_dtype=amp_dtype, device=device, n_passes=n_passes,
-            )
-            per_client[client_id] = _build_mc_uncertainty_entry(
-                task_type=task_type, all_outputs=c_outputs, mean=np.array([]),
-                dataloader=client_dl, output_dir=output_dir,
-                client_id=client_id, all_labels=c_labels,
-            )
+            if task_type == "segmentation":
+                per_client[client_id] = _run_segmentation_mc_dropout_streaming_entry(
+                    model=model, dataloader=client_dl,
+                    patch_size_dict=client_ps, spacing_dict=client_sp or {},
+                    amp_dtype=amp_dtype, device=device, n_passes=n_passes,
+                )
+            else:
+                _, _, c_outputs, c_labels = mc_dropout_predict(
+                    model=model, dataloader=client_dl, task_type=task_type,
+                    patch_size_dict=client_ps, spacing_dict=client_sp,
+                    amp_dtype=amp_dtype, device=device, n_passes=n_passes,
+                )
+                per_client[client_id] = _build_mc_uncertainty_entry(
+                    task_type=task_type, all_outputs=c_outputs, mean=np.array([]),
+                    dataloader=client_dl, output_dir=output_dir,
+                    client_id=client_id, all_labels=c_labels,
+                    spacing_dict=client_sp,
+                )
         result["per_client"] = per_client
 
     return result
@@ -2658,6 +2720,8 @@ def compute_clinical_metrics_uncertainty(
     all_outputs: list[np.ndarray],
     all_labels: np.ndarray,
     task_type: str,
+    reg_mean: float | None = None,
+    reg_std: float | None = None,
 ) -> dict[str, dict[str, float]]:
     """Compute mean and std of clinical metrics across MC Dropout passes.
 
@@ -2666,6 +2730,8 @@ def compute_clinical_metrics_uncertainty(
                      For regression: list of (n_samples,) preds.
         all_labels: Ground truth labels, shape (n_samples,).
         task_type: "classification" or "regression".
+        reg_mean: Regression normalization mean, when task_type is "regression".
+        reg_std: Regression normalization std, when task_type is "regression".
 
     Returns:
         Dict mapping metric name to {"mean": float, "std": float}.
@@ -2691,6 +2757,12 @@ def compute_clinical_metrics_uncertainty(
         elif task_type == "regression":
             from models.cinema.cinema.regression.train import regression_metrics
             metrics = regression_metrics(true_labels=all_labels, pred_labels=pass_outputs)
+            if reg_mean is not None and reg_std is not None:
+                restored_metrics = regression_metrics(
+                    true_labels=(all_labels * reg_std) + reg_mean,
+                    pred_labels=(pass_outputs * reg_std) + reg_mean,
+                )
+                metrics.update({f"restored_{k}": v for k, v in restored_metrics.items() if k != "r2"})
             metrics_per_pass.append({k: float(v) for k, v in metrics.items()})
 
     if not metrics_per_pass:
@@ -2733,17 +2805,23 @@ def _build_mc_uncertainty_entry(
             "mutual_info": float(unc["mutual_info"]),
             "per_class_std": to_builtin(unc["per_class_std"]),
         }
+        if all_labels is not None:
+            entry["n_samples"] = len(all_labels)
     elif task_type == "regression":
         reg_mean = getattr(dataloader.dataset, "reg_mean", 0.0)
         reg_std = getattr(dataloader.dataset, "reg_std", 1.0)
         stacked = np.stack(all_outputs, axis=0).squeeze(-1) if all_outputs[0].ndim == 2 else np.stack(all_outputs, axis=0)
-        unc = compute_regression_uncertainty(all_preds=stacked, reg_mean=reg_mean, reg_std=reg_std)
+        unc = compute_regression_uncertainty(
+            all_preds=stacked, reg_mean=reg_mean, reg_std=reg_std,
+        )
         probabilistic["regression"] = {
             "mean_std": float(np.mean(unc["std"])),
             "ci_lower": to_builtin(unc["ci_lower"]),
             "ci_upper": to_builtin(unc["ci_upper"]),
             "restored_mean_std": float(np.mean(unc["restored_std"])),
         }
+        if all_labels is not None:
+            entry["n_samples"] = len(all_labels)
     elif task_type == "segmentation":
         eff_output_dir = Path(output_dir) if output_dir else Path(".")
         eff_output_dir.mkdir(parents=True, exist_ok=True)
@@ -2754,6 +2832,7 @@ def _build_mc_uncertainty_entry(
             "mean_predictive_variance": float(unc["mean_predictive_variance"]),
             "per_class_predictive_variance": to_builtin(unc["per_class_predictive_variance"]),
             "mean_predictive_entropy": float(unc["mean_predictive_entropy"]),
+            "mean_predictive_entropy_foreground": float(unc["mean_predictive_entropy_foreground"]),
         }
 
     entry["probabilistic"] = probabilistic
@@ -2761,12 +2840,64 @@ def _build_mc_uncertainty_entry(
     # ── Clinical metrics uncertainty (mean ± std per metric across passes) ─
     if task_type == "segmentation" and all_outputs:
         entry["clinical_metrics"] = _compute_segmentation_clinical_uncertainty(all_outputs, spacing_dict=spacing_dict)
-    elif all_labels is not None and task_type in ("classification", "regression"):
-        entry["clinical_metrics"] = compute_clinical_metrics_uncertainty(
-            all_outputs=all_outputs, all_labels=all_labels, task_type=task_type,
+    elif task_type == "regression" and all_labels is not None:
+        reg_mean = getattr(dataloader.dataset, "reg_mean", 0.0)
+        reg_std = getattr(dataloader.dataset, "reg_std", 1.0)
+        stacked_cm = np.stack(all_outputs, axis=0).squeeze(-1) if all_outputs[0].ndim == 2 else np.stack(all_outputs, axis=0)
+        entry["clinical_metrics"] = compute_regression_clinical_metrics_uncertainty(
+            all_preds=stacked_cm, labels=all_labels,
+            reg_mean=reg_mean, reg_std=reg_std,
+        )
+    elif all_labels is not None and task_type == "classification":
+        entry["clinical_metrics"] = compute_classification_clinical_metrics_uncertainty(
+            all_outputs=all_outputs,
+            all_labels=all_labels,
         )
 
     return entry
+
+
+def _segmentation_clinical_metrics(
+    logits: torch.Tensor,
+    labels: torch.Tensor,
+    spacing: tuple[float, ...],
+) -> dict[str, float]:
+    """Lightweight segmentation metrics (Dice, IoU, Stability, Volume) — no Hausdorff.
+
+    Mirrors ``segmentation_metrics`` from cinema but skips the expensive
+    ``compute_hausdorff_distance`` to avoid memory fragmentation with many passes.
+    """
+    import torch.nn.functional as F
+
+    from monai.metrics import compute_dice, compute_iou
+    from cinema.metric import get_volumes, stability_score
+
+    n_classes = logits.shape[1] - 1
+    labels_1d = labels.squeeze(dim=1).long()
+
+    pred_labels = torch.argmax(logits, dim=1)
+    pred_mask = F.one_hot(pred_labels, n_classes + 1).moveaxis(-1, 1)
+    true_mask = F.one_hot(labels_1d, n_classes + 1).moveaxis(-1, 1)
+
+    dice = compute_dice(y_pred=pred_mask, y=true_mask, num_classes=n_classes + 1)
+    iou = compute_iou(y_pred=pred_mask, y=true_mask)
+    stability = stability_score(logits=logits)
+    true_volumes = get_volumes(mask=true_mask, spacing=spacing)
+    pred_volumes = get_volumes(mask=pred_mask, spacing=spacing)
+
+    result: dict[str, float] = {}
+    for i in range(n_classes):
+        cls_idx = i + 1
+        result[f"class_{cls_idx}_dice_score"] = float(dice[0, cls_idx].item())
+        result[f"class_{cls_idx}_iou_score"] = float(iou[0, cls_idx].item())
+        result[f"class_{cls_idx}_stability_score"] = float(stability[0, cls_idx].item())
+        result[f"class_{cls_idx}_true_volume"] = float(true_volumes[0, cls_idx].item())
+        result[f"class_{cls_idx}_pred_volume"] = float(pred_volumes[0, cls_idx].item())
+
+    result["mean_dice_score"] = float(dice[0, 1:].mean().item())
+    result["mean_iou_score"] = float(iou[0, 1:].mean().item())
+    result["mean_stability_score"] = float(stability[0, 1:].mean().item())
+    return result
 
 
 def _compute_segmentation_clinical_uncertainty(
@@ -2775,12 +2906,9 @@ def _compute_segmentation_clinical_uncertainty(
 ) -> dict[str, dict[str, float]]:
     """Compute mean and std of segmentation clinical metrics across MC passes.
 
-    all_outputs is a list of per-pass lists of dicts:
-    [[{logits, labels}_p0_s0, ...], [{logits, labels}_p1_s0, ...]].
+    Uses lightweight metrics (no Hausdorff) to avoid OOM.
     """
-    from models.cinema.cinema.segmentation.train import segmentation_metrics
 
-    # Collect per-pass aggregate metrics
     metrics_per_pass: list[dict[str, float]] = []
 
     for pass_outputs in all_outputs:
@@ -2792,10 +2920,9 @@ def _compute_segmentation_clinical_uncertainty(
             logits = logits_dict[first_view]
             labels = labels_dict[first_view]
             sp = spacing_dict.get(first_view, (1.0, 1.0, 1.0)) if spacing_dict else (1.0, 1.0, 1.0)
-            m = segmentation_metrics(logits, labels, spacing=sp)
+            m = _segmentation_clinical_metrics(logits, labels, spacing=sp)
             for k, v in m.items():
-                pass_metrics_accum.setdefault(k, []).append(float(v.item()))
-        # Average across samples for this pass
+                pass_metrics_accum.setdefault(k, []).append(v)
         metrics_per_pass.append({k: float(np.mean(v)) for k, v in pass_metrics_accum.items()})
 
     if not metrics_per_pass:
@@ -2812,6 +2939,215 @@ def _compute_segmentation_clinical_uncertainty(
     return result
 
 
+def _run_segmentation_mc_dropout_streaming_entry(
+    model: torch.nn.Module,
+    dataloader: DataLoader,
+    patch_size_dict: dict[str, tuple[int, ...]],
+    spacing_dict: dict[str, tuple[float, ...]],
+    amp_dtype: torch.dtype,
+    device: torch.device,
+    n_passes: int,
+) -> dict[str, Any]:
+    """Compute segmentation MC Dropout uncertainty without storing all pass logits."""
+    from models.cinema.cinema.segmentation.train import segmentation_eval
+    from models.cinema.cinema.transform import crop_start
+
+    def _crop_labels(batch: dict[str, torch.Tensor], logits_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+        labels_cpu: dict[str, torch.Tensor] = {}
+        for view in logits_dict:
+            width = int(batch[f"{view}_width"][0])
+            height = int(batch[f"{view}_height"][0])
+            label = batch[f"{view}_label"]
+            if len(patch_size_dict[view]) == 3:
+                n_slices = int(batch["n_slices"][0])
+                label = crop_start(label, (*label.shape[:2], width, height, n_slices))
+            elif len(patch_size_dict[view]) == 2:
+                label = crop_start(label, (*label.shape[:2], width, height))
+            labels_cpu[view] = label.cpu()
+        return labels_cpu
+
+    pass_metrics_accum: list[dict[str, list[float]]] = [dict() for _ in range(n_passes)]
+    per_sample_variance: list[np.ndarray] = []
+    per_sample_entropy: list[float] = []
+    per_sample_entropy_fg: list[float] = []
+    n_samples = 0
+
+    for batch in dataloader:
+        probs_sum: torch.Tensor | None = None
+        probs_sq_sum: torch.Tensor | None = None
+        first_view: str | None = None
+
+        for pass_idx in range(n_passes):
+            with torch.autocast("cuda", dtype=amp_dtype, enabled=torch.cuda.is_available()):
+                logits_dict, _ = segmentation_eval(
+                    model=model,
+                    batch=batch,
+                    patch_size_dict=patch_size_dict,
+                    spacing_dict=spacing_dict,
+                    amp_dtype=amp_dtype,
+                    device=device,
+                    metrics_fn=None,
+                )
+
+            cpu_logits = {view: logits.detach().cpu() for view, logits in logits_dict.items()}
+            labels_cpu = _crop_labels(batch, logits_dict)
+
+            first_view = next(iter(cpu_logits))
+            logits = cpu_logits[first_view]
+            labels = labels_cpu[first_view]
+            sp = spacing_dict.get(first_view, (1.0, 1.0, 1.0))
+
+            metrics = _segmentation_clinical_metrics(logits, labels, spacing=sp)
+            for key, value in metrics.items():
+                pass_metrics_accum[pass_idx].setdefault(key, []).append(value)
+
+            probs = torch.softmax(logits.float(), dim=1)
+            if probs_sum is None:
+                probs_sum = torch.zeros_like(probs)
+                probs_sq_sum = torch.zeros_like(probs)
+            probs_sum += probs
+            probs_sq_sum += probs * probs
+
+        if probs_sum is None or probs_sq_sum is None or first_view is None:
+            continue
+
+        n_samples += 1
+        mean_probs = probs_sum / n_passes
+        var_probs = torch.clamp((probs_sq_sum / n_passes) - (mean_probs * mean_probs), min=0.0)
+        var_per_class = var_probs.mean(dim=(-1, -2, -3)).squeeze(0)
+        per_sample_variance.append(var_per_class.float().cpu().numpy())
+
+        mean_probs_clipped = torch.clamp(mean_probs, min=1e-10)
+        entropy = -torch.sum(mean_probs * torch.log(mean_probs_clipped), dim=1)
+        per_sample_entropy.append(float(entropy.mean().item()))
+
+        predicted_foreground = torch.argmax(mean_probs, dim=1).squeeze(0) > 0
+        fg_entropy = entropy.squeeze(0)[predicted_foreground]
+        if fg_entropy.numel() > 0:
+            per_sample_entropy_fg.append(float(fg_entropy.mean().item()))
+
+    metrics_per_pass = [
+        {key: float(np.mean(values)) for key, values in pass_accum.items()}
+        for pass_accum in pass_metrics_accum
+    ]
+
+    clinical_metrics: dict[str, dict[str, float]] = {}
+    if metrics_per_pass and metrics_per_pass[0]:
+        for metric_name in metrics_per_pass[0].keys():
+            values = [m[metric_name] for m in metrics_per_pass]
+            clinical_metrics[metric_name] = {
+                "mean": float(np.mean(values)),
+                "std": float(np.std(values)),
+            }
+
+    dice_std = {
+        key: value["std"]
+        for key, value in clinical_metrics.items()
+        if "dice" in key
+    }
+    mean_dice_std = float(np.mean(list(dice_std.values()))) if dice_std else 0.0
+
+    if per_sample_variance:
+        stacked_vars = np.stack(per_sample_variance, axis=0)
+        per_class_predictive_variance = stacked_vars.mean(axis=0)
+        mean_predictive_variance = float(np.mean(per_class_predictive_variance))
+    else:
+        per_class_predictive_variance = np.array([])
+        mean_predictive_variance = 0.0
+
+    mean_predictive_entropy = float(np.mean(per_sample_entropy)) if per_sample_entropy else 0.0
+    mean_predictive_entropy_fg = float(np.mean(per_sample_entropy_fg)) if per_sample_entropy_fg else 0.0
+    if per_sample_variance:
+        n_classes = len(per_sample_variance[0])
+        if n_classes > 1:
+            mean_predictive_entropy = mean_predictive_entropy / np.log(n_classes)
+            mean_predictive_entropy_fg = mean_predictive_entropy_fg / np.log(n_classes)
+
+    return {
+        "n_passes": n_passes,
+        "probabilistic": {
+            "segmentation": {
+                "mean_dice_std": mean_dice_std,
+                "per_class_dice_std": to_builtin(dice_std),
+                "mean_predictive_variance": mean_predictive_variance,
+                "per_class_predictive_variance": to_builtin(_label_predictive_variance(per_class_predictive_variance)),
+                "mean_predictive_entropy": mean_predictive_entropy,
+                "mean_predictive_entropy_foreground": mean_predictive_entropy_fg,
+            }
+        },
+        "clinical_metrics": clinical_metrics,
+    }
+
+
+def _compute_overall_mc_regression(
+    per_client_data: list[dict[str, float]],
+) -> dict[str, float] | None:
+    """Compute overall weighted-average metrics and global R² across federated clients.
+
+    Uses SS decomposition for global R²:
+      global_ss_res = sum(client ss_res)
+      global_ss_tot = within_ss_tot + between_variance
+      global_r2 = 1 - global_ss_res / global_ss_tot
+
+    Args:
+        per_client_data: List of dicts, each with keys:
+            n_samples, rmse, restored_rmse, mae, restored_mae,
+            picp, mpiw, restored_mpiw, nll,
+            ss_res, ss_tot, mean_y, r2.
+
+    Returns:
+        Dict with weighted_avg section, or None if no clients.
+    """
+    import math as _math
+
+    if not per_client_data:
+        return None
+
+    total_samples = sum(c["n_samples"] for c in per_client_data)
+    if total_samples == 0:
+        return None
+
+    # Weighted RMSE (quadratic mean — standard for RMSE aggregation)
+    weighted_rmse = _math.sqrt(
+        sum(c["n_samples"] * c["rmse"] ** 2 for c in per_client_data) / total_samples
+    )
+    weighted_restored_rmse = _math.sqrt(
+        sum(c["n_samples"] * c["restored_rmse"] ** 2 for c in per_client_data) / total_samples
+    )
+
+    # Weighted MAE (linear)
+    weighted_mae = sum(c["n_samples"] * c["mae"] for c in per_client_data) / total_samples
+    weighted_restored_mae = sum(c["n_samples"] * c["restored_mae"] for c in per_client_data) / total_samples
+
+    # Weighted PICP, MPIW, NLL (linear)
+    weighted_picp = sum(c["n_samples"] * c["picp"] for c in per_client_data) / total_samples
+    weighted_mpiw = sum(c["n_samples"] * c["mpiw"] for c in per_client_data) / total_samples
+    weighted_restored_mpiw = sum(c["n_samples"] * c["restored_mpiw"] for c in per_client_data) / total_samples
+    weighted_nll = sum(c["n_samples"] * c["nll"] for c in per_client_data) / total_samples
+
+    # Global R² via SS decomposition
+    global_ss_res = sum(c["ss_res"] for c in per_client_data)
+    within_variance = sum(c["ss_tot"] for c in per_client_data)
+    global_mean_y = sum(c["mean_y"] * c["n_samples"] for c in per_client_data) / total_samples
+    between_variance = sum(
+        c["n_samples"] * (c["mean_y"] - global_mean_y) ** 2 for c in per_client_data
+    )
+    global_ss_tot = within_variance + between_variance
+    global_r2 = 1.0 - global_ss_res / global_ss_tot if global_ss_tot > 0 else 0.0
+
+    return {
+        "rmse": weighted_rmse,
+        "restored_rmse": weighted_restored_rmse,
+        "mae": weighted_mae,
+        "restored_mae": weighted_restored_mae,
+        "picp": weighted_picp,
+        "mpiw": weighted_mpiw,
+        "restored_mpiw": weighted_restored_mpiw,
+        "nll": weighted_nll,
+        "r2": float(global_r2),
+    }
+
+
 def _run_mc_dropout_federated(
     model: torch.nn.Module,
     checkpoint: dict[str, Any],
@@ -2823,10 +3159,9 @@ def _run_mc_dropout_federated(
     base_state: dict[str, torch.Tensor],
     output_dir: Path | None,
 ) -> dict[str, Any]:
-    """Run MC Dropout for federated: per-client (with private artifacts) + global pool."""
+    """Run MC Dropout for federated per-client evaluation."""
     from omegaconf import OmegaConf
     from flwr_cinema.federated.evaluate import apply_private_artifacts, build_eval_dataloader
-    from torch.utils.data import ConcatDataset
 
     datasets_by_client, _ = _load_federated_client_datasets(config, task_type)
 
@@ -2849,31 +3184,49 @@ def _run_mc_dropout_federated(
         model.to(device)
 
         dataloader = build_eval_dataloader(dataset)
-        _, _, all_outputs, all_labels = mc_dropout_predict(
-            model=model, dataloader=dataloader, task_type=task_type,
-            patch_size_dict=patch_size_dict, spacing_dict=spacing_dict,
-            amp_dtype=amp_dtype, device=device, n_passes=n_passes,
-        )
-        per_client_uncertainty[client_id] = _build_mc_uncertainty_entry(
-            task_type=task_type, all_outputs=all_outputs, mean=np.array([]),
-            dataloader=dataloader, output_dir=output_dir, client_id=client_id,
-            all_labels=all_labels,
-        )
+        if task_type == "segmentation":
+            per_client_uncertainty[client_id] = _run_segmentation_mc_dropout_streaming_entry(
+                model=model, dataloader=dataloader,
+                patch_size_dict=patch_size_dict, spacing_dict=spacing_dict,
+                amp_dtype=amp_dtype, device=device, n_passes=n_passes,
+            )
+        else:
+            _, _, all_outputs, all_labels = mc_dropout_predict(
+                model=model, dataloader=dataloader, task_type=task_type,
+                patch_size_dict=patch_size_dict, spacing_dict=spacing_dict,
+                amp_dtype=amp_dtype, device=device, n_passes=n_passes,
+            )
+            per_client_uncertainty[client_id] = _build_mc_uncertainty_entry(
+                task_type=task_type, all_outputs=all_outputs, mean=np.array([]),
+                dataloader=dataloader, output_dir=output_dir, client_id=client_id,
+                all_labels=all_labels, spacing_dict=spacing_dict,
+            )
     result["per_client"] = per_client_uncertainty
 
-    # ── Global pool (base model, no private artifacts) ──────────────────
-    model.load_state_dict(base_state, strict=False)
-    model.to(device)
-    pooled_dataset = ConcatDataset([ds for _, ds in datasets_by_client.values()])
-    pooled_dataloader = build_eval_dataloader(pooled_dataset)
-    _, _, gp_outputs, gp_labels = mc_dropout_predict(
-        model=model, dataloader=pooled_dataloader, task_type=task_type,
-        patch_size_dict=patch_size_dict, spacing_dict=spacing_dict,
-        amp_dtype=amp_dtype, device=device, n_passes=n_passes,
-    )
-    result["global_pool"] = _build_mc_uncertainty_entry(
-        task_type=task_type, all_outputs=gp_outputs, mean=np.array([]),
-        dataloader=pooled_dataloader, output_dir=output_dir, all_labels=gp_labels,
-    )
+    # ── Overall aggregation (regression only) ────────────────────────────
+    if task_type == "regression":
+        per_client_agg = []
+        for client_entry in per_client_uncertainty.values():
+            cm = client_entry.get("clinical_metrics", {})
+            n = client_entry.get("n_samples", 0)
+            if n > 0 and cm:
+                per_client_agg.append({
+                    "n_samples": n,
+                    "rmse": cm["rmse"],
+                    "restored_rmse": cm["restored_rmse"],
+                    "mae": cm["mae"],
+                    "restored_mae": cm["restored_mae"],
+                    "picp": cm["picp"],
+                    "mpiw": cm["mpiw"],
+                    "restored_mpiw": cm["restored_mpiw"],
+                    "nll": cm["nll"],
+                    "ss_res": cm["ss_res"],
+                    "ss_tot": cm["ss_tot"],
+                    "mean_y": cm["mean_y"],
+                    "r2": cm["r2"],
+                })
+        overall = _compute_overall_mc_regression(per_client_agg)
+        if overall is not None:
+            result["weighted_avg"] = overall
 
     return result

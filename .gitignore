@@ -221,3 +221,9 @@ tests/
 TODO
 scripts/analyze_metrics.py
 run_runs.sh
+background.tex
+capitulo3_implementation.tex
+capitulo4_results_discussion.tex
+data_distribution_table.tex
+eval-all.ps1
+tfg_sections_server_strategies_and_adapters.md

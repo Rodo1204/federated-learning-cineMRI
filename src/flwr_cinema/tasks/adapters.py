@@ -159,9 +159,46 @@ def _enable_head_only_training(config: DictConfig, model: torch.nn.Module) -> No
                     param.requires_grad = True
 
 
+def _apply_convvit_dropout(config: DictConfig, model: torch.nn.Module) -> None:
+    """Inject MC Dropout rate from config into all ``nn.Dropout`` layers.
+
+    Cinema models (ConvViT, ConvUNetR) already contain dropout modules in
+    Attention, Mlp, and ConvMlp, but they default to ``p=0.0``. This sets
+    a non-zero rate at runtime so the model can be trained with stochastic
+    dropout and used for Monte Carlo Dropout uncertainty — without
+    modifying cinema source code.
+
+    Called BEFORE LoRA application so LoRA dropout (controlled by its own
+    config) is not overwritten.
+    """
+    import logging
+
+    from flwr_cinema.models.dropout import inject_mc_dropout
+
+    # Resolve dropout rate from the correct model config section.
+    model_name = str(config.model.name).lower()
+    if model_name == "convunetr":
+        dropout_rate = float(config.model.convunetr.get("dropout", 0.0))
+    else:
+        dropout_rate = float(config.model.convvit.get("dropout", 0.0))
+
+    if dropout_rate > 0.0:
+        n = inject_mc_dropout(model, dropout_rate)
+        logging.getLogger(__name__).info(
+            "Injected dropout rate %.3f into %d nn.Dropout modules",
+            dropout_rate,
+            n,
+        )
+
+
 def build_federated_model(config: DictConfig, task_spec: TaskSpec) -> torch.nn.Module:
     """Build the model for federated execution (Dual LoRA allowed)."""
     model = task_spec.base_model_factory(config)
+
+    # Inject MC Dropout rate into all nn.Dropout layers BEFORE LoRA so
+    # LoRA dropout (controlled by config.lora.dropout / config.dual_lora.dropout)
+    # is not overwritten. Cinema models ship with p=0.0 by default.
+    _apply_convvit_dropout(config, model)
 
     if config.train.use_lora:
         
@@ -191,6 +228,9 @@ def build_federated_model(config: DictConfig, task_spec: TaskSpec) -> torch.nn.M
 def build_centralized_model(config: DictConfig, task_spec: TaskSpec) -> torch.nn.Module:
     """Build the model for centralized execution (Dual LoRA excluded)."""
     model = task_spec.base_model_factory(config)
+
+    # Inject MC Dropout rate BEFORE LoRA (see build_federated_model).
+    _apply_convvit_dropout(config, model)
 
     if config.train.use_lora:
         _apply_standard_lora(config, model)

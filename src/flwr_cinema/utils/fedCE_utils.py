@@ -95,7 +95,7 @@ def calculate_excluded_model(global_weights: dict, local_weights: dict, prev_rho
 def compute_fedCE_gamma_cos(global_weights: dict, local_weights: dict, global_gradient: dict, prev_rho: float, epsilon: float = 1e-5) -> float:
     """Compute the FedCE gamma_cos for a client.
 
-    Uses NVFlare-style excluded gradient (without division by 1-prev_rho)
+    Uses authors-style excluded gradient (without division by 1-prev_rho)
     since cosine similarity is scale-invariant. This avoids numerical
     instability when prev_rho ≈ 1.
     """
