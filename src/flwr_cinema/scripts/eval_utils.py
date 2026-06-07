@@ -2534,6 +2534,13 @@ def _run_centralized_per_client(
                 amp_dtype=amp_dtype,
                 device=device,
             )
+        elif task_type == "segmentation":
+            metrics = _evaluate_segmentation(
+                model=model,
+                dataloader=client_dataloader,
+                config=config,
+                device=device,
+            )
         else:
             # Use eval_utils compute_metrics_on_dataloader for R² support (cinema's
             # regression_eval_dataloader is equivalent but doesn't include R²).
@@ -2712,6 +2719,35 @@ def _run_mc_dropout_centralized(
                     spacing_dict=client_sp,
                 )
         result["per_client"] = per_client
+
+        # ── Overall aggregation (regression only) ────────────────────────
+        if task_type == "regression":
+            per_client_agg = []
+            for client_entry in per_client.values():
+                cm = client_entry.get("clinical_metrics", {})
+                prob = client_entry.get("probabilistic", {}).get("regression", {})
+                n = client_entry.get("n_samples", 0)
+                if n > 0 and cm:
+                    per_client_agg.append({
+                        "n_samples": n,
+                        "rmse": cm["rmse"],
+                        "restored_rmse": cm["restored_rmse"],
+                        "mae": cm["mae"],
+                        "restored_mae": cm["restored_mae"],
+                        "picp": cm["picp"],
+                        "mpiw": cm["mpiw"],
+                        "restored_mpiw": cm["restored_mpiw"],
+                        "nll": cm["nll"],
+                        "ss_res": cm["ss_res"],
+                        "ss_tot": cm["ss_tot"],
+                        "mean_y": cm["mean_y"],
+                        "r2": cm["r2"],
+                        "mean_std": prob.get("mean_std", 0.0),
+                        "restored_mean_std": prob.get("restored_mean_std", 0.0),
+                    })
+            overall = _compute_overall_mc_regression(per_client_agg)
+            if overall is not None:
+                result["weighted_avg"] = overall
 
     return result
 
@@ -3093,7 +3129,8 @@ def _compute_overall_mc_regression(
         per_client_data: List of dicts, each with keys:
             n_samples, rmse, restored_rmse, mae, restored_mae,
             picp, mpiw, restored_mpiw, nll,
-            ss_res, ss_tot, mean_y, r2.
+            ss_res, ss_tot, mean_y, r2,
+            mean_std, restored_mean_std.
 
     Returns:
         Dict with weighted_avg section, or None if no clients.
@@ -3125,6 +3162,10 @@ def _compute_overall_mc_regression(
     weighted_restored_mpiw = sum(c["n_samples"] * c["restored_mpiw"] for c in per_client_data) / total_samples
     weighted_nll = sum(c["n_samples"] * c["nll"] for c in per_client_data) / total_samples
 
+    # Weighted predictive std (linear — mean of per-sample stds across passes)
+    weighted_mean_std = sum(c["n_samples"] * c.get("mean_std", 0.0) for c in per_client_data) / total_samples
+    weighted_restored_mean_std = sum(c["n_samples"] * c.get("restored_mean_std", 0.0) for c in per_client_data) / total_samples
+
     # Global R² via SS decomposition
     global_ss_res = sum(c["ss_res"] for c in per_client_data)
     within_variance = sum(c["ss_tot"] for c in per_client_data)
@@ -3144,6 +3185,8 @@ def _compute_overall_mc_regression(
         "mpiw": weighted_mpiw,
         "restored_mpiw": weighted_restored_mpiw,
         "nll": weighted_nll,
+        "mean_std": weighted_mean_std,
+        "restored_mean_std": weighted_restored_mean_std,
         "r2": float(global_r2),
     }
 
@@ -3208,6 +3251,7 @@ def _run_mc_dropout_federated(
         per_client_agg = []
         for client_entry in per_client_uncertainty.values():
             cm = client_entry.get("clinical_metrics", {})
+            prob = client_entry.get("probabilistic", {}).get("regression", {})
             n = client_entry.get("n_samples", 0)
             if n > 0 and cm:
                 per_client_agg.append({
@@ -3224,6 +3268,8 @@ def _run_mc_dropout_federated(
                     "ss_tot": cm["ss_tot"],
                     "mean_y": cm["mean_y"],
                     "r2": cm["r2"],
+                    "mean_std": prob.get("mean_std", 0.0),
+                    "restored_mean_std": prob.get("restored_mean_std", 0.0),
                 })
         overall = _compute_overall_mc_regression(per_client_agg)
         if overall is not None:
