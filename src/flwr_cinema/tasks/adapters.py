@@ -1,15 +1,12 @@
-"""Task adapters: TaskSpec, runtime adapters, and auto-discovery registry.
+"""Task adapters, runtime wrappers, and auto-discovery registry.
 
-Architecture
-------------
 Task-specific factories (loss, eval, transforms, dataset) live in
-``tasks/<name>/functions.py``. The registry discovers them via duck typing
-so adding a new task means creating a new ``functions.py`` — no changes to
+tasks/<name>/functions.py. The registry discovers them via duck typing,
+so adding a new task means creating a new functions.py — no changes to
 this file needed.
 
-The two runtime adapters — ``FederatedTaskAdapter`` and
-``CentralizedTaskAdapter`` — wrap the same ``TaskSpec`` for their respective
-execution modes. Federated is the only runtime allowed to enable Dual LoRA.
+FederatedTaskAdapter and CentralizedTaskAdapter wrap the same
+TaskSpec for their respective execution modes.
 """
 
 from __future__ import annotations
@@ -46,7 +43,16 @@ _TaskFunctions = ModuleType  # duck-typed: has get_loss_fn, get_eval_fn, etc.
 
 @dataclass(frozen=True)
 class TaskSpec:
-    """Single source of truth for task semantics across runtimes."""
+    """Single source of truth for task semantics across runtimes.
+
+    Attributes:
+        name: Task name (e.g., 'classification', 'segmentation').
+        base_model_factory: Builds the base model from DictConfig.
+        loss_fn_factory: Zero-arg factory for the task loss function.
+        eval_fn_factory: Zero-arg factory for the task eval function.
+        transform_factory: Builds train/val transforms from DictConfig.
+        dataset_factory: Builds the dataset from config and paths.
+    """
 
     name: str
     base_model_factory: ModelFactory
@@ -58,24 +64,37 @@ class TaskSpec:
 
 @dataclass(frozen=True)
 class FederatedTaskAdapter:
-    """Thin federated runtime facade over a shared :class:`TaskSpec`."""
+    """Thin federated-runtime facade over a shared TaskSpec.
+
+    Attributes:
+        task_spec: Shared task specification.
+        client_class_factory: Zero-arg factory for the Flower client class.
+        federated_model_factory: Builds a model for federated execution.
+    """
 
     task_spec: TaskSpec
     client_class_factory: Callable[[], type]
     federated_model_factory: RuntimeModelFactory
 
     def build_model(self, config: DictConfig) -> torch.nn.Module:
+        """Build and return the federated model for the given config."""
         return self.federated_model_factory(config, self.task_spec)
 
 
 @dataclass(frozen=True)
 class CentralizedTaskAdapter:
-    """Thin centralized runtime facade over a shared :class:`TaskSpec`."""
+    """Thin centralized-runtime facade over a shared TaskSpec.
+
+    Attributes:
+        task_spec: Shared task specification.
+        centralized_model_factory: Builds a model for centralized execution.
+    """
 
     task_spec: TaskSpec
     centralized_model_factory: RuntimeModelFactory
 
     def build_model(self, config: DictConfig) -> torch.nn.Module:
+        """Build and return the centralized model for the given config."""
         return self.centralized_model_factory(config, self.task_spec)
 
 
@@ -160,10 +179,10 @@ def _enable_head_only_training(config: DictConfig, model: torch.nn.Module) -> No
 
 
 def _apply_convvit_dropout(config: DictConfig, model: torch.nn.Module) -> None:
-    """Inject MC Dropout rate from config into all ``nn.Dropout`` layers.
+    """Inject MC Dropout rate from config into all nn.Dropout layers.
 
     Cinema models (ConvViT, ConvUNetR) already contain dropout modules in
-    Attention, Mlp, and ConvMlp, but they default to ``p=0.0``. This sets
+    Attention, Mlp, and ConvMlp, but they default to p=0.0. This sets
     a non-zero rate at runtime so the model can be trained with stochastic
     dropout and used for Monte Carlo Dropout uncertainty — without
     modifying cinema source code.
@@ -192,33 +211,16 @@ def _apply_convvit_dropout(config: DictConfig, model: torch.nn.Module) -> None:
 
 
 def build_federated_model(config: DictConfig, task_spec: TaskSpec) -> torch.nn.Module:
-    """Build the model for federated execution (Dual LoRA allowed)."""
+    """Build the model for federated execution."""
     model = task_spec.base_model_factory(config)
 
     # Inject MC Dropout rate into all nn.Dropout layers BEFORE LoRA so
-    # LoRA dropout (controlled by config.lora.dropout / config.dual_lora.dropout)
+    # LoRA dropout (controlled by config.lora.dropout)
     # is not overwritten. Cinema models ship with p=0.0 by default.
     _apply_convvit_dropout(config, model)
 
     if config.train.use_lora:
-        
-        if getattr(config, "dual_lora", None) and getattr(config.dual_lora, "enabled", False):
-            if config.task == "segmentation":
-                raise NotImplementedError("Dual LoRA is not yet implemented for segmentation models.")
-            
-            from flwr_cinema.scripts.lora import apply_dual_lora_to_convvit
-
-            apply_dual_lora_to_convvit(
-                model=model,
-                global_rank=config.dual_lora.global_rank,
-                local_rank=config.dual_lora.local_rank,
-                alpha=config.dual_lora.alpha,
-                dropout=config.dual_lora.dropout,
-                target_modules=config.dual_lora.target_modules,
-                blocks_to_lora=getattr(config.lora, "blocks_to_lora", None),
-            )
-        else:
-            _apply_standard_lora(config, model)
+        _apply_standard_lora(config, model)
     else:
         _enable_head_only_training(config, model)
 
@@ -226,7 +228,7 @@ def build_federated_model(config: DictConfig, task_spec: TaskSpec) -> torch.nn.M
 
 
 def build_centralized_model(config: DictConfig, task_spec: TaskSpec) -> torch.nn.Module:
-    """Build the model for centralized execution (Dual LoRA excluded)."""
+    """Build the model for centralized execution."""
     model = task_spec.base_model_factory(config)
 
     # Inject MC Dropout rate BEFORE LoRA (see build_federated_model).
@@ -258,9 +260,9 @@ _TASK_MODEL_FACTORIES: dict[str, ModelFactory] = {
 
 
 def _load_task_functions(task_name: str) -> _TaskFunctions:
-    """Import and validate a task's ``functions`` module.
+    """Import and validate a task's functions module.
 
-    Raises ``AttributeError`` immediately if the module is missing any
+    Raises AttributeError immediately if the module is missing any
     required function, with a clear message pointing to the broken file.
     """
     mod = importlib.import_module(f"flwr_cinema.tasks.{task_name}.functions")
@@ -300,12 +302,26 @@ def _resolve_task_name(config: DictConfig) -> str:
 
 
 def get_task_spec(config: DictConfig) -> TaskSpec:
-    """Return the shared task specification for the current config."""
+    """Return the shared task specification for the current config.
+
+    Args:
+        config: OmegaConf DictConfig with a task key.
+
+    Returns:
+        A frozen TaskSpec with all factories resolved.
+    """
     return _build_task_spec(_resolve_task_name(config))
 
 
 def get_federated_task_adapter(config: DictConfig) -> FederatedTaskAdapter:
-    """Return the federated runtime adapter for the current task."""
+    """Return the federated runtime adapter for the current task.
+
+    Args:
+        config: OmegaConf DictConfig with a task key.
+
+    Returns:
+        A FederatedTaskAdapter.
+    """
     from flwr_cinema.tasks.client import FederatedClient
 
     task = _resolve_task_name(config)
@@ -317,7 +333,14 @@ def get_federated_task_adapter(config: DictConfig) -> FederatedTaskAdapter:
 
 
 def get_centralized_task_adapter(config: DictConfig) -> CentralizedTaskAdapter:
-    """Return the centralized runtime adapter for the current task."""
+    """Return the centralized runtime adapter for the current task.
+
+    Args:
+        config: OmegaConf DictConfig with a task key.
+
+    Returns:
+        A CentralizedTaskAdapter.
+    """
     task = _resolve_task_name(config)
     return CentralizedTaskAdapter(
         task_spec=_build_task_spec(task),
@@ -326,7 +349,14 @@ def get_centralized_task_adapter(config: DictConfig) -> CentralizedTaskAdapter:
 
 
 def get_task_adapter(config: DictConfig) -> FederatedTaskAdapter:
-    """Backward-compatible alias for ``get_federated_task_adapter``."""
+    """Backward-compatible alias for get_federated_task_adapter.
+
+    Args:
+        config: OmegaConf DictConfig with a task key.
+
+    Returns:
+        A FederatedTaskAdapter (same as get_federated_task_adapter).
+    """
     return get_federated_task_adapter(config)
 
 
@@ -334,7 +364,17 @@ def resolve_regression_stats(
     config: DictConfig,
     train_meta_df: Any,
 ) -> tuple[Any, Any]:
-    """Resolve regression normalization stats (re-exported from task module)."""
+    """Resolve regression normalization stats from the task module.
+
+    Re-exported from flwr_cinema.tasks.regression.functions.
+
+    Args:
+        config: OmegaConf DictConfig.
+        train_meta_df: Training metadata DataFrame.
+
+    Returns:
+        A (mean, std) tuple of normalization statistics.
+    """
     from flwr_cinema.tasks.regression.functions import (
         resolve_regression_stats as _resolve,
     )

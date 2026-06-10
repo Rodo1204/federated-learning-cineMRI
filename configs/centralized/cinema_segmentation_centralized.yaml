@@ -82,19 +82,6 @@ lora:
   target_modules: ["q", "kv"]  # Attention modules to adapt: q, kv, proj
   blocks_to_lora: null
 
-# Dual LoRA configuration (personalized federated learning)
-# Set dual_lora.enabled=True to use Dual LoRA with global + local adapters
-# Set dual_lora.enabled=False to use standard single LoRA (default)
-# Note: blocks_to_lora is shared with lora.blocks_to_lora (both global and local adapters use the same blocks)
-dual_lora:
-  enabled: False  # Toggle Dual LoRA on/off (True=personalized, False=standard FedAvg)
-  global_rank: 4  # Rank of global adapters (aggregated via FedAvg across clients)
-  local_rank: 4   # Rank of local adapters (client-specific, never aggregated)
-  alpha: 8        # Scaling factor for both global and local adapters
-  dropout: 0.1    # Dropout rate for LoRA path
-  target_modules: ["q", "kv"]  # Which attention projections to adapt
-
-
 transform:
   prob: 0.5
   gamma: [0.5, 1.5]
