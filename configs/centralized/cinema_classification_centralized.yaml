@@ -125,7 +125,7 @@ train:
   batch_size_per_device: 16
   eval_steps: 406  # Evaluate every N optimizer steps (aligned centralized/federated)
   early_stopping:
-    metric: "roc_auc" #"roc_auc"
+    metric: "mcc" #"roc_auc"
     mode: "max"
     patience: 10 #10
     min_delta: 5e-4 #5e-4
