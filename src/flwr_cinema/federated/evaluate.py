@@ -1,5 +1,8 @@
 """Federated checkpoint evaluator with unified result schema.
 
+Thin wrapper around the unified evaluation orchestrator.
+Keeps federated-specific helpers for use by the orchestrator.
+
 Supports classification, regression, and segmentation evaluation.
 """
 
@@ -15,6 +18,7 @@ import torch
 from torch.utils.data import ConcatDataset, DataLoader, SequentialSampler
 
 from flwr_cinema.scripts.eval_utils import (
+    build_shared_argument_parser,
     compute_primary_metric_fairness,
     filter_metadata_by_client_config,
     find_best_federated_round,
@@ -28,6 +32,7 @@ from flwr_cinema.scripts.eval_utils import (
     resolve_federated_eval_task,
     resolve_federated_checkpoint_dir,
     resolve_data_dir_with_fallback,
+    run_unified_evaluation,
     to_builtin,
 )
 
@@ -237,184 +242,6 @@ def _compute_assertivity_metrics(client_results: list[dict[str, Any]]) -> dict[s
     return {"weighted_avg": weighted, "macro_avg": macro}
 
 
-def _build_patch_size_dict(config: dict[str, Any]) -> dict[str, Any]:
-    from omegaconf import OmegaConf
-
-    cfg = OmegaConf.create(config)
-    views = cfg.model.views if isinstance(cfg.model.views, list) else [cfg.model.views]
-    return {
-        view: cfg.data.sax.patch_size if view == "sax" else cfg.data.lax.patch_size
-        for view in views
-    }
-
-
-def _resolve_regression_normalization(config: dict[str, Any]) -> tuple[float, float]:
-    from flwr_cinema.tasks.adapters import resolve_regression_stats
-    from omegaconf import OmegaConf
-
-    data_dir = Path(config["data"]["combined"]["dir"]).expanduser()
-    data_dir = resolve_data_dir_with_fallback(data_dir)
-    train_meta_df = load_metadata(data_dir / "train_metadata.csv", metadata_type="train")
-    train_meta_df = filter_metadata_by_client_config(config=config, meta_df=train_meta_df, metadata_type="train")
-    cfg = OmegaConf.create(config)
-    return resolve_regression_stats(cfg, train_meta_df)
-
-
-def _evaluate_personalized_global_pool_classification(
-    model: torch.nn.Module,
-    checkpoint: dict[str, Any],
-    config: dict[str, Any],
-    datasets_by_client: dict[str, tuple[int, Any]],
-    base_state: dict[str, torch.Tensor],
-    device: torch.device,
-) -> dict[str, float]:
-    import torch.nn.functional as F
-    from sklearn.metrics import balanced_accuracy_score
-
-    from models.cinema.cinema.classification.train import classification_eval, classification_metrics
-    from models.cinema.cinema.device import get_amp_dtype_and_device
-
-    amp_dtype, _ = get_amp_dtype_and_device()
-    patch_size_dict = _build_patch_size_dict(config)
-
-    pred_labels: list[torch.Tensor] = []
-    true_labels: list[torch.Tensor] = []
-    pred_logits: list[torch.Tensor] = []
-
-    for client_id, (_, dataset) in sorted(datasets_by_client.items(), key=lambda item: str(item[0])):
-        model.load_state_dict(base_state, strict=False)
-        apply_private_artifacts(model=model, checkpoint=checkpoint, client_id=str(client_id))
-        dataloader = build_eval_dataloader(dataset)
-        model.to(device)
-        model.eval()
-
-        with torch.no_grad():
-            for batch in dataloader:
-                logits, _ = classification_eval(
-                    model=model,
-                    batch=batch,
-                    patch_size_dict=patch_size_dict,
-                    amp_dtype=amp_dtype,
-                    device=device,
-                )
-                pred_labels.append(torch.argmax(logits, dim=1))
-                true_labels.append(batch["label"])
-                pred_logits.append(logits)
-
-    pred_labels_np = torch.cat(pred_labels, dim=0).cpu().to(dtype=torch.float32).numpy()
-    true_labels_np = torch.cat(true_labels, dim=0).cpu().to(dtype=torch.float32).numpy()
-    pred_logits_tensor = torch.cat(pred_logits, dim=0).cpu().to(dtype=torch.float32)
-    pred_probs_np = F.softmax(pred_logits_tensor, dim=1).numpy()
-
-    metrics = classification_metrics(
-        true_labels=true_labels_np,
-        pred_labels=pred_labels_np,
-        pred_probs=pred_probs_np,
-    )
-    metrics["balanced_accuracy"] = float(
-        balanced_accuracy_score(y_true=true_labels_np, y_pred=pred_labels_np)
-    )
-    return {name: float(value) for name, value in metrics.items()}
-
-
-def _evaluate_personalized_global_pool_regression(
-    model: torch.nn.Module,
-    checkpoint: dict[str, Any],
-    config: dict[str, Any],
-    datasets_by_client: dict[str, tuple[int, Any]],
-    base_state: dict[str, torch.Tensor],
-    device: torch.device,
-) -> dict[str, float]:
-    from models.cinema.cinema.device import get_amp_dtype_and_device
-    from models.cinema.cinema.regression.train import regression_eval, regression_metrics
-
-    amp_dtype, _ = get_amp_dtype_and_device()
-    patch_size_dict = _build_patch_size_dict(config)
-    reg_mean, reg_std = _resolve_regression_normalization(config)
-
-    pred_labels: list[torch.Tensor] = []
-    true_labels: list[torch.Tensor] = []
-
-    for client_id, (_, dataset) in sorted(datasets_by_client.items(), key=lambda item: str(item[0])):
-        model.load_state_dict(base_state, strict=False)
-        apply_private_artifacts(model=model, checkpoint=checkpoint, client_id=str(client_id))
-        dataloader = build_eval_dataloader(dataset)
-        model.to(device)
-        model.eval()
-
-        with torch.no_grad():
-            for batch in dataloader:
-                preds, _ = regression_eval(
-                    model=model,
-                    batch=batch,
-                    patch_size_dict=patch_size_dict,
-                    amp_dtype=amp_dtype,
-                    device=device,
-                )
-                pred_labels.append(preds)
-                true_labels.append(batch["label"])
-
-    pred_labels_np = torch.cat(pred_labels, dim=0).cpu().to(dtype=torch.float32).numpy()
-    true_labels_np = torch.cat(true_labels, dim=0).cpu().to(dtype=torch.float32).numpy()
-
-    metrics = regression_metrics(true_labels=true_labels_np, pred_labels=pred_labels_np)
-    restored_metrics = regression_metrics(
-        true_labels=(true_labels_np * reg_std) + reg_mean,
-        pred_labels=(pred_labels_np * reg_std) + reg_mean,
-    )
-    metrics.update({f"restored_{name}": float(value) for name, value in restored_metrics.items()})
-    return {name: float(value) for name, value in metrics.items()}
-
-
-def evaluate_global_pool(
-    model: torch.nn.Module,
-    checkpoint: dict[str, Any],
-    evaluate_fn: Any,
-    config: dict[str, Any],
-    task_type: str,
-    datasets_by_client: dict[str, tuple[int, Any]],
-    base_state: dict[str, torch.Tensor],
-    device: torch.device,
-) -> tuple[str, dict[str, float]]:
-    """Evaluate pooled test data using global model or personalized artifacts."""
-    if has_private_artifacts(checkpoint):
-        if task_type == "classification":
-            return "personalized", _evaluate_personalized_global_pool_classification(
-                model=model,
-                checkpoint=checkpoint,
-                config=config,
-                datasets_by_client=datasets_by_client,
-                base_state=base_state,
-                device=device,
-            )
-        if task_type == "regression":
-            return "personalized", _evaluate_personalized_global_pool_regression(
-                model=model,
-                checkpoint=checkpoint,
-                config=config,
-                datasets_by_client=datasets_by_client,
-                base_state=base_state,
-                device=device,
-            )
-        # Segmentation with private artifacts: per-client eval already covers
-        # personalization; global pool falls back to aggregated model.
-        model.load_state_dict(base_state, strict=False)
-        pooled_dataset = ConcatDataset([dataset for _, dataset in datasets_by_client.values()])
-        pooled_dataloader = build_eval_dataloader(pooled_dataset)
-        model.to(device)
-        model.eval()
-        metrics = evaluate_fn(model=model, dataloader=pooled_dataloader, config=config, device=device)
-        return "global", normalize_metric_values(metrics)
-
-    model.load_state_dict(base_state, strict=False)
-    pooled_dataset = ConcatDataset([dataset for _, dataset in datasets_by_client.values()])
-    pooled_dataloader = build_eval_dataloader(pooled_dataset)
-    model.to(device)
-    model.eval()
-    metrics = evaluate_fn(model=model, dataloader=pooled_dataloader, config=config, device=device)
-    return "global", normalize_metric_values(metrics)
-
-
 def build_per_client_payload(client_results: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
     per_client: dict[str, dict[str, Any]] = {}
     for result in client_results:
@@ -466,142 +293,38 @@ def evaluate_clients(
     return results
 
 
-def build_result_payload(
-    checkpoint_name: str,
-    selection: dict[str, Any],
-    config: dict[str, Any],
-    global_pool_metrics: dict[str, float],
-    global_pool_model_variant: str,
-    client_results: list[dict[str, Any]],
-) -> dict[str, Any]:
-    """Build federated result payload aligned with centralized evaluation output."""
-    primary_metric, direction = _extract_primary_metric_meta(config)
-    fairness = compute_primary_metric_fairness(client_results, primary_metric=primary_metric)
-    assertivity = _compute_assertivity_metrics(client_results)
-
-    payload = {
-        "config": {
-            "checkpoint": checkpoint_name,
-            "checkpoint_selection_mode": selection.get("mode"),
-            "checkpoint_round": selection.get("selected_round"),
-            "use_lora": bool(config.get("train", {}).get("use_lora", False)),
-            "primary_metric": primary_metric,
-            "primary_metric_direction": direction,
-            "task": str(config.get("task", "regression")),
-            "global_pool_model_variant": global_pool_model_variant,
-        },
-        "global_pool": global_pool_metrics,
-        "per_client": build_per_client_payload(client_results),
-        "assertivity": assertivity,
-        "fairness": fairness,
-    }
-    return to_builtin(payload)
-
-
-def validate_result_payload(payload: dict[str, Any]) -> None:
-    required_top_level = {
-        "config",
-        "global_pool",
-        "per_client",
-        "assertivity",
-        "fairness",
-    }
-    missing = required_top_level.difference(payload.keys())
-    if missing:
-        raise ValueError(f"Result payload missing required keys: {sorted(missing)}")
-
-
 def run_evaluation(
     checkpoint_dir: Path,
     checkpoint_path: Path | None,
     output_name: str,
     output_dir: Path | None = None,
 ) -> Path:
-    checkpoint_dir = Path(checkpoint_dir)
-    resolved_checkpoint_dir: Path | None = None
-
-    if checkpoint_path is None:
-        # Metrics-based checkpoint selection depends on federated output structure.
-        resolved_checkpoint_dir = resolve_federated_checkpoint_dir(checkpoint_dir)
-        last_ckpt, _ = find_last_federated_round(resolved_checkpoint_dir)
-        _, provisional_config = load_checkpoint_and_config(last_ckpt, output_dir=resolved_checkpoint_dir)
-        selected_checkpoint_path, selection = resolve_checkpoint_for_evaluation(
-            checkpoint_dir=resolved_checkpoint_dir,
-            checkpoint_path=None,
-            config=provisional_config,
-        )
-    else:
-        # Direct checkpoint selection must work without fragile directory assumptions.
-        selected_checkpoint_path, selection = resolve_checkpoint_for_evaluation(
-            checkpoint_dir=checkpoint_dir,
-            checkpoint_path=checkpoint_path,
-            config={},
-        )
-
-    effective_checkpoint_dir = (
-        resolved_checkpoint_dir if resolved_checkpoint_dir is not None else selected_checkpoint_path.parent
+    """Thin wrapper around run_unified_evaluation for backward compatibility."""
+    return run_unified_evaluation(
+        checkpoint_dir=checkpoint_dir,
+        checkpoint_path=checkpoint_path,
+        checkpoint_epoch=None,
+        output_dir=output_dir,
+        output_file_name=output_name,
+        mc_dropout=False,
+        mc_dropout_passes=30,
+        is_federated=True,
     )
-
-    # Reload exact checkpoint selected
-    checkpoint, config = load_checkpoint_and_config(selected_checkpoint_path, output_dir=selected_checkpoint_path.parent)
-    task_type = str(config.get("task", "regression"))
-    task_type = resolve_federated_eval_task(task_type)
-
-    model = build_base_model(config=config, checkpoint=checkpoint)
-    datasets_by_client, evaluate_fn = load_client_datasets(config=config, task_type=task_type)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    base_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
-
-    client_results = evaluate_clients(
-        model=model,
-        checkpoint=checkpoint,
-        evaluate_fn=evaluate_fn,
-        config=config,
-        datasets_by_client=datasets_by_client,
-        base_state=base_state,
-        device=device,
-    )
-    global_pool_model_variant, global_pool_metrics = evaluate_global_pool(
-        model=model,
-        checkpoint=checkpoint,
-        evaluate_fn=evaluate_fn,
-        config=config,
-        task_type=task_type,
-        datasets_by_client=datasets_by_client,
-        base_state=base_state,
-        device=device,
-    )
-    payload = build_result_payload(
-        checkpoint_name=selected_checkpoint_path.name,
-        selection=selection,
-        config=config,
-        global_pool_metrics=global_pool_metrics,
-        global_pool_model_variant=global_pool_model_variant,
-        client_results=client_results,
-    )
-    validate_result_payload(payload)
-
-    results_dir = Path(output_dir) if output_dir is not None else effective_checkpoint_dir / "test_evaluation"
-    results_dir.mkdir(parents=True, exist_ok=True)
-    result_path = results_dir / output_name
-    with open(result_path, "w", encoding="utf-8") as f:
-        json.dump(to_builtin(payload), f, indent=2)
-    return result_path
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Evaluate federated checkpoints with unified schema.")
-    parser.add_argument("--checkpoint-dir", required=True, type=Path, help="Directory containing federated checkpoints")
-    parser.add_argument("--checkpoint-path", type=Path, default=None, help="Direct checkpoint path. If set, metrics-based selection is skipped.")
-    parser.add_argument("--output-name", default="federated_eval.json")
-    parser.add_argument("--output-dir", type=Path, default=None, help="Output directory for results (defaults to checkpoint_dir/test_evaluation)")
+    parser = build_shared_argument_parser()
     args = parser.parse_args()
 
-    run_evaluation(
+    run_unified_evaluation(
         checkpoint_dir=args.checkpoint_dir,
         checkpoint_path=args.checkpoint_path,
-        output_name=args.output_name,
+        checkpoint_epoch=None,
         output_dir=args.output_dir,
+        output_file_name=args.output_file_name,
+        mc_dropout=args.mc_dropout,
+        mc_dropout_passes=args.mc_dropout_passes,
+        is_federated=True,
     )
 
 

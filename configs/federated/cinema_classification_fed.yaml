@@ -132,7 +132,7 @@ transform:
     translate_range: [60, 60, 0]
 
 train:
-  use_lora: False # Set to True to use LoRA
+  use_lora: True # Set to True to use LoRA
   use_class_weighted_loss: False # Set to True to use class-weighted BCE loss for imbalanced classification
   n_workers: 4
   clip_grad: 5.0
@@ -147,9 +147,9 @@ train:
   max_n_ckpts: 2
   batch_size: 32 
   batch_size_per_device: 16
-  eval_steps: 80 #80  # Evaluate every N optimizer steps (aligned centralized/federated)
+  eval_steps: 406 #80  # Evaluate every N optimizer steps (aligned centralized/federated)
   early_stopping:
-    metric: "roc_auc"
+    metric: "mcc"
     mode: "max"
     patience: 10
     min_delta: 5e-4
@@ -157,7 +157,7 @@ train:
 model:
   name: convvit # convvit, resnet
   ckpt_path: null
-  freeze_pretrained: False
+  freeze_pretrained: True
   views: sax
   n_frames: 2
   out_chans: null

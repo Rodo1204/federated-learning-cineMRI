@@ -310,6 +310,7 @@ class FederatedClient:
         self,
         message: Message,
         model_state_dict: dict,
+        last_state_dict: dict,
         updated_state_dict: dict,
         round_idx: int,
     ) -> dict | None:
@@ -342,9 +343,10 @@ class FederatedClient:
 
             excluded_model = calculate_excluded_model(
                 global_weights=model_state_dict,
-                local_weights=updated_state_dict,
+                local_weights=last_state_dict,
                 prev_rho=prev_rho,
             )
+            del last_state_dict
 
             gamma_err = 1e-4
             try:
@@ -478,8 +480,10 @@ class FederatedClient:
 
         agg_metrics = None
         if strategy == "fedce" and round_idx > 1:
+            updated_state_dict = {k: v.clone() for k, v in updated_state_dict.items()}
+            last_state_dict = context.state.array_records["last_model_params"].to_torch_state_dict(keep_input=False)
             agg_metrics = self._compute_fedce(
-                message, model_state_dict, updated_state_dict, round_idx
+                message, model_state_dict, last_state_dict, updated_state_dict, round_idx
             )
 
         if agg_metrics is not None:
@@ -490,6 +494,8 @@ class FederatedClient:
         )
         out_record["model_params"] = out_params
         out_record["metrics"] = out_metrics
+
+        context.state.array_records["last_model_params"] = out_params
 
         return Message(content=out_record, reply_to=message)
 
