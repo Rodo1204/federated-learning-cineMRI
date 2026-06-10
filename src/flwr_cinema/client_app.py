@@ -1,3 +1,8 @@
+"""Flower ClientApp entry point for federated training.
+
+Handles per-client model caching, data loading, class-weighted loss wrapping,
+and the Flower train/evaluate message handlers.
+"""
 import torch
 from flwr.app import Context, Message, ConfigRecord
 from flwr.clientapp import ClientApp
@@ -18,10 +23,9 @@ import logging
 # Flower ClientApp 
 app = ClientApp()
 
-# Model cache per client_id to preserve local decoder/head state across rounds
-# when aggregate_decoder=False or aggregate_head=False. Each client gets its
-# own model object so per-client artifacts don't leak across clients sharing
-# the same Ray actor in simulation mode.
+# Model cache per client_id. Preserves local decoder/head state across rounds
+# when aggregate_head=False or aggregate_decoder=False. Inactive models are
+# kept on CPU to avoid VRAM exhaustion with many clients per actor.
 _MODEL_CACHE: dict[str, torch.nn.Module] = {}
 _OPTIM_STATE_CACHE: dict[str, dict] = {}
 _TRAIN_DATALOADER_CACHE = None
@@ -30,12 +34,10 @@ _STATS_CACHE = None
 # def setup_logging(log_dir: Path, ):
 
 def get_model(config: DictConfig, client_id: str | None = None) -> torch.nn.Module:
-    """Build or retrieve the model for a specific federated client.
-    
-    Caches one model per client_id so local decoder/head parameters
-    survive across rounds. Inactive client models are flushed to CPU to
-    avoid exhausting GPU VRAM when many clients share the same actor.
-    The active model will be moved to GPU by FederatedClient.
+    """Build or retrieve the cached model for a specific client.
+
+    Caches one model per client_id so local decoder/head parameters survive
+    across rounds. The active model is moved to GPU by FederatedClient.
     """
     global _MODEL_CACHE
     
@@ -76,23 +78,15 @@ def load_client_data(
     client_id: str,
     vendor: str | None = None,
 ) -> tuple[DataLoader, DataLoader, dict]:
-    """Load training data for a specific federated learning client.
-    
-    This is a thin wrapper around the common load_client_dataloaders() from
-    data/federated_dataset_loader.py that handles task-agnostic data loading.
-    
-    Terminology:
-        - client_id: Federated learning participant (acdc, GE, Canon, Siemens, Philips)
-        - vendor: Scanner manufacturer in metadata (only for filtered MnMs data)
-    
+    """Load train/val dataloaders and stats for a federated client.
+
     Args:
         config: Configuration dictionary.
-        client_id: Federated client identifier (e.g., "acdc", "GE", "Canon").
-                  Matches the 'client' column in combined dataset metadata.
-        vendor: [DEPRECATED] Vendor to filter by. Now uses client_id directly.
-        
+        client_id: Federated client identifier (e.g. "acdc", "Siemens").
+        vendor: [DEPRECATED] Vendor filter. Now uses client_id directly.
+
     Returns:
-        Tuple of (train_loader, val_loader, stats_dict) for the client.
+        Tuple of (train_loader, val_loader, stats_dict).
     """
 
     global _TRAIN_DATALOADER_CACHE
@@ -146,14 +140,12 @@ def train(msg: Message, context: Context):
     # Load server and hydra config
     in_config = msg.content.config_records.get("config", ConfigRecord())
     config = load_hydra_config(context)
-    config = update_config_from_config_record(config, in_config)  # Update Hydra config with any overrides from server-sent config record
+    config = update_config_from_config_record(config, in_config)
     
     round_idx = int(in_config.get("server-round", 0))
     torch.manual_seed(config.seed + round_idx)
 
-    # Construct output directory using same config template structure as server
-    # Use coordinated timestamp from server if available
-    # Otherwise generate new timestamp
+    # Use coordinated timestamp from server, or generate one.
     coordinated_timestamp = in_config.get("federated_timestamp", None)
     if coordinated_timestamp:
         timestamp_str = str(coordinated_timestamp)
@@ -177,8 +169,7 @@ def train(msg: Message, context: Context):
     )
     base_output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Flower assigns numeric 'partition-id' (0, 1, 2...) automatically in simulation.
-    # Map it to string dataset names (e.g. acdc, Siemens...) configured in Hydra.
+    # Map Flower partition-id to client name from config.
     if "partition-id" in context.node_config:
         partition_id = context.node_config["partition-id"]
         # config.federated.client_ids can be a list: ["acdc", "Siemens", "GE", "Philips", "Canon"]
@@ -278,9 +269,7 @@ def evaluate(msg: Message, context: Context):
     round_idx = int(in_config.get("server-round", 0))
     torch.manual_seed(config.seed + round_idx)
     
-    # Construct output directory using same config template structure as server
-    # Use coordinated timestamp from server if available
-    # Otherwise generate new timestamp
+    # Use coordinated timestamp from server, or generate one.
     coordinated_timestamp = in_config.get("federated_timestamp", None)
     if coordinated_timestamp:
         timestamp_str = str(coordinated_timestamp)
@@ -304,7 +293,7 @@ def evaluate(msg: Message, context: Context):
     )
     base_output_dir.mkdir(parents=True, exist_ok=True)
     
-    # Map Flower 'partition-id' to actual string dataset center name for validation
+    # Map Flower partition-id to client name from config.
     if "partition-id" in context.node_config:
         partition_id = context.node_config["partition-id"]
         client_names = getattr(config.federated, "client_ids", [])

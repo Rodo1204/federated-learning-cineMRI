@@ -1,4 +1,9 @@
-"""Shared evaluation utilities for centralized and federated regression models."""
+"""Shared evaluation utilities for centralized and federated models.
+
+Covers metadata loading, checkpoint selection, federated round selection,
+client-split dataset creation, per-client evaluation, fairness metrics,
+Monte Carlo Dropout uncertainty estimation, and clinical metrics.
+"""
 
 from __future__ import annotations
 
@@ -107,7 +112,7 @@ def find_best_checkpoint(checkpoint_dir: Path) -> tuple[Path, int | None]:
 
     Uses nearby validation history (validation_metrics.jsonl) and early-stopping
     config (config.yaml / .hydra/config.yaml). Exact mapping reads only
-    `primary_validation_metrics`. Legacy histories without this field are treated
+    primary_validation_metrics. Legacy histories without this field are treated
     as not reliably mappable and trigger heuristic fallback.
 
     Args:
@@ -280,8 +285,8 @@ def resolve_federated_checkpoint_dir(checkpoint_dir: Path) -> Path:
     """Resolve federated checkpoints directory.
 
     Contract:
-    - preferred input is direct `.../federated_server/checkpoints`
-    - experiment root containing `federated_server/checkpoints` is accepted
+    - preferred input is direct .../federated_server/checkpoints
+    - experiment root containing federated_server/checkpoints is accepted
     """
     candidate = Path(checkpoint_dir)
     if candidate.exists() and candidate.is_dir() and candidate.name == "checkpoints":
@@ -491,8 +496,8 @@ def find_best_federated_round(
 
     Args:
         checkpoint_dir: Federated checkpoint directory or experiment root.
-        primary_metric: Metric key expected inside each ``fedavg_metrics`` payload.
-        direction: Optimization direction, one of ``min`` or ``max``.
+        primary_metric: Metric key expected inside each fedavg_metrics payload.
+        direction: Optimization direction, one of min or max.
 
     Returns:
         Tuple of checkpoint path and round number.
@@ -578,83 +583,15 @@ def find_best_federated_round(
         return find_last_federated_round(checkpoint_dir)
 
 
-def get_round_participants(output_dir: Path, round_num: int) -> list[str]:
-    """Get list of clients that participated in a specific federated round.
-    
-    Infers from:
-    1. Aggregated metrics history (client_steps keys)
-    2. Client checkpoint directories
-    3. Config file
-    
-    Args:
-        output_dir: Federated training output directory.
-        round_num: Round number.
-    
-    Returns:
-        List of client IDs (e.g., ["acdc", "GE"]).
-    """
-    federated_server_dir = output_dir / "federated_server"
-    
-    # Try to extract from metrics history
-    metrics_file = federated_server_dir / "metrics_history.json"
-    if metrics_file.exists():
-        try:
-            with open(metrics_file) as f:
-                metrics_history = json.load(f)
-
-            # New format (v2): {"rounds": [...]}
-            if isinstance(metrics_history, dict) and "rounds" in metrics_history:
-                entries = metrics_history["rounds"]
-            elif isinstance(metrics_history, list):
-                entries = metrics_history
-            else:
-                entries = []
-
-            for entry in entries:
-                if entry.get("round") == round_num:
-                    if "client_steps" in entry:
-                        return list(entry["client_steps"].keys())
-        except Exception as e:
-            logger.warning(f"Failed to extract participants from metrics: {e}")
-    
-    # Fall back to client directories
-    client_dirs = sorted(federated_server_dir.parent.glob("client_*/"))
-    if client_dirs:
-        participants = [d.name.replace("client_", "") for d in client_dirs]
-        logger.info(f"Inferred participants from client directories: {participants}")
-        return participants
-    
-    # Fall back to config
-    config_path = output_dir / "config.yaml"
-    if not config_path.exists():
-        config_path = output_dir.parent / "config.yaml"
-    if not config_path.exists():
-        config_path = output_dir.parent.parent / "config.yaml"
-    
-    if config_path.exists():
-        try:
-            from omegaconf import OmegaConf
-            cfg = OmegaConf.load(config_path)
-            if "federated" in cfg and "n_clients" in cfg.federated:
-                # Default clients based on config
-                if cfg.federated.n_clients >= 2:
-                    return ["acdc", "GE", "Philips", "Siemens", "Canon"]  # Common default
-        except Exception as e:
-            logger.warning(f"Failed to read config: {e}")
-    
-    logger.warning("Could not determine round participants, assuming all clients")
-    return ["acdc", "GE", "Philips", "Siemens", "Canon"]  # Default assumption
-
-
 def _load_config_near_checkpoint(
     checkpoint_path: Path,
     output_dir: Path | None = None,
 ) -> dict:
     """Find and load the config YAML near a checkpoint, without loading the model.
 
-    Searches parent directories of both ``output_dir`` and ``checkpoint_path``
-    for ``config.yaml`` (including ``.hydra/config.yaml``).  Falls back to the
-    project default ``configs/cinema_fed.yaml`` when nothing else is found.
+    Searches parent directories of both output_dir and checkpoint_path
+    for config.yaml (including .hydra/config.yaml).  Falls back to the
+    project default configs/cinema_fed.yaml when nothing else is found.
 
     Args:
         checkpoint_path: Path to a checkpoint (.pt) file (used to anchor the search).
@@ -950,47 +887,6 @@ def compute_metrics_on_dataloader(
     return metrics
 
 
-def compute_weighted_metrics(
-    metrics_by_client: dict[str, dict],
-    test_meta_df: pd.DataFrame,
-) -> dict[str, float]:
-    """Compute weighted average metrics across clients.
-    
-    Args:
-        metrics_by_client: Dictionary mapping client_id to metrics dict.
-        test_meta_df: Test metadata to get client sample counts.
-    
-    Returns:
-        Weighted average metrics.
-    """
-    if not metrics_by_client:
-        return {}
-    
-    # Identify client column
-    if "client" in test_meta_df.columns:
-        client_col = "client"
-    elif "vendor" in test_meta_df.columns:
-        client_col = "vendor"
-    else:
-        # Single client, no weighting needed
-        return list(metrics_by_client.values())[0]
-    
-    # Get sample counts per client
-    client_counts = test_meta_df[client_col].value_counts().to_dict()
-    total_samples = len(test_meta_df)
-    
-    weighted_metrics = {}
-    for metric_name in metrics_by_client[list(metrics_by_client.keys())[0]].keys():
-        weighted_value = 0.0
-        for client_id, metrics in metrics_by_client.items():
-            count = client_counts.get(client_id, 1)
-            weight = count / total_samples
-            weighted_value += metrics[metric_name] * weight
-        weighted_metrics[metric_name] = weighted_value
-    
-    return weighted_metrics
-
-
 def to_builtin(obj: Any) -> Any:
     """Recursively convert numpy/torch values to JSON-serializable builtins."""
     if isinstance(obj, dict):
@@ -1228,257 +1124,12 @@ def get_federated_eval_fn(task: str | dict[str, Any] | Any) -> Callable[..., dic
     return _evaluate_regression
 
 
-def compute_cross_center_metrics(
-    model: torch.nn.Module,
-    datasets_by_client: dict[str, tuple[int, ClassificationDataset | RegressionDataset]],
-    test_meta_df: pd.DataFrame,
-    reg_mean: float,
-    reg_std: float,
-    config: dict,
-    device: torch.device,
-) -> dict[str, dict[str, float]]:
-    """Compute cross-center validation metrics.
-    
-    For each client's model, evaluate on all other clients' test data.
-    Automatically detects task type (classification vs regression) and uses appropriate metrics.
-    
-    Args:
-        model: Global model.
-        datasets_by_client: Datasets split by client.
-        test_meta_df: Test metadata.
-        reg_mean: Normalization mean (for regression only).
-        reg_std: Normalization std (for regression only).
-        config: Configuration dictionary.
-        device: Device to use.
-    
-    Returns:
-        Dictionary mapping "client_X_to_client_Y" to metrics dict.
-    """
-    from omegaconf import OmegaConf
-    
-    cross_center_metrics = {}
-    clients = sorted(datasets_by_client.keys())
-    
-    # Determine task type
-    cfg = OmegaConf.create(config)
-    task = getattr(cfg, "task", "regression")
-    is_classification = task == "classification"
-    
-    # For each source client, evaluate on all target clients
-    for source_client in clients:
-        for target_client in clients:
-            if source_client == target_client:
-                continue
-            
-            # Create dataloader for target client data
-            n_samples, dataset = datasets_by_client[target_client]
-            sampler = SequentialSampler(dataset)
-            dataloader = DataLoader(
-                dataset=dataset,
-                sampler=sampler,
-                batch_size=1,
-                drop_last=False,
-                pin_memory=True,
-                num_workers=0,
-            )
-            
-            # Compute metrics (task-specific)
-            try:
-                if is_classification:
-                    # For classification, try to use the classification metrics function if available
-                    # Otherwise fall back to regression metrics (which may fail gracefully and be caught)
-                    try:
-                        from cinema_classification.federated.evaluate import compute_metrics_on_dataloader_with_balanced_accuracy
-                        metrics, _, _ = compute_metrics_on_dataloader_with_balanced_accuracy(
-                            model=model,
-                            dataloader=dataloader,
-                            config=config,
-                            device=device,
-                            task="classification",
-                            reg_mean=None,
-                            reg_std=None,
-                        )
-                    except (ImportError, TypeError):
-                        # Fall back to generic metrics computation
-                        metrics = compute_metrics_on_dataloader(
-                            model=model,
-                            dataloader=dataloader,
-                            reg_mean=0,
-                            reg_std=1,
-                            config=config,
-                            device=device,
-                        )
-                else:
-                    # Use regression metrics
-                    metrics = compute_metrics_on_dataloader(
-                        model=model,
-                        dataloader=dataloader,
-                        reg_mean=reg_mean,
-                        reg_std=reg_std,
-                        config=config,
-                        device=device,
-                    )
-                
-                cross_center_key = f"{source_client}_to_{target_client}"
-                cross_center_metrics[cross_center_key] = metrics
-                logger.debug(f"Cross-center evaluation {cross_center_key}: success")
-            except Exception as e:
-                cross_center_key = f"{source_client}_to_{target_client}"
-                logger.debug(f"Failed to evaluate {cross_center_key}: {type(e).__name__}: {e}")
-                # Don't fail entire cross-center evaluation for a single pair - just skip it
-                continue
-    
-    return cross_center_metrics
-
-
-def format_results_json_csv(
-    overall_metrics: dict[str, float],
-    per_client_metrics: dict[str, dict[str, float]],
-    weighted_metrics: dict[str, float],
-    cross_center_metrics: dict[str, dict[str, float]] | None = None,
-    output_dir: Path | None = None,
-) -> tuple[dict[str, dict[str, float] | dict[str, dict[str, float]]], pd.DataFrame, pd.DataFrame | None]:
-    """Format evaluation results into JSON and CSV format.
-    
-    Supports both classification and regression metrics automatically.
-    
-    Args:
-        overall_metrics: Overall metrics dictionary.
-        per_client_metrics: Per-client metrics dictionary.
-        weighted_metrics: Weighted average metrics.
-        cross_center_metrics: Cross-center evaluation results (optional).
-        output_dir: Directory to save results (optional).
-    
-    Returns:
-        Tuple of (results_dict, metrics_dataframe, cross_center_dataframe)
-    """
-    # Classification metrics
-    classification_metrics = [
-        "accuracy", "balanced_accuracy", "f1", "mcc", "roc_auc", 
-        "sensitivity", "specificity"
-    ]
-    
-    # Regression metrics
-    regression_metrics_list = [
-        "rmse", "mae", "max_error", "min_error",
-        "restored_rmse", "restored_mae", "restored_max_error", "restored_min_error"
-    ]
-    
-    # Detect which metrics are present (classification vs regression)
-    all_metrics_keys = set(overall_metrics.keys()) | set(weighted_metrics.keys())
-    for metrics in per_client_metrics.values():
-        all_metrics_keys.update(metrics.keys())
-    
-    is_classification = any(m in all_metrics_keys for m in classification_metrics)
-    is_regression = any(m in all_metrics_keys for m in regression_metrics_list)
-    
-    # Choose which metrics to keep based on what's present
-    if is_classification:
-        metrics_to_keep = classification_metrics
-    elif is_regression:
-        metrics_to_keep = regression_metrics_list
-    else:
-        # Keep all metrics if we can't determine type
-        metrics_to_keep = list(all_metrics_keys)
-    
-    # Helper to convert numpy types to Python floats for JSON serialization
-    def convert_to_serializable(obj):
-        if isinstance(obj, dict):
-            return {k: convert_to_serializable(v) for k, v in obj.items()}
-        elif isinstance(obj, (np.floating, np.integer)):
-            return float(obj)
-        elif isinstance(obj, (float, int)):
-            return obj
-        else:
-            return obj
-    
-    # Filter to only selected metrics
-    overall_filtered = {k: v for k, v in overall_metrics.items() if k in metrics_to_keep}
-    weighted_filtered = {k: v for k, v in weighted_metrics.items() if k in metrics_to_keep}
-    per_client_filtered = {
-        client: {k: v for k, v in metrics.items() if k in metrics_to_keep}
-        for client, metrics in per_client_metrics.items()
-    }
-    
-    # Prepare JSON results
-    results_dict = {
-        "overall": overall_filtered,
-        "weighted": weighted_filtered,
-        "per_client": per_client_filtered,
-    }
-    
-    if cross_center_metrics:
-        cross_center_filtered = {
-            k: {m: v for m, v in metrics.items() if m in metrics_to_keep}
-            for k, metrics in cross_center_metrics.items()
-        }
-        results_dict["cross_center"] = cross_center_filtered
-    
-    # Convert to serializable format with explicit type casting
-    results_dict_serializable: dict[str, dict[str, float] | dict[str, dict[str, float]]] = convert_to_serializable(results_dict)  # type: ignore
-    
-    # Prepare DataFrames for CSV
-    metrics_data: dict[str, list] = {"metric": []}
-    metrics_data["overall"] = []
-    metrics_data["weighted"] = []
-    for client in sorted(per_client_filtered.keys()):
-        metrics_data[client] = []
-    
-    for metric in metrics_to_keep:
-        metrics_data["metric"].append(metric)
-        metrics_data["overall"].append(float(overall_filtered.get(metric, np.nan)))
-        metrics_data["weighted"].append(float(weighted_filtered.get(metric, np.nan)))
-        for client in sorted(per_client_filtered.keys()):
-            metrics_data[client].append(float(per_client_filtered[client].get(metric, np.nan)))
-    
-    metrics_df = pd.DataFrame(metrics_data)
-    
-    # Prepare cross-center DataFrame
-    cross_center_df = None
-    if cross_center_metrics:
-        cross_center_data: dict[str, list] = {"metric": []}
-        for key in sorted(cross_center_metrics.keys()):
-            cross_center_data[key] = []
-        
-        for metric in metrics_to_keep:
-            cross_center_data["metric"].append(metric)
-            for key in sorted(cross_center_metrics.keys()):
-                metrics = cross_center_metrics[key]
-                cross_center_data[key].append(float(metrics.get(metric, np.nan)))
-        
-        cross_center_df = pd.DataFrame(cross_center_data)
-    
-    # Save to files if output_dir provided
-    if output_dir:
-        output_dir = Path(output_dir)
-        output_dir.mkdir(parents=True, exist_ok=True)
-        
-        # Save JSON
-        json_path = output_dir / "test_metrics.json"
-        with open(json_path, "w") as f:
-            json.dump(results_dict_serializable, f, indent=2)
-        logger.info(f"Saved metrics to {json_path}")
-        
-        # Save CSV
-        csv_path = output_dir / "test_metrics.csv"
-        metrics_df.to_csv(csv_path, index=False)
-        logger.info(f"Saved metrics to {csv_path}")
-        
-        # Save cross-center CSV if available
-        if cross_center_df is not None:
-            cross_center_csv_path = output_dir / "test_cross_center_metrics.csv"
-            cross_center_df.to_csv(cross_center_csv_path, index=False)
-            logger.info(f"Saved cross-center metrics to {cross_center_csv_path}")
-    
-    return results_dict_serializable, metrics_df, cross_center_df
-
-
 # ============================================================================
 # PR #2 — Monte Carlo Dropout Uncertainty Estimation
 # ============================================================================
 
 def enable_mc_dropout(model: torch.nn.Module) -> list[str]:
-    """Set only ``nn.Dropout`` layers to train mode; leave all others in eval.
+    """Set only nn.Dropout layers to train mode; leave all others in eval.
 
     Does NOT touch DropPath, BatchNorm, LayerNorm, or any timm stochastic layers.
 
@@ -1776,9 +1427,9 @@ def compute_classification_clinical_metrics_uncertainty(
 ) -> dict[str, dict[str, float] | dict[str, dict[str, float]]]:
     """Compute classification clinical metrics with consensus and per-pass sections.
 
-    Consensus metrics are computed on ``argmax(mean_t(probs_t))`` — the Bayesian
+    Consensus metrics are computed on argmax(mean_t(probs_t)) — the Bayesian
     model's averaged prediction.  Per-pass metrics capture variability across
-    dropout realisations using ``{mean, std}`` envelopes.
+    dropout realisations using {mean, std} envelopes.
 
     Args:
         all_outputs: List of per-pass probability arrays, each (n_samples, n_classes).
@@ -1786,9 +1437,9 @@ def compute_classification_clinical_metrics_uncertainty(
 
     Returns:
         Dict with two top-level keys:
-        - ``consensus``: flat float scalars (accuracy, balanced_accuracy, f1, mcc,
+        - consensus: flat float scalars (accuracy, balanced_accuracy, f1, mcc,
           roc_auc, cross_entropy, [specificity, sensitivity,] n_samples).
-        - ``per_pass``: ``{metric: {"mean": float, "std": float}}`` for each
+        - per_pass: {metric: {"mean": float, "std": float}} for each
           metric (same keys minus n_samples).
     """
     from models.cinema.cinema.classification.train import classification_metrics
@@ -2226,8 +1877,8 @@ def run_unified_evaluation(
     f. Fairness metrics
     g. JSON output with new schema
 
-    MC Dropout (PR #2): when ``mc_dropout=True``, runs stochastic forward passes
-    and appends uncertainty metrics under ``mc_dropout_uncertainty`` key.
+    MC Dropout: when mc_dropout=True, runs stochastic forward passes
+    and appends uncertainty metrics under mc_dropout_uncertainty key.
     """
     from flwr_cinema.scripts.lora import load_lora_state_dict
     from models.cinema.cinema.device import get_amp_dtype_and_device
@@ -2807,69 +2458,6 @@ def _run_mc_dropout_centralized(
     return result
 
 
-def compute_clinical_metrics_uncertainty(
-    all_outputs: list[np.ndarray],
-    all_labels: np.ndarray,
-    task_type: str,
-    reg_mean: float | None = None,
-    reg_std: float | None = None,
-) -> dict[str, dict[str, float]]:
-    """Compute mean and std of clinical metrics across MC Dropout passes.
-
-    Args:
-        all_outputs: List of per-pass outputs. For classification: list of (n_samples, n_classes) probs.
-                     For regression: list of (n_samples,) preds.
-        all_labels: Ground truth labels, shape (n_samples,).
-        task_type: "classification" or "regression".
-        reg_mean: Regression normalization mean, when task_type is "regression".
-        reg_std: Regression normalization std, when task_type is "regression".
-
-    Returns:
-        Dict mapping metric name to {"mean": float, "std": float}.
-    """
-    import torch.nn.functional as F
-
-    metrics_per_pass: list[dict[str, float]] = []
-
-    for pass_outputs in all_outputs:
-        if task_type == "classification":
-            from models.cinema.cinema.classification.train import classification_metrics
-            probs = torch.from_numpy(pass_outputs).to(dtype=torch.float32)
-            pred_labels = torch.argmax(probs, dim=1).numpy()
-            metrics = classification_metrics(
-                true_labels=all_labels, pred_labels=pred_labels, pred_probs=pass_outputs,
-            )
-            # Add balanced accuracy
-            from sklearn.metrics import balanced_accuracy_score
-            metrics["balanced_accuracy"] = float(
-                balanced_accuracy_score(y_true=all_labels, y_pred=pred_labels)
-            )
-            metrics_per_pass.append({k: float(v) for k, v in metrics.items()})
-        elif task_type == "regression":
-            from models.cinema.cinema.regression.train import regression_metrics
-            metrics = regression_metrics(true_labels=all_labels, pred_labels=pass_outputs)
-            if reg_mean is not None and reg_std is not None:
-                restored_metrics = regression_metrics(
-                    true_labels=(all_labels * reg_std) + reg_mean,
-                    pred_labels=(pass_outputs * reg_std) + reg_mean,
-                )
-                metrics.update({f"restored_{k}": v for k, v in restored_metrics.items() if k != "r2"})
-            metrics_per_pass.append({k: float(v) for k, v in metrics.items()})
-
-    if not metrics_per_pass:
-        return {}
-
-    result: dict[str, dict[str, float]] = {}
-    for metric_name in metrics_per_pass[0].keys():
-        values = [m[metric_name] for m in metrics_per_pass]
-        result[metric_name] = {
-            "mean": float(np.mean(values)),
-            "std": float(np.std(values)),
-        }
-
-    return result
-
-
 def _build_mc_uncertainty_entry(
     task_type: str,
     all_outputs: list,
@@ -2883,8 +2471,8 @@ def _build_mc_uncertainty_entry(
     """Build MC uncertainty dict with probabilistic + clinical metrics sections.
 
     Returns a dict with two sub-keys:
-    - ``probabilistic``: entropy, MI, per-class std (classification), std+CI (regression), Dice std (seg)
-    - ``clinical_metrics``: mean and std of each clinical metric across passes
+    - probabilistic: entropy, MI, per-class std (classification), std+CI (regression), Dice std (seg)
+    - clinical_metrics: mean and std of each clinical metric across passes
     """
     entry: dict[str, Any] = {"n_passes": len(all_outputs)}
     probabilistic: dict[str, Any] = {}
@@ -2955,8 +2543,8 @@ def _segmentation_clinical_metrics(
 ) -> dict[str, float]:
     """Lightweight segmentation metrics (Dice, IoU, Stability, Volume) — no Hausdorff.
 
-    Mirrors ``segmentation_metrics`` from cinema but skips the expensive
-    ``compute_hausdorff_distance`` to avoid memory fragmentation with many passes.
+    Mirrors segmentation_metrics from cinema but skips the expensive
+    compute_hausdorff_distance to avoid memory fragmentation with many passes.
     """
     import torch.nn.functional as F
 

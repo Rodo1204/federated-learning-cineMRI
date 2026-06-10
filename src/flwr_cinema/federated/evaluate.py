@@ -37,13 +37,11 @@ from flwr_cinema.scripts.eval_utils import (
 )
 
 
-def detect_model_variant(applied_head: bool, applied_local_lora: bool, applied_decoder: bool = False) -> str:
+def detect_model_variant(applied_head: bool, applied_decoder: bool = False) -> str:
     """Derive model variant exclusively from applied private artifacts."""
     parts = []
     if applied_head:
         parts.append("head")
-    if applied_local_lora:
-        parts.append("local_lora")
     if applied_decoder:
         parts.append("decoder")
     if parts:
@@ -55,7 +53,6 @@ def has_private_artifacts(checkpoint: dict[str, Any]) -> bool:
     """Return whether checkpoint contains any client-private evaluation artifacts."""
     return (
         bool(checkpoint.get("client_heads"))
-        or bool(checkpoint.get("client_local_loras"))
         or bool(checkpoint.get("client_decoders"))
     )
 
@@ -114,7 +111,7 @@ def resolve_checkpoint_for_evaluation(
 def build_base_model(config: dict[str, Any], checkpoint: dict[str, Any]) -> torch.nn.Module:
     """Recreate model and load global/base checkpoint weights."""
     from flwr_cinema.tasks.adapters import get_federated_task_adapter
-    from flwr_cinema.scripts.lora import load_global_lora_state_dict, load_lora_state_dict
+    from flwr_cinema.scripts.lora import load_lora_state_dict
     from omegaconf import OmegaConf
 
     cfg = OmegaConf.create(config)
@@ -130,18 +127,12 @@ def build_base_model(config: dict[str, Any], checkpoint: dict[str, Any]) -> torc
     if use_lora and isinstance(checkpoint.get("lora_state_dict"), dict):
         load_lora_state_dict(model, checkpoint["lora_state_dict"])
 
-    if isinstance(checkpoint.get("global_lora_state_dict"), dict):
-        load_global_lora_state_dict(model, checkpoint["global_lora_state_dict"])
-
     return model
 
 
 def apply_private_artifacts(model: torch.nn.Module, checkpoint: dict[str, Any], client_id: str) -> dict[str, bool]:
-    """Apply client-private head / decoder / local LoRA artifacts when present."""
-    from flwr_cinema.scripts.lora import load_local_lora_state_dict
-
+    """Apply client-private head / decoder artifacts when present."""
     applied_head = False
-    applied_local_lora = False
     applied_decoder = False
 
     # --- per-client head ---
@@ -154,16 +145,6 @@ def apply_private_artifacts(model: torch.nn.Module, checkpoint: dict[str, Any], 
         model.load_state_dict(model_state, strict=False)
         applied_head = True
 
-    # --- per-client local LoRA (Dual LoRA) ---
-    client_local_loras = checkpoint.get("client_local_loras")
-    if (
-        isinstance(client_local_loras, dict)
-        and client_id in client_local_loras
-        and isinstance(client_local_loras[client_id], dict)
-    ):
-        load_local_lora_state_dict(model, client_local_loras[client_id])
-        applied_local_lora = True
-
     # --- per-client decoder (ConvUNetR with aggregate_decoder=False) ---
     client_decoders = checkpoint.get("client_decoders")
     if isinstance(client_decoders, dict) and client_id in client_decoders and isinstance(client_decoders[client_id], dict):
@@ -174,7 +155,7 @@ def apply_private_artifacts(model: torch.nn.Module, checkpoint: dict[str, Any], 
         model.load_state_dict(model_state, strict=False)
         applied_decoder = True
 
-    return {"local_head": applied_head, "local_lora": applied_local_lora, "local_decoder": applied_decoder}
+    return {"local_head": applied_head, "local_decoder": applied_decoder}
 
 
 def build_eval_dataloader(dataset: Any) -> DataLoader:
@@ -206,7 +187,6 @@ def evaluate_single_client(
     applied = apply_private_artifacts(model=model, checkpoint=checkpoint, client_id=client_id)
     model_variant = detect_model_variant(
         applied_head=applied["local_head"],
-        applied_local_lora=applied["local_lora"],
         applied_decoder=applied.get("local_decoder", False),
     )
 

@@ -1,3 +1,8 @@
+"""Flower ServerApp entry point for federated training.
+
+Bootstraps the global model, resolves the aggregation strategy from config,
+runs the federated loop, and saves the final model with metrics.
+"""
 from datetime import datetime
 from pathlib import Path
 
@@ -29,10 +34,9 @@ def get_model(config: DictConfig) -> torch.nn.Module:
 def get_model_params(config: DictConfig, model: torch.nn.Module) -> dict:
     """Get parameters to send to clients.
 
-    Delegates to ``get_lora_policy``, which resolves the correct
-    extractor based on model architecture, LoRA flavour, and
-    ``federated.aggregate_head``. if full fine-tuning is used, 
-    ignores the aggregate_head setting and returns the full state_dict.
+    Uses get_lora_policy to resolve the correct extractor based on model
+    architecture, LoRA flavour, and federated.aggregate_head. Full fine-tuning
+    returns the full state_dict regardless of aggregate_head.
     """
     if not config.train.use_lora and not config.model.get("freeze_pretrained", False):
         return model.state_dict()
@@ -54,8 +58,7 @@ def load_arrays_into_model(
     """Load aggregated ArrayRecord parameters back into the global model.
 
     Handles LoRA (single/dual), frozen backbone, and full model modes.
-    Used by both the strategy mixin (for checkpoints) and
-    :func:`save_final_model`.
+    Used by both the strategy mixin (for checkpoints) and save_final_model.
     """
     state_dict = arrays.to_torch_state_dict()
     if not config.train.use_lora and not config.model.get("freeze_pretrained", False):
@@ -76,10 +79,10 @@ def get_strategy(
     global_model: torch.nn.Module,
     save_dir: Path,
 ) -> Strategy:
-    """Get federated learning strategy based on config.
-    
-    Creates the strategy with all CinemaStrategyMixin parameters wired from
-    the Hydra config, including the global model reference for checkpointing.
+    """Resolve and instantiate the aggregation strategy from config.
+
+    Wires all CinemaStrategyMixin parameters from Hydra config, including
+    the global model reference for checkpointing.
     """
 
     agg = getattr(config.federated, "aggregation_method", None)
@@ -88,7 +91,7 @@ def get_strategy(
     
     kwargs = {
         "arrayrecord_key": "model_params",
-        "weighted_by_key": "num_samples",  # Default to weighting by number of samples for aggregation, can be overridden by specific strategies if needed
+        "weighted_by_key": "num_samples",  # default, overridable per strategy
     }
     if agg_name == "fedavg":
         from flwr_cinema.strategies.fedAvg import FedAvgStrategy as FedStrategy
@@ -132,8 +135,7 @@ def get_strategy(
         max_n_ckpts=getattr(config.train, "max_n_ckpts", 5),
         aggregate_head=getattr(config.federated, "aggregate_head", True),
         aggregate_decoder=getattr(config.federated, "aggregate_decoder", True),
-        # FedAvg params can be added here as needed, e.g.:
-        # fraction_train=config.federated.fraction_train,
+        # FedAvg params (e.g. fraction_train) can be added here as needed.
         **kwargs
     )
 
@@ -146,22 +148,18 @@ def save_final_model(
     strategy: Strategy = None,
 ) -> None:
     """Save the final global model checkpoint with metrics and config.
-    
-    Loads the final aggregated parameters back into the global model,
-    then saves a comprehensive checkpoint with:
-    - Full model state_dict (backbone + aggregated LoRA/head)
-    - Separate LoRA weights (if applicable)
-    - Per-client local LoRA or unaggregated heads (if available in strategy)
-    - All training and evaluation metrics from the Flower Result
-    - The Hydra config used for this run
-    
+
+    Saves a comprehensive checkpoint: model state_dict, separate LoRA weights
+    (if applicable), per-client states, metrics history as JSON, and the
+    Hydra config.
+
     Args:
         save_dir: Directory to save checkpoint files.
-        model: The global model (will be updated with final aggregated params).
-        result: Flower Result object containing final arrays and metrics history.
-        config: Hydra DictConfig used for this run.
+        model: Global model (updated with final aggregated params).
+        result: Flower Result with final arrays and metrics.
+        config: Hydra DictConfig for this run.
         n_rounds: Number of rounds executed.
-        strategy: The strategy instance used, to extract client-specific states.
+        strategy: Strategy instance for client-specific states.
     """
 
     save_dir.mkdir(parents=True, exist_ok=True)

@@ -119,6 +119,7 @@ Key flags:
 | `--mc-dropout`        | Enable Monte Carlo Dropout uncertainty estimation            |
 | `--mc-dropout-passes` | Number of MC forward passes (default: 30)                    |
 | `--output-dir`        | Custom output directory for results                          |
+| `--output-file-name`  | Output JSON filename (default: evaluation_results.json)      |
 
 Results are saved as `evaluation_results.json` next to the checkpoint.
 
@@ -198,6 +199,7 @@ Key flags:
 | `--mc-dropout`        | Enable Monte Carlo Dropout uncertainty estimation            |
 | `--mc-dropout-passes` | Number of MC forward passes (default: 30)                    |
 | `--output-dir`        | Custom output directory for results                          |
+| `--output-file-name`  | Output JSON filename (default: evaluation_results.json)      |
 
 The evaluator automatically selects the best round by the primary metric configured in `train.early_stopping.metric`.
 

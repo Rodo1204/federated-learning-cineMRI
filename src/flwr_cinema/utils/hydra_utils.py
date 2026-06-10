@@ -1,10 +1,15 @@
+"""Hydra configuration utilities for Flower federated runs.
+
+Loads Hydra config from the run context and merges server-sent overrides
+into the client config at runtime.
+"""
 from flwr.app import Context, ConfigRecord
 from hydra import compose, initialize
 from omegaconf import DictConfig, OmegaConf
 from hydra.core.global_hydra import GlobalHydra
 
 def load_hydra_config(context: Context) -> DictConfig:
-    """Extract, validate, and load the Hydra configuration specified in the run config based on flwr context."""
+    """Load Hydra config from the run context (config_dir + config_name + overrides)."""
 
     config_dir = context.run_config.get("hydra_config_dir")
     config_name = context.run_config.get("hydra_config_name")
@@ -26,7 +31,7 @@ def load_hydra_config(context: Context) -> DictConfig:
     return cfg
 
 def update_config_from_config_record(config: DictConfig, config_record: ConfigRecord) -> DictConfig:
-    """Update the given Hydra config with values from the provided ConfigRecord, allowing for server-sent overrides."""
+    """Merge server-sent overrides from ConfigRecord into the Hydra config."""
     # TODO: May need to add some validations to ensure that only expected keys are updated
 
     server_config_dict = dict(config_record)
@@ -34,7 +39,7 @@ def update_config_from_config_record(config: DictConfig, config_record: ConfigRe
     OmegaConf.set_struct(config, False)  # Temporarily disable struct mode to allow merging
     
     for key, value in server_config_dict.items():
-        if key not in ["federated_timestamp", "server-round", "optimizer_steps_this_round" ]:  # Exclude certain keys that we don't want to merge into the config
+        if key not in ["federated_timestamp", "server-round", "optimizer_steps_this_round" ]:  # exclude metadata keys
             OmegaConf.update(config, key, value, merge=True)
 
     OmegaConf.set_struct(config, True)  # Re-enable struct mode after merging

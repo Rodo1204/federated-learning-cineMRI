@@ -1,3 +1,9 @@
+"""FedCE utility functions.
+
+Computes gamma_cos (cosine similarity between local delta and excluded gradient)
+and gamma_err (validation error) for FedCE client weighting. Also builds the
+excluded model w_k^-i used to evaluate gamma_err on each client.
+"""
 import math
 import time
 
@@ -9,7 +15,7 @@ from flwr.common.logger import log
 
 
 def compute_flattened_delta_and_global_gradient(global_weights: dict, local_weights: dict, global_gradient: dict) -> tuple[torch.Tensor, torch.Tensor]:
-        """Calculate the FedCE delta between global and local weights and flatten global gradients aswell."""
+        """Flatten weight deltas and global gradients into 1D tensors for cosine similarity."""
         delta_tensors = []
         global_gradient_tensors = [] 
         common_keys = [k for k in global_weights.keys() if k in local_weights]

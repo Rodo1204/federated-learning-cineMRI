@@ -1,6 +1,6 @@
 """Generic federated client for all tasks.
 
-A single concrete class that receives ``loss_fn`` and ``eval_dataloader_fn``
+A single concrete class that receives loss_fn and eval_dataloader_fn
 via constructor injection — no ABC, no subclassing needed.
 """
 
@@ -28,12 +28,7 @@ from models.cinema.cinema.convvit import param_groups_lr_decay
 from models.cinema.cinema.device import get_amp_dtype_and_device
 from models.cinema.cinema.optim import GradScaler
 from models.cinema.cinema.train import train_one_epoch
-from flwr_cinema.scripts.lora import (
-    get_local_lora_state_dict,
-    get_lora_policy,
-    has_dual_lora,
-    load_local_lora_state_dict,
-)
+from flwr_cinema.scripts.lora import get_lora_policy
 
 logger = logging.getLogger(__name__)
 
@@ -66,46 +61,27 @@ class FederatedClient:
     class serves classification, regression, and segmentation without
     subclassing.
 
-    Parameters
-    ----------
-    client_id : str
-        Unique client identifier.
-    model : nn.Module
-        Local model (initialized same as global).
-    train_loader : DataLoader
-        Local training data loader.
-    loss_fn : Callable
-        Task-specific loss function.
-    views : list[str]
-        Views to use.
-    local_epochs : int
-        Number of local training epochs per round.
-    lr : float
-        Learning rate.
-    weight_decay : float
-        Weight decay for optimizer.
-    clip_grad : float | None
-        Gradient clipping value.
-    use_lora : bool
-        Whether using LoRA.
-    freeze_pretrained : bool
-        Whether pretrained backbone is frozen.
-    aggregate_head : bool
-        Whether the server aggregates prediction heads (fed only).
-    val_loader : DataLoader, optional
-        Local validation data loader.
-    metrics_save_path : str, optional
-        Path to save metrics.
-    stats_save_path : str, optional
-        Path to save statistics.
-    run_dir : str, optional
-        Directory to save run files.
-    eval_dataloader_fn : Callable, optional
-        Function to evaluate model on a dataloader.
-    config : object, optional
-        Configuration object.
-    n_accum_steps : int
-        Number of gradient accumulation steps.
+    Args:
+        client_id: Unique client identifier.
+        model: Local model (initialized same as global).
+        train_loader: Local training data loader.
+        loss_fn: Task-specific loss function.
+        views: Views to use.
+        local_epochs: Number of local training epochs per round.
+        lr: Learning rate.
+        weight_decay: Weight decay for optimizer.
+        clip_grad: Gradient clipping value.
+        use_lora: Whether using LoRA.
+        freeze_pretrained: Whether pretrained backbone is frozen.
+        aggregate_head: Whether the server aggregates prediction heads (fed only).
+        aggregate_decoder: Whether the server aggregates decoder (fed only).
+        val_loader: Local validation data loader.
+        metrics_save_path: Path to save metrics.
+        stats_save_path: Path to save statistics.
+        run_dir: Directory to save run files.
+        eval_dataloader_fn: Function to evaluate model on a dataloader.
+        config: Configuration object.
+        n_accum_steps: Number of gradient accumulation steps.
     """
 
     def __init__(
@@ -158,7 +134,7 @@ class FederatedClient:
         self.model.to(self.device)
         log(logging.INFO, f"Client {self.client_id} - Initialized on device: {self.device}")
 
-        # Optimizer for local training
+        # Optimizer: full fine-tuning uses layer-wise decay; LoRA uses two groups.
         if not self.use_lora:
             param_groups = param_groups_lr_decay(
                 model,
@@ -179,6 +155,7 @@ class FederatedClient:
 
             param_groups = [
                 {"params": head_and_other_params, "weight_decay": self.weight_decay,},
+                # LoRA params get no weight decay — low-rank matrices are small.
                 {"params": lora_params, "weight_decay": 0.0},
             ]
         self.optimizer = torch.optim.AdamW(
@@ -218,7 +195,7 @@ class FederatedClient:
     def update_model(self, server_params: dict) -> None:
         """Update local model with parameters from server."""
         if not self.use_lora and not self.freeze_pretrained:
-            # Full fine-tuning: load all params (including buffers)
+            # Full fine-tuning: direct state_dict copy including buffers.
             for name, param in self.model.named_parameters():
                 if name in server_params:
                     param.data.copy_(server_params[name].to(param.device))
@@ -258,7 +235,7 @@ class FederatedClient:
     # ------------------------------------------------------------------
 
     def train_local(self, round_idx: int) -> int:
-        """Local training loop using the injected ``loss_fn``."""
+        """Local training loop using the injected loss_fn."""
         self.model.train()
         n_samples_trained = 0
 
@@ -284,7 +261,7 @@ class FederatedClient:
         return self.n_samples
 
     def validate_local(self) -> tuple[int, dict]:
-        """Local validation using the injected ``eval_dataloader_fn``."""
+        """Local validation using the injected eval_dataloader_fn."""
         if self.val_loader is None or self.eval_dataloader_fn is None:
             return 0, {}
 
@@ -349,13 +326,9 @@ class FederatedClient:
             del last_state_dict
 
             gamma_err = 1e-4
+            # Temporarily load excluded_model to evaluate error — restore on finally.
             try:
-                # W5 fix: filter out BN buffers from excluded_model before loading.
-                # The excluded_model is a mathematical construct — its BN running
-                # stats (mean/var) are linear interpolations that can produce
-                # invalid values (e.g., negative variance). The global model's
-                # BN stats, representing the federation's aggregate data
-                # distribution, are the correct normalization statistics.
+                # Strip BN stats from excluded_model — interpolated values can be invalid.
                 excluded_params_only = {
                     k: v for k, v in excluded_model.items()
                     if "running_" not in k and "num_batches_tracked" not in k
@@ -374,6 +347,7 @@ class FederatedClient:
                     f"for round {round_idx}: {primary_metric_value}",
                 )
                 if primary_metric_value is not None:
+                    # gamma_err: distance from perfect score (1.0 for max, 0.0 for min).
                     if primary_metric_direction == "max":
                         gamma_err = 1.0 - primary_metric_value
                     else:
@@ -421,9 +395,7 @@ class FederatedClient:
             self.update_model(model_state_dict)
 
         if strategy == "fedprox":
-            # ─── FedProx: wrap loss_fn with proximal term ──────────────────
-            # Called AFTER update_model (model holds w^t) but BEFORE dual
-            # LoRA loading (local adapters are not part of global consensus).
+            # Wrap loss_fn with proximal term (after update_model, before dual LoRA).
             proximal_mu = float(in_configs.get("proximal-mu", 0.0))
             _original_loss_fn = self.loss_fn
             if proximal_mu > 0:
@@ -432,24 +404,13 @@ class FederatedClient:
                 self.loss_fn = create_fedprox_loss_wrapper(
                     _original_loss_fn, self.model, proximal_mu
                 )
-            # ────────────────────────────────────────────────────────────────
-
-        # Load local LoRA if using dual LoRA
-        if self.use_lora and has_dual_lora(self.model):
-            if "local_lora" in context.state.array_records:
-                local_lora_record = context.state.array_records["local_lora"]
-                local_lora_state_dict = local_lora_record.to_torch_state_dict(
-                    keep_input=False
-                )
-                load_local_lora_state_dict(self.model, local_lora_state_dict)
 
         num_samples = self.train_local(round_idx)
 
         if strategy == "fedprox":
-            # ─── FedProx: restore original loss_fn ─────────────────────────
+            # Restore original loss_fn after training.
             if proximal_mu > 0:
                 self.loss_fn = _original_loss_fn
-            # ────────────────────────────────────────────────────────────────
 
         updated_state_dict = self.get_model_update()
 
@@ -457,16 +418,7 @@ class FederatedClient:
         out_metrics = MetricRecord()
         out_configs = ConfigRecord()
 
-        if self.use_lora and has_dual_lora(self.model):
-            local_lora_dict = get_local_lora_state_dict(self.model)
-            local_lora_record = ArrayRecord.from_torch_state_dict(
-                local_lora_dict, keep_input=False
-            )
-            context.state.array_records["local_lora"] = local_lora_record
-            out_record["local_lora_params"] = local_lora_record
-
-        # Estimate optimizer steps this round (floor division, matching centralized:
-        # only complete accumulation groups produce an optimizer step)
+        # Estimate optimizer steps this round (only complete accumulation groups count).
         optimizer_steps_this_round = 0
         if self.train_loader is not None:
             batches_per_epoch = len(self.train_loader)
@@ -480,6 +432,7 @@ class FederatedClient:
 
         agg_metrics = None
         if strategy == "fedce" and round_idx > 1:
+            # Clone — _compute_fedce mutates model, original dict stays clean for out_params.
             updated_state_dict = {k: v.clone() for k, v in updated_state_dict.items()}
             last_state_dict = context.state.array_records["last_model_params"].to_torch_state_dict(keep_input=False)
             agg_metrics = self._compute_fedce(
@@ -510,16 +463,9 @@ class FederatedClient:
             model_state_dict = in_params.to_torch_state_dict(keep_input=False)
             self.update_model(model_state_dict)
 
-        if self.use_lora and has_dual_lora(self.model):
-            if "local_lora" in context.state.array_records:
-                local_lora_record = context.state.array_records["local_lora"]
-                local_lora_state_dict = local_lora_record.to_torch_state_dict(
-                    keep_input=False
-                )
-                load_local_lora_state_dict(self.model, local_lora_state_dict)
-
         num_val_samples, metrics = self.validate_local()
 
+        # Drop metrics whose values can't be converted to Flower types.
         safe_metrics = {
             k: converted
             for k, v in metrics.items()

@@ -111,115 +111,6 @@ class LoRALinear(nn.Module):
                 self.lora_b.data.zero_()
 
 
-class DualLoRALinear(nn.Module):
-    """Dual LoRA adapter with global (aggregated) and local (personalized) components.
-    
-    For personalized federated learning, this module maintains:
-    - Global adapters (A_g, B_g): Shared across clients, aggregated via FedAvg
-    - Local adapters (A_l, B_l): Client-specific, never aggregated
-    
-    Forward pass:
-    output = Wx + (alpha_g/rank_g) * B_g @ A_g @ x + (alpha_l/rank_l) * B_l @ A_l @ x
-    
-    This enables:
-    1. Personalization: Each client adapts the model to its local distribution
-    2. Shared knowledge: Global adapters capture common patterns across domains
-    3. Privacy: Local adapters never leave the client device
-    4. Scalability: Only global params need to be aggregated
-    """
-
-    def __init__(
-        self,
-        original_layer: nn.Linear,
-        global_rank: int = 4,
-        local_rank: int = 4,
-        alpha: float = 8.0,
-        dropout: float = 0.0,
-    ) -> None:
-        """Initialize Dual LoRA adapter.
-        
-        Args:
-            original_layer: The original nn.Linear layer to adapt.
-            global_rank: Rank of global (aggregated) adapters (typically 4-8).
-            local_rank: Rank of local (personalized) adapters (typically 4-8).
-            alpha: Scaling factor for LoRA weights (typically 8-16).
-            dropout: Dropout probability for LoRA path.
-        """
-        super().__init__()
-        self.in_features = original_layer.in_features
-        self.out_features = original_layer.out_features
-        self.global_rank = global_rank
-        self.local_rank = local_rank
-        self.alpha = alpha
-        
-        # Separate scaling for global and local
-        self.scaling_g = alpha / global_rank if global_rank > 0 else 0.0
-        self.scaling_l = alpha / local_rank if local_rank > 0 else 0.0
-        
-        # Freeze original weights
-        self.weight = original_layer.weight
-        self.bias = original_layer.bias
-        self.weight.requires_grad = False
-        if self.bias is not None:
-            self.bias.requires_grad = False
-        
-        # Global LoRA trainable parameters (aggregated across clients via FedAvg)
-        self.lora_a_g = nn.Parameter(torch.zeros(global_rank, self.in_features))
-        self.lora_b_g = nn.Parameter(torch.zeros(self.out_features, global_rank))
-        nn.init.kaiming_uniform_(self.lora_a_g, a=5**0.5)
-        nn.init.zeros_(self.lora_b_g)
-        
-        # Local LoRA trainable parameters (client-specific, never aggregated)
-        self.lora_a_l = nn.Parameter(torch.zeros(local_rank, self.in_features))
-        self.lora_b_l = nn.Parameter(torch.zeros(self.out_features, local_rank))
-        nn.init.kaiming_uniform_(self.lora_a_l, a=5**0.5)
-        nn.init.zeros_(self.lora_b_l)
-        
-        self.dropout = nn.Dropout(p=dropout) if dropout > 0.0 else nn.Identity()
-    
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward pass with dual LoRA adaptation (global + local).
-        
-        Args:
-            x: Input tensor of shape (*, in_features).
-            
-        Returns:
-            Output tensor of shape (*, out_features).
-        """
-        # Base forward pass (frozen)
-        result = F.linear(x, self.weight, self.bias)
-        
-        # Global LoRA forward pass (aggregated component)
-        if self.global_rank > 0:
-            x_dropout = self.dropout(x)
-            lora_out_g = x_dropout @ self.lora_a_g.t() @ self.lora_b_g.t()
-            result = result + self.scaling_g * lora_out_g
-        
-        # Local LoRA forward pass (personalization component)
-        if self.local_rank > 0:
-            x_dropout = self.dropout(x)
-            lora_out_l = x_dropout @ self.lora_a_l.t() @ self.lora_b_l.t()
-            result = result + self.scaling_l * lora_out_l
-        
-        return result
-    
-    def merge_weights(self) -> None:
-        """Merge both global and local LoRA weights into the original layer for inference.
-        
-        This operation is irreversible and modifies the original weight tensor.
-        After merging, LoRA parameters can be discarded.
-        """
-        with torch.no_grad():
-            if self.global_rank > 0:
-                self.weight.data += self.scaling_g * (self.lora_b_g @ self.lora_a_g)
-                self.lora_a_g.data.zero_()
-                self.lora_b_g.data.zero_()
-            if self.local_rank > 0:
-                self.weight.data += self.scaling_l * (self.lora_b_l @ self.lora_a_l)
-                self.lora_a_l.data.zero_()
-                self.lora_b_l.data.zero_()
-
-
 def count_lora_parameters_by_block(
     model: ConvViT | ConvUNetR,
     blocks_to_lora: list[int] | None = None,
@@ -294,48 +185,6 @@ def apply_lora_to_attention(
                 logger.debug(f"Applied LoRA to {name} projection: {original_layer.in_features} -> {original_layer.out_features}, rank={rank}")
             else:
                 logger.warning(f"Module {name} is not nn.Linear, skipping LoRA application")
-        else:
-            logger.warning(f"Attention module does not have attribute {name}")
-
-
-def apply_dual_lora_to_attention(
-    attention_module: nn.Module,
-    global_rank: int = 4,
-    local_rank: int = 4,
-    alpha: float = 8.0,
-    dropout: float = 0.0,
-    target_modules: list[str] | None = None,
-) -> None:
-    """Apply Dual LoRA adapters to attention Q/K/V projections.
-    
-    Args:
-        attention_module: The attention module (cinema.vit.Attention).
-        global_rank: Rank of global (aggregated) adapters (typically 4-8).
-        local_rank: Rank of local (personalized) adapters (typically 4-8).
-        alpha: LoRA alpha scaling factor.
-        dropout: LoRA dropout rate.
-        target_modules: List of module names to apply LoRA to.
-    """
-    if target_modules is None:
-        target_modules = ["q", "kv"]
-    
-    for name in target_modules:
-        if hasattr(attention_module, name):
-            original_layer = getattr(attention_module, name)
-            if isinstance(original_layer, nn.Linear):
-                dual_lora_layer = DualLoRALinear(
-                    original_layer=original_layer,
-                    global_rank=global_rank,
-                    local_rank=local_rank,
-                    alpha=alpha,
-                    dropout=dropout,
-                )
-                setattr(attention_module, name, dual_lora_layer)
-                logger.debug(
-                    f"Applied Dual LoRA to {name}: global_rank={global_rank}, local_rank={local_rank}"
-                )
-            else:
-                logger.warning(f"Module {name} is not nn.Linear, skipping Dual LoRA")
         else:
             logger.warning(f"Attention module does not have attribute {name}")
 
@@ -525,106 +374,6 @@ def apply_lora_to_convunetr(
 
 
 
-
-def apply_dual_lora_to_convvit(
-    model: ConvViT,
-    global_rank: int = 4,
-    local_rank: int = 4,
-    alpha: float = 8.0,
-    dropout: float = 0.0,
-    target_modules: list[str] | None = None,
-    blocks_to_lora: list[int] | None = None,
-) -> None:
-    """Apply Dual LoRA adapters to ConvViT model's transformer attention layers.
-    
-    This function:
-    1. Applies Dual LoRA to specified (or all) attention Q/K/V projections in ViT encoder blocks
-    2. Global adapters (shared) are aggregated via FedAvg during federation
-    3. Local adapters (personalized) stay on each client and are never aggregated
-    4. Freezes all pretrained parameters except LoRA and prediction heads
-    
-    Args:
-        model: ConvViT model instance.
-        global_rank: Rank of global (aggregated) adapters (typically 4-8).
-        local_rank: Rank of local (personalized) adapters (typically 4-8).
-        alpha: LoRA alpha scaling (typically 8-16).
-        dropout: LoRA dropout rate (typically 0.0-0.1).
-        target_modules: Which attention modules to adapt. Default ["q", "kv"].
-        blocks_to_lora: List of block indices to apply LoRA to. If None, applies to all blocks (0-11 for ViT-B).
-                       Both global and local adapters use the same blocks.
-    """
-    # First, freeze all model parameters
-    for param in model.parameters():
-        param.requires_grad = False
-    
-    # Default: apply to all blocks if not specified
-    encoder = model.encoder
-    if blocks_to_lora is None and hasattr(encoder, "blocks"):
-        blocks_to_lora = list(range(len(encoder.blocks)))
-    
-    # Validate block indices
-    if blocks_to_lora and hasattr(encoder, "blocks"):
-        invalid_blocks = [b for b in blocks_to_lora if b < 0 or b >= len(encoder.blocks)]
-        if invalid_blocks:
-            logger.warning(
-                f"Invalid block indices {invalid_blocks}. Valid range: [0, {len(encoder.blocks)-1}]. "
-                f"Using valid blocks from {blocks_to_lora}."
-            )
-            blocks_to_lora = [b for b in blocks_to_lora if 0 <= b < len(encoder.blocks)]
-    
-    logger.info(
-        f"Applying Dual LoRA (global_rank={global_rank}, local_rank={local_rank}, "
-        f"alpha={alpha}, dropout={dropout}) to ConvViT attention layers. "
-        f"Blocks: {blocks_to_lora}"
-    )
-    
-    # Apply Dual LoRA to selected encoder blocks
-    lora_count = 0
-    if hasattr(encoder, "blocks"):
-        for block_idx, block in enumerate(encoder.blocks):
-            # Only apply Dual LoRA to blocks in blocks_to_lora list
-            if block_idx in blocks_to_lora and hasattr(block, "attn"):
-                apply_dual_lora_to_attention(
-                    attention_module=block.attn,
-                    global_rank=global_rank,
-                    local_rank=local_rank,
-                    alpha=alpha,
-                    dropout=dropout,
-                    target_modules=target_modules,
-                )
-                lora_count += 1
-                logger.debug(f"Applied Dual LoRA to encoder block {block_idx}")
-    
-    # Unfreeze prediction heads for task-specific fine-tuning
-    if hasattr(model, 'pred_head_dict'):
-        for head in model.pred_head_dict.parameters():
-            head.requires_grad = True
-        logger.info("Unfroze prediction heads for task-specific training")
-    
-    # Count trainable parameters
-    global_params = sum(
-        p.numel() for m in model.modules() if isinstance(m, DualLoRALinear)
-        for p in [m.lora_a_g, m.lora_b_g]
-    )
-    local_params = sum(
-        p.numel() for m in model.modules() if isinstance(m, DualLoRALinear)
-        for p in [m.lora_a_l, m.lora_b_l]
-    )
-    total_params = sum(p.numel() for p in model.parameters())
-    
-    # Count per-block parameters
-    param_counts = count_lora_parameters_by_block(model, blocks_to_lora)
-    
-    logger.info(
-        f"Dual LoRA applied to {lora_count} attention blocks. "
-        f"Global params: {global_params:,} (aggregated via FedAvg) | "
-        f"Local params: {local_params:,} (personalized, never aggregated) | "
-        f"Total trainable: {global_params + local_params:,} / {total_params:,} "
-        f"({100 * (global_params + local_params) / total_params:.2f}%)"
-    )
-    logger.debug(f"Parameter breakdown: {param_counts}")
-
-
 def get_lora_parameters(model: nn.Module) -> list[nn.Parameter]:
     """Extract only LoRA parameters from a model.
     
@@ -648,21 +397,12 @@ def get_lora_state_dict(model: nn.Module) -> dict[str, torch.Tensor]:
         model: Model with LoRA adapters.
         
     Returns:
-        State dict containing LoRA parameters.
-        - Standard LoRA: {module.lora_a, module.lora_b}
-        - Dual LoRA: {module.lora_a_g, module.lora_b_g, module.lora_a_l, module.lora_b_l}
+        State dict containing LoRA parameters ({module.lora_a, module.lora_b}).
     """
     lora_state_dict = {}
     
     for name, module in model.named_modules():
-        if isinstance(module, DualLoRALinear):
-            # Dual LoRA: extract global and local adapters
-            lora_state_dict[f"{name}.lora_a_g"] = module.lora_a_g.data.clone()
-            lora_state_dict[f"{name}.lora_b_g"] = module.lora_b_g.data.clone()
-            lora_state_dict[f"{name}.lora_a_l"] = module.lora_a_l.data.clone()
-            lora_state_dict[f"{name}.lora_b_l"] = module.lora_b_l.data.clone()
-        elif isinstance(module, LoRALinear):
-            # Standard LoRA: extract adapters
+        if isinstance(module, LoRALinear):
             lora_state_dict[f"{name}.lora_a"] = module.lora_a.data.clone()
             lora_state_dict[f"{name}.lora_b"] = module.lora_b.data.clone()
     
@@ -674,28 +414,10 @@ def load_lora_state_dict(model: nn.Module, lora_state_dict: dict[str, torch.Tens
     
     Args:
         model: Model with LoRA adapters.
-        lora_state_dict: State dict containing LoRA parameters.
-            - Standard LoRA: {module.lora_a, module.lora_b}
-            - Dual LoRA: {module.lora_a_g, module.lora_b_g, module.lora_a_l, module.lora_b_l}
+        lora_state_dict: State dict containing LoRA parameters ({module.lora_a, module.lora_b}).
     """
     for name, module in model.named_modules():
-        if isinstance(module, DualLoRALinear):
-            # Dual LoRA loading
-            lora_a_g_key = f"{name}.lora_a_g"
-            lora_b_g_key = f"{name}.lora_b_g"
-            lora_a_l_key = f"{name}.lora_a_l"
-            lora_b_l_key = f"{name}.lora_b_l"
-            
-            if lora_a_g_key in lora_state_dict:
-                module.lora_a_g.data.copy_(lora_state_dict[lora_a_g_key])
-            if lora_b_g_key in lora_state_dict:
-                module.lora_b_g.data.copy_(lora_state_dict[lora_b_g_key])
-            if lora_a_l_key in lora_state_dict:
-                module.lora_a_l.data.copy_(lora_state_dict[lora_a_l_key])
-            if lora_b_l_key in lora_state_dict:
-                module.lora_b_l.data.copy_(lora_state_dict[lora_b_l_key])
-        elif isinstance(module, LoRALinear):
-            # Standard LoRA loading
+        if isinstance(module, LoRALinear):
             lora_a_key = f"{name}.lora_a"
             lora_b_key = f"{name}.lora_b"
             if lora_a_key in lora_state_dict:
@@ -715,21 +437,14 @@ def get_lora_and_head_state_dict(model: nn.Module) -> dict[str, torch.Tensor]:
         
     Returns:
         State dict containing:
-        - LoRA parameters (lora_a, lora_b for standard LoRA or lora_a_g/lora_b_g/lora_a_l/lora_b_l for dual)
+        - LoRA parameters (lora_a, lora_b)
         - Classification/regression head parameters (pred_head_dict)
     """
     combined_state_dict = {}
     
     # Extract LoRA parameters
     for name, module in model.named_modules():
-        if isinstance(module, DualLoRALinear):
-            # Dual LoRA: extract global and local adapters
-            combined_state_dict[f"{name}.lora_a_g"] = module.lora_a_g.data.clone()
-            combined_state_dict[f"{name}.lora_b_g"] = module.lora_b_g.data.clone()
-            combined_state_dict[f"{name}.lora_a_l"] = module.lora_a_l.data.clone()
-            combined_state_dict[f"{name}.lora_b_l"] = module.lora_b_l.data.clone()
-        elif isinstance(module, LoRALinear):
-            # Standard LoRA: extract adapters
+        if isinstance(module, LoRALinear):
             combined_state_dict[f"{name}.lora_a"] = module.lora_a.data.clone()
             combined_state_dict[f"{name}.lora_b"] = module.lora_b.data.clone()
     
@@ -752,23 +467,7 @@ def load_lora_and_head_state_dict(model: nn.Module, combined_state_dict: dict[st
     """
     # Load LoRA parameters
     for name, module in model.named_modules():
-        if isinstance(module, DualLoRALinear):
-            # Dual LoRA loading
-            lora_a_g_key = f"{name}.lora_a_g"
-            lora_b_g_key = f"{name}.lora_b_g"
-            lora_a_l_key = f"{name}.lora_a_l"
-            lora_b_l_key = f"{name}.lora_b_l"
-            
-            if lora_a_g_key in combined_state_dict:
-                module.lora_a_g.data.copy_(combined_state_dict[lora_a_g_key])
-            if lora_b_g_key in combined_state_dict:
-                module.lora_b_g.data.copy_(combined_state_dict[lora_b_g_key])
-            if lora_a_l_key in combined_state_dict:
-                module.lora_a_l.data.copy_(combined_state_dict[lora_a_l_key])
-            if lora_b_l_key in combined_state_dict:
-                module.lora_b_l.data.copy_(combined_state_dict[lora_b_l_key])
-        elif isinstance(module, LoRALinear):
-            # Standard LoRA loading
+        if isinstance(module, LoRALinear):
             lora_a_key = f"{name}.lora_a"
             lora_b_key = f"{name}.lora_b"
             if lora_a_key in combined_state_dict:
@@ -787,13 +486,11 @@ def load_lora_and_head_state_dict(model: nn.Module, combined_state_dict: dict[st
 def merge_all_lora_weights(model: nn.Module) -> None:
     """Merge all LoRA weights into original layers for inference.
     
-    Works with both LoRALinear and DualLoRALinear modules.
-    
     Args:
         model: Model with LoRA adapters.
     """
     for module in model.modules():
-        if isinstance(module, (LoRALinear, DualLoRALinear)):
+        if isinstance(module, LoRALinear):
             module.merge_weights()
     logger.info("Merged all LoRA weights into base model")
 
@@ -987,209 +684,6 @@ def load_lora_decoder_state_dict(
     _load_decoder_params(model, state_dict)
 
 
-# Dual LoRA parameter extraction and loading functions
-
-def get_global_lora_state_dict(model: nn.Module) -> dict[str, torch.Tensor]:
-    """Extract only GLOBAL LoRA parameters for server-side aggregation.
-    
-    This extracts only the global adapters (A_g, B_g) that should be aggregated
-    via FedAvg. Local adapters are excluded and remain on the client.
-    
-    Args:
-        model: Model with Dual LoRA adapters.
-        
-    Returns:
-        State dict containing only global LoRA parameters (lora_a_g, lora_b_g).
-    """
-    global_state_dict = {}
-    for name, module in model.named_modules():
-        if isinstance(module, DualLoRALinear):
-            global_state_dict[f"{name}.lora_a_g"] = module.lora_a_g.data.clone()
-            global_state_dict[f"{name}.lora_b_g"] = module.lora_b_g.data.clone()
-    return global_state_dict
-
-
-def get_global_lora_and_head_state_dict(model: nn.Module) -> dict[str, torch.Tensor]:
-    """Extract GLOBAL LoRA parameters AND head parameters for federated communication.
-    
-    For Dual LoRA models, this extracts:
-    - Global adapters (lora_a_g, lora_b_g) - to be aggregated on server
-    - Classification/regression head parameters - to be aggregated on server
-    - NOT local adapters (lora_a_l, lora_b_l) - these stay on client only
-    
-    This is used during federated learning to send only the aggregatable parts.
-    
-    Args:
-        model: Model with Dual LoRA adapters.
-        
-    Returns:
-        State dict containing global LoRA parameters and head parameters.
-    """
-    global_and_head_dict = {}
-    
-    # Extract GLOBAL LoRA parameters only (not local)
-    for name, module in model.named_modules():
-        if isinstance(module, DualLoRALinear):
-            global_and_head_dict[f"{name}.lora_a_g"] = module.lora_a_g.data.clone()
-            global_and_head_dict[f"{name}.lora_b_g"] = module.lora_b_g.data.clone()
-    
-    # Extract classification/regression head parameters
-    if hasattr(model, 'pred_head_dict'):
-        for view_name, head_module in model.pred_head_dict.items():
-            for param_name, param in head_module.named_parameters():
-                key = f"pred_head_dict.{view_name}.{param_name}"
-                global_and_head_dict[key] = param.data.clone()
-    
-    return global_and_head_dict
-
-
-def get_local_lora_state_dict(model: nn.Module) -> dict[str, torch.Tensor]:
-    """Extract only LOCAL LoRA parameters (client-specific).
-    
-    Use this to backup/restore local parameters on the client.
-    These should never be sent to or modified on the server.
-    
-    Args:
-        model: Model with Dual LoRA adapters.
-        
-    Returns:
-        State dict containing only local LoRA parameters (lora_a_l, lora_b_l).
-    """
-    local_state_dict = {}
-    for name, module in model.named_modules():
-        if isinstance(module, DualLoRALinear):
-            local_state_dict[f"{name}.lora_a_l"] = module.lora_a_l.data.clone()
-            local_state_dict[f"{name}.lora_b_l"] = module.lora_b_l.data.clone()
-    return local_state_dict
-
-
-def load_global_lora_state_dict(
-    model: nn.Module,
-    global_state_dict: dict[str, torch.Tensor],
-) -> None:
-    """Load GLOBAL LoRA parameters while preserving LOCAL parameters.
-    
-    Use this on the server after FedAvg aggregation to update only global params.
-    Local parameters remain unchanged on the server and clients.
-    
-    Args:
-        model: Model with Dual LoRA adapters.
-        global_state_dict: State dict containing global parameters (from FedAvg aggregation).
-    """
-    for name, module in model.named_modules():
-        if isinstance(module, DualLoRALinear):
-            lora_a_g_key = f"{name}.lora_a_g"
-            lora_b_g_key = f"{name}.lora_b_g"
-            if lora_a_g_key in global_state_dict:
-                module.lora_a_g.data.copy_(global_state_dict[lora_a_g_key])
-            if lora_b_g_key in global_state_dict:
-                module.lora_b_g.data.copy_(global_state_dict[lora_b_g_key])
-
-
-def load_global_lora_and_head_state_dict(
-    model: nn.Module,
-    global_and_head_dict: dict[str, torch.Tensor],
-) -> None:
-    """Load GLOBAL LoRA and head parameters while preserving LOCAL LoRA parameters.
-    
-    For Dual LoRA models, this loads:
-    - Aggregated global adapters (lora_a_g, lora_b_g)
-    - Aggregated head parameters
-    - Does NOT touch local adapters (lora_a_l, lora_b_l) - they stay unchanged
-    
-    Use this on clients after receiving aggregated parameters from server.
-    
-    Args:
-        model: Model with Dual LoRA adapters.
-        global_and_head_dict: State dict with global LoRA params and head params.
-    """
-    # Load GLOBAL LoRA parameters only (preserves local)
-    for name, module in model.named_modules():
-        if isinstance(module, DualLoRALinear):
-            lora_a_g_key = f"{name}.lora_a_g"
-            lora_b_g_key = f"{name}.lora_b_g"
-            if lora_a_g_key in global_and_head_dict:
-                module.lora_a_g.data.copy_(global_and_head_dict[lora_a_g_key])
-            if lora_b_g_key in global_and_head_dict:
-                module.lora_b_g.data.copy_(global_and_head_dict[lora_b_g_key])
-    
-    # Load head parameters
-    if hasattr(model, 'pred_head_dict'):
-        for view_name, head_module in model.pred_head_dict.items():
-            for param_name, param in head_module.named_parameters():
-                key = f"pred_head_dict.{view_name}.{param_name}"
-                if key in global_and_head_dict:
-                    param.data.copy_(global_and_head_dict[key])
-
-
-def load_local_lora_state_dict(
-    model: nn.Module,
-    local_state_dict: dict[str, torch.Tensor],
-) -> None:
-    """Load LOCAL LoRA parameters (client-specific).
-    
-    Use this to restore client-specific local adapters.
-    
-    Args:
-        model: Model with Dual LoRA adapters.
-        local_state_dict: State dict containing local parameters.
-    """
-    for name, module in model.named_modules():
-        if isinstance(module, DualLoRALinear):
-            lora_a_l_key = f"{name}.lora_a_l"
-            lora_b_l_key = f"{name}.lora_b_l"
-            if lora_a_l_key in local_state_dict:
-                module.lora_a_l.data.copy_(local_state_dict[lora_a_l_key])
-            if lora_b_l_key in local_state_dict:
-                module.lora_b_l.data.copy_(local_state_dict[lora_b_l_key])
-
-
-def freeze_local_lora(model: nn.Module) -> None:
-    """Freeze local LoRA parameters (for server-side aggregation).
-    
-    When aggregating on the server, freeze local parameters so they don't
-    accidentally get updated. They should only change on the client.
-    
-    Args:
-        model: Model with Dual LoRA adapters.
-    """
-    for module in model.modules():
-        if isinstance(module, DualLoRALinear):
-            module.lora_a_l.requires_grad = False
-            module.lora_b_l.requires_grad = False
-    logger.info("Froze local LoRA parameters")
-
-
-def unfreeze_local_lora(model: nn.Module) -> None:
-    """Unfreeze local LoRA parameters (for client-side training).
-    
-    On the client, both global and local parameters should be trainable.
-    
-    Args:
-        model: Model with Dual LoRA adapters.
-    """
-    for module in model.modules():
-        if isinstance(module, DualLoRALinear):
-            module.lora_a_l.requires_grad = True
-            module.lora_b_l.requires_grad = True
-    logger.info("Unfroze local LoRA parameters")
-
-
-def has_dual_lora(model: nn.Module) -> bool:
-    """Check if model has Dual LoRA adapters.
-    
-    Args:
-        model: Model to check.
-        
-    Returns:
-        True if model contains DualLoRALinear modules, False otherwise.
-    """
-    for module in model.modules():
-        if isinstance(module, DualLoRALinear):
-            return True
-    return False
-
-
 def get_trainable_state_dict(model: nn.Module) -> dict[str, torch.Tensor]:
     """Extract only trainable parameters as a state dict.
     
@@ -1251,8 +745,8 @@ def get_lora_policy(
     ----------
     model:
         The concrete model instance (ConvViT, ConvUNetR, etc.).  The function
-        inspects the model's attributes (e.g. ``has_dual_lora``,
-        ``hasattr(model, "decoder_dict")``) to select the right variant.
+        inspects the model's attributes (e.g. ``hasattr(model, "decoder_dict")``)
+        to select the right variant.
     use_lora:
         Whether LoRA adapters are active.
     freeze_pretrained:
@@ -1272,7 +766,6 @@ def get_lora_policy(
     LoRaPolicy(get=…, load=…)
         Appropriate extractor/loader pair for the current model state.
     """
-    is_dual: bool = has_dual_lora(model)
     is_unetr: bool = hasattr(model, "decoder_dict")
 
     # ── No LoRA (head-only) ──────────────────────────────────────
@@ -1306,18 +799,6 @@ def get_lora_policy(
         return LoRaPolicy(
             get=get_lora_decoder_state_dict,
             load=load_lora_decoder_state_dict,
-        )
-
-    # ── Dual LoRA (ConvViT) ────────────────────────────────────────────────────
-    if is_dual:
-        if aggregate_head:
-            return LoRaPolicy(
-                get=get_global_lora_and_head_state_dict,
-                load=load_global_lora_and_head_state_dict,
-            )
-        return LoRaPolicy(
-            get=get_global_lora_state_dict,
-            load=load_global_lora_state_dict,
         )
 
     # ── Standard LoRA (ConvViT) ────────────────────────────────────────────────

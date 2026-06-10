@@ -21,42 +21,20 @@ def create_fedprox_loss_wrapper(
     model: nn.Module,
     proximal_mu: float,
 ) -> Callable[..., tuple[torch.Tensor, dict[str, float]]]:
-    """Wrap a loss function with the FedProx proximal regularization term.
+    """Wrap a loss function with the FedProx proximal term (mu/2)*||w - w^t||^2.
 
-    Takes a snapshot of *all trainable parameters* from ``model`` at
-    wrapper-creation time — the caller is responsible for ensuring that
-    ``model`` already holds the global weights ``w^t`` (i.e. after
-    ``update_model()`` and before any local training).
+    Snapshots trainable parameters at call time — the caller must ensure model
+    already holds global weights w^t (after update_model, before local training).
 
-    The returned callable accepts the four shared positional parameters
-    (``model``, ``batch``, ``views``, ``device``) plus any extra keyword
-    arguments that ``original_loss_fn`` may need.  This makes the wrapper
-    compatible with classification (``label_smoothing``), segmentation
-    (``loss_fn``), and future task loss functions without change.
+    The returned callable computes: L_task + (mu / 2) * ||w - w^t||^2.
 
-    On every call the wrapper:
+    Args:
+        original_loss_fn: Task loss callable(model, batch, views, device, **kwargs).
+        model: Model whose trainable params are snapshotted as w^t.
+        proximal_mu: Proximal term weight (0.0 = vanilla FedAvg).
 
-    1. Calls ``original_loss_fn(model, batch, views, device, **kwargs)``
-       to obtain the task loss ``L_task`` and the standard metrics dict.
-    2. Computes ``||w - w^t||^2`` — the squared L2 norm of the
-       difference between the current *trainable* model parameters
-       and the frozen global snapshot.
-    3. Returns ``L_task + (mu / 2) * proximal_term`` and adds
-       ``"proximal_term"`` to the metrics dict.
-
-    Parameters
-    ----------
-    original_loss_fn:
-        The task-specific loss callable. Must accept ``model``, ``batch``,
-        ``views``, and ``device`` as its first four positional arguments.
-    model:
-        The model whose trainable parameters will be snapshotted as ``w^t``.
-    proximal_mu:
-        FedProx proximal-term weight (0.0 = vanilla FedAvg).
-
-    Returns
-    -------
-    Callable with the same signature as ``original_loss_fn``.
+    Returns:
+        Wrapped callable with same signature as original_loss_fn.
     """
     # Snapshot all trainable parameters at wrapper-creation time.
     # Kept on the model's device so the per-batch proximal term

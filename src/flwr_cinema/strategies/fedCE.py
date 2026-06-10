@@ -1,3 +1,11 @@
+"""FedCE aggregation strategy.
+
+Implements FedCE weighting: clients compute gamma_cos (cosine similarity to
+global gradient) and gamma_err (validation error), the server normalizes and
+combines them into per-client aggregation weights rho.
+
+Reference: FedCE (Federated Contributive Explanation), ISBI 2025.
+"""
 from flwr.app import Message, ArrayRecord, ConfigRecord, MetricRecord, RecordDict
 from flwr.serverapp import Grid
 from flwr.serverapp.strategy import FedAvg
@@ -12,26 +20,28 @@ from flwr.common.logger import log
 _FEDCE_MIN_WEIGHT = 1e-3
 
 class FedCE(FedAvg):
-    """Federated strategy implementing FedCE aggregation, combined with CineMA-specific logic (step-based validation, 
-    early stopping, checkpointing).
-    
-    All parameters are forwarded through **kwargs — CinemaStrategyMixin consumes
-    its own (eval_steps, primary_metric_name, etc.) and passes the rest to FedAvg
-    (fraction_train, weighted_by_key, etc.).
+    """FedAvg variant implementing FedCE client weighting.
+
+    Clients compute gamma_cos and gamma_err; server normalizes and combines
+    them into rho weights for weighted aggregation.
+
+    Args are forwarded: CinemaStrategyMixin consumes its own (eval_steps,
+    primary_metric_name, etc.), the rest go to FedAvg.
     """
     def __init__(self, **kwargs):
-        combination_method = kwargs.pop("combination_method", "multiplication") # Method to combine gamma_cos and gamma_err ("multiplication" or "sum")
+        combination_method = kwargs.pop("combination_method", "multiplication")
         log(INFO, f"Initializing FedCE strategy with combination method: {combination_method}")
         self.combination_method = combination_method if combination_method in ["multiplication", "sum"] else "multiplication"
 
-        kwargs["weighted_by_key"] = "fedce_normalized_rho" # use the normalized rho as the key for weighted aggregation to reuse the existing weighted aggregation logic in FedAvg
+        # Use normalized rho as aggregation weight key to reuse FedAvg's weighted logic.
+        kwargs["weighted_by_key"] = "fedce_normalized_rho"
         kwargs["train_metrics_aggr_fn"] = lambda replies, _: aggregate_metricrecords(replies, "num_samples")
         super().__init__(**kwargs)
-        self.prev_normalized_rho_by_client: dict[str, float] = {}  
-        self._previous_global_params: ArrayRecord | None = None # Store global parameters to send to clients for FedCE calculations
-        self.global_gradient: ArrayRecord | None = None # Store global gradient to send to clients for FedCE calculations
-        self.accumulated_gammas: dict[str, float] = {}  
-        self.first_round_uniform_rho: float | None = None # Store the uniform rho value for the first round when we don't have any previous information
+        self.prev_normalized_rho_by_client: dict[str, float] = {}
+        self._previous_global_params: ArrayRecord | None = None  # W_{t-1} for global gradient
+        self.global_gradient: ArrayRecord | None = None  # sent to clients for gamma_cos
+        self.accumulated_gammas: dict[str, float] = {}
+        self.first_round_uniform_rho: float | None = None  # 1/|C| for round 1
 
     def compute_global_gradient(self, previous_global_params: ArrayRecord, aggregated_params: ArrayRecord) -> ArrayRecord:
         """Compute the global gradient as the difference between the previous global parameters and the newly aggregated parameters."""
@@ -52,16 +62,13 @@ class FedCE(FedAvg):
         config: ConfigRecord,
         grid: Grid,
     ) -> Iterable[Message]:
-        """Override configure_train to include FedCE-specific data (global gradients, previous rhos) in the messages sent to clients."""
+        """Inject FedCE data (global gradient, prev rho) into client messages."""
     
         self._previous_global_params = arrays
 
-        # First call the parent method to get the base messages with global weights
-        # log(INFO, f"Configuring train messages for server round {server_round}. Global weights keys: {arrays.keys() if arrays else 'No global weights'}")
         base_messages = list(super().configure_train(server_round, arrays, config, grid))
-
         if not base_messages:
-            return base_messages  # No clients selected, return empty
+            return base_messages
         
         if server_round == 1: 
             total_clients = len(list(grid.get_node_ids())) 
@@ -71,34 +78,32 @@ class FedCE(FedAvg):
 
         for message in base_messages:
             client_id = str(message.metadata.dst_node_id)
-            new_content = RecordDict() # Create a copy of the content to modify
+            new_content = RecordDict()
             log(INFO, f"Configuring train message for client {client_id} with content keys: {message.content.keys()}")
             for key, record in message.content.items():
                 if isinstance(record, ConfigRecord):
-                    new_content[key] = ConfigRecord(record)  # Create a copy of the ConfigRecord 
-                else: # We keep the reference for tensor records to avoid unnecessary copying
+                    new_content[key] = ConfigRecord(record)
+                else:
                     new_content[key] = record
 
-            strategy_data = ConfigRecord() # Create a new ConfigRecord for strategy-specific data
-            
-            strategy_data["prev_fedce_rho"] = float(self.prev_normalized_rho_by_client.get(client_id, self.first_round_uniform_rho)) # Include previous rho for this client, default to 0.0 for the first round
-            strategy_data["primary_metric_name"] = self.primary_metric_name # Pass primary metric name
-            strategy_data["primary_metric_direction"] = self.metric_direction # Pass primary metric direction
+            strategy_data = ConfigRecord()
+            strategy_data["prev_fedce_rho"] = float(self.prev_normalized_rho_by_client.get(client_id, self.first_round_uniform_rho))
+            strategy_data["primary_metric_name"] = self.primary_metric_name
+            strategy_data["primary_metric_direction"] = self.metric_direction
             new_content["strategy_data"] = strategy_data
             log(INFO, f"Configuring train message for client {client_id} with prev_fedce_rho: {strategy_data['prev_fedce_rho']}")
 
             if self.global_gradient is not None:
-                new_content["global_gradient"] = self.global_gradient # Include global gradient for FedCE calculations on the client side
-            message.content = new_content   
-            # log(INFO, f"Configured train message for client {client_id} with updated content keys: {message.content.array_records.get('model_params', 'N/A').keys() if message.content.array_records.get('model_params', None) else 'No model params'}")
-
+                new_content["global_gradient"] = self.global_gradient
+            message.content = new_content
 
         return base_messages
 
     def aggregate_train(self, server_round, replies):
+        """Aggregate with FedCE rho weights computed from gamma_cos and gamma_err."""
         replies_list = list(replies)
         if server_round == 1:
-            # For the first round, we don't have any previous information to calculate meaningful rhos, so we can skip the FedCE-specific logic so we use the default FedAvg aggregation 
+            # Round 1: no gamma data yet — use uniform weights (num_samples or 1/|C|).
             for message in replies_list:
                 client_id = str(message.metadata.src_node_id)
                 message.content.metric_records["metrics"]["fedce_normalized_rho"] = message.content.metric_records["metrics"].get("num_samples", self.first_round_uniform_rho) 
@@ -119,31 +124,23 @@ class FedCE(FedAvg):
                     sum_cos += gamma_cos
                     sum_err += gamma_err
             
+            # Normalize and combine gammas into per-client rho.
             for client_id in raw_cos.keys():
                 normalized_cos = (raw_cos[client_id] / sum_cos) if sum_cos > 0 else 0.0
                 normalized_err = (raw_err[client_id] / sum_err) if sum_err > 0 else 0.0
-
-                if self.combination_method == "sum":
-                    combined_gamma = normalized_cos + normalized_err
-                else: # default to "multiplication"
-                    combined_gamma = normalized_cos * normalized_err
-
+                combined_gamma = normalized_cos + normalized_err if self.combination_method == "sum" else normalized_cos * normalized_err
                 self.accumulated_gammas[client_id] = self.accumulated_gammas.get(client_id, 0.0) + combined_gamma
             
             z_k = sum(self.accumulated_gammas.values())
+            self.prev_normalized_rho_by_client.clear()
 
-            self.prev_normalized_rho_by_client.clear() # Clear previous normalized rho values before calculating new ones for this round
-            
             for client_id, gamma_sum in self.accumulated_gammas.items():
                 self.prev_normalized_rho_by_client[client_id] = gamma_sum / z_k if z_k > 0 else 0.0
 
-            # clip minimum weight and re-normalize to prevent ZeroDivisionError in FedAvg
-            # (aligned with authors implementation: np.clip(weights, a_min=1e-3))
+            # Clip minimum weight and re-normalize (aligned with authors: np.clip(weights, a_min=1e-3)).
             if self.prev_normalized_rho_by_client:
                 for cid in self.prev_normalized_rho_by_client:
-                    self.prev_normalized_rho_by_client[cid] = max(
-                        self.prev_normalized_rho_by_client[cid], _FEDCE_MIN_WEIGHT
-                    )
+                    self.prev_normalized_rho_by_client[cid] = max(self.prev_normalized_rho_by_client[cid], _FEDCE_MIN_WEIGHT)
                 z_clipped = sum(self.prev_normalized_rho_by_client.values())
                 if z_clipped > 0:
                     for cid in self.prev_normalized_rho_by_client:
@@ -156,18 +153,17 @@ class FedCE(FedAvg):
                     rho = self.first_round_uniform_rho or _FEDCE_MIN_WEIGHT
                     log(INFO, f"Client {client_id} not in prev_normalized_rho_by_client, using fallback rho={rho}")
                 message.content.metric_records["metrics"]["fedce_normalized_rho"] = rho
-                log(INFO, f"Setting normalized rho for client {client_id}: {message.content.metric_records['metrics']['fedce_normalized_rho']}")
 
             agg_arrays, agg_metrics = super().aggregate_train(server_round, replies_list)
 
+        # Compute global gradient for next round's gamma_cos.
         if self._previous_global_params and agg_arrays:
             self.global_gradient = self.compute_global_gradient(self._previous_global_params, agg_arrays)
 
-        # log(INFO, f"First round aggregation complete. {agg_arrays.keys() if agg_arrays else 'No arrays aggregated'}")
         return agg_arrays, agg_metrics
     
     def aggregate_evaluate(self, server_round, replies):
-        self.weighted_by_key = "num_samples" # During evaluation, we want to weight by number of samples to get correct global metrics, so we switch back to the default key for aggregation
+        """Evaluate with num_samples weighting, then restore FedCE weighting."""
         try:
             agg_metric = super().aggregate_evaluate(server_round, replies)
         finally:
@@ -177,11 +173,10 @@ class FedCE(FedAvg):
 
 
 class FedCEStrategy(CinemaStrategyMixin, FedCE):
-    """Federated strategy combining CineMA-specific logic (step-based validation, 
-    early stopping, checkpointing) with FedCE aggregation.
-    
-    All parameters are forwarded through **kwargs — CinemaStrategyMixin consumes
-    its own (eval_steps, primary_metric_name, etc.) and passes the rest.
+    """FedCE + CinemaStrategyMixin (step validation, early stopping, checkpoints).
+
+    MRO: CinemaStrategyMixin -> FedCE -> FedAvg.
+    All params forwarded via **kwargs.
     """
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
