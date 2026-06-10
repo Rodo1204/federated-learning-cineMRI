@@ -7,4 +7,3 @@ dependencies:
   - pip=24.2
   - pip:
       - -e ..
-      - ../models/cinema
