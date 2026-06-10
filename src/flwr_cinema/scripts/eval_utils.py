@@ -1,4 +1,9 @@
-"""Shared evaluation utilities for centralized and federated regression models."""
+"""Shared evaluation utilities for centralized and federated models.
+
+Covers metadata loading, checkpoint selection, federated round selection,
+client-split dataset creation, per-client evaluation, fairness metrics,
+Monte Carlo Dropout uncertainty estimation, and clinical metrics.
+"""
 
 from __future__ import annotations
 
@@ -107,7 +112,7 @@ def find_best_checkpoint(checkpoint_dir: Path) -> tuple[Path, int | None]:
 
     Uses nearby validation history (validation_metrics.jsonl) and early-stopping
     config (config.yaml / .hydra/config.yaml). Exact mapping reads only
-    `primary_validation_metrics`. Legacy histories without this field are treated
+    primary_validation_metrics. Legacy histories without this field are treated
     as not reliably mappable and trigger heuristic fallback.
 
     Args:
@@ -280,8 +285,8 @@ def resolve_federated_checkpoint_dir(checkpoint_dir: Path) -> Path:
     """Resolve federated checkpoints directory.
 
     Contract:
-    - preferred input is direct `.../federated_server/checkpoints`
-    - experiment root containing `federated_server/checkpoints` is accepted
+    - preferred input is direct .../federated_server/checkpoints
+    - experiment root containing federated_server/checkpoints is accepted
     """
     candidate = Path(checkpoint_dir)
     if candidate.exists() and candidate.is_dir() and candidate.name == "checkpoints":
@@ -491,8 +496,8 @@ def find_best_federated_round(
 
     Args:
         checkpoint_dir: Federated checkpoint directory or experiment root.
-        primary_metric: Metric key expected inside each ``fedavg_metrics`` payload.
-        direction: Optimization direction, one of ``min`` or ``max``.
+        primary_metric: Metric key expected inside each fedavg_metrics payload.
+        direction: Optimization direction, one of min or max.
 
     Returns:
         Tuple of checkpoint path and round number.
@@ -584,9 +589,9 @@ def _load_config_near_checkpoint(
 ) -> dict:
     """Find and load the config YAML near a checkpoint, without loading the model.
 
-    Searches parent directories of both ``output_dir`` and ``checkpoint_path``
-    for ``config.yaml`` (including ``.hydra/config.yaml``).  Falls back to the
-    project default ``configs/cinema_fed.yaml`` when nothing else is found.
+    Searches parent directories of both output_dir and checkpoint_path
+    for config.yaml (including .hydra/config.yaml).  Falls back to the
+    project default configs/cinema_fed.yaml when nothing else is found.
 
     Args:
         checkpoint_path: Path to a checkpoint (.pt) file (used to anchor the search).
@@ -1124,7 +1129,7 @@ def get_federated_eval_fn(task: str | dict[str, Any] | Any) -> Callable[..., dic
 # ============================================================================
 
 def enable_mc_dropout(model: torch.nn.Module) -> list[str]:
-    """Set only ``nn.Dropout`` layers to train mode; leave all others in eval.
+    """Set only nn.Dropout layers to train mode; leave all others in eval.
 
     Does NOT touch DropPath, BatchNorm, LayerNorm, or any timm stochastic layers.
 
@@ -1422,9 +1427,9 @@ def compute_classification_clinical_metrics_uncertainty(
 ) -> dict[str, dict[str, float] | dict[str, dict[str, float]]]:
     """Compute classification clinical metrics with consensus and per-pass sections.
 
-    Consensus metrics are computed on ``argmax(mean_t(probs_t))`` — the Bayesian
+    Consensus metrics are computed on argmax(mean_t(probs_t)) — the Bayesian
     model's averaged prediction.  Per-pass metrics capture variability across
-    dropout realisations using ``{mean, std}`` envelopes.
+    dropout realisations using {mean, std} envelopes.
 
     Args:
         all_outputs: List of per-pass probability arrays, each (n_samples, n_classes).
@@ -1432,9 +1437,9 @@ def compute_classification_clinical_metrics_uncertainty(
 
     Returns:
         Dict with two top-level keys:
-        - ``consensus``: flat float scalars (accuracy, balanced_accuracy, f1, mcc,
+        - consensus: flat float scalars (accuracy, balanced_accuracy, f1, mcc,
           roc_auc, cross_entropy, [specificity, sensitivity,] n_samples).
-        - ``per_pass``: ``{metric: {"mean": float, "std": float}}`` for each
+        - per_pass: {metric: {"mean": float, "std": float}} for each
           metric (same keys minus n_samples).
     """
     from models.cinema.cinema.classification.train import classification_metrics
@@ -1872,8 +1877,8 @@ def run_unified_evaluation(
     f. Fairness metrics
     g. JSON output with new schema
 
-    MC Dropout (PR #2): when ``mc_dropout=True``, runs stochastic forward passes
-    and appends uncertainty metrics under ``mc_dropout_uncertainty`` key.
+    MC Dropout: when mc_dropout=True, runs stochastic forward passes
+    and appends uncertainty metrics under mc_dropout_uncertainty key.
     """
     from flwr_cinema.scripts.lora import load_lora_state_dict
     from models.cinema.cinema.device import get_amp_dtype_and_device
@@ -2466,8 +2471,8 @@ def _build_mc_uncertainty_entry(
     """Build MC uncertainty dict with probabilistic + clinical metrics sections.
 
     Returns a dict with two sub-keys:
-    - ``probabilistic``: entropy, MI, per-class std (classification), std+CI (regression), Dice std (seg)
-    - ``clinical_metrics``: mean and std of each clinical metric across passes
+    - probabilistic: entropy, MI, per-class std (classification), std+CI (regression), Dice std (seg)
+    - clinical_metrics: mean and std of each clinical metric across passes
     """
     entry: dict[str, Any] = {"n_passes": len(all_outputs)}
     probabilistic: dict[str, Any] = {}
@@ -2538,8 +2543,8 @@ def _segmentation_clinical_metrics(
 ) -> dict[str, float]:
     """Lightweight segmentation metrics (Dice, IoU, Stability, Volume) — no Hausdorff.
 
-    Mirrors ``segmentation_metrics`` from cinema but skips the expensive
-    ``compute_hausdorff_distance`` to avoid memory fragmentation with many passes.
+    Mirrors segmentation_metrics from cinema but skips the expensive
+    compute_hausdorff_distance to avoid memory fragmentation with many passes.
     """
     import torch.nn.functional as F
 

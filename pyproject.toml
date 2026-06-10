@@ -39,7 +39,7 @@ dependencies = [
     "wandb>=0.15.0",
 
     # Federated Learning & Parameter Efficiency
-    "flwr[simulation]>=1.26.0",
+    "flwr[simulation]==1.26.0",
     "flwr-datasets[vision]>=0.5.0",
     "peft>=0.7.0",
 
@@ -85,6 +85,3 @@ batch-size = 32
 hydra_config_dir = "../../../configs/federated"
 hydra_config_name = "cinema_classification_fed"
 hydra_overrides = ""
-
-[superlink.local]
-options.num-supernodes = 2

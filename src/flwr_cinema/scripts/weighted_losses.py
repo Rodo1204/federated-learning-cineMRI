@@ -19,7 +19,7 @@ def wrap_loss_with_class_weights(
     """Wrap a loss function to use class-weighted cross-entropy.
 
     Computes inverse-frequency weights per class and passes them to
-    ``F.cross_entropy`` while preserving ``label_smoothing``.
+    F.cross_entropy while preserving label_smoothing.
 
     Args:
         original_loss_fn: Original loss function (unused, kept for API compat).
@@ -29,7 +29,7 @@ def wrap_loss_with_class_weights(
             (e.g., ["NOR", "DISEASED"]). If None, falls back to sorted keys.
 
     Returns:
-        Wrapped loss function or ``original_loss_fn`` if distribution is invalid.
+        Wrapped loss function or original_loss_fn if distribution is invalid.
     """
     if class_distribution is None or len(class_distribution) < 2:
         return original_loss_fn

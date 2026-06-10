@@ -1,3 +1,9 @@
+"""Shared strategy utilities for federated learning.
+
+Provides CinemaStrategyMixin for step-based validation, checkpointing,
+and early stopping. Also includes metric direction inference and a
+lightweight early-stopping exception.
+"""
 import logging
 from typing import Any
 from collections.abc import Callable, Iterable
@@ -15,13 +21,13 @@ class MetricTargetReachedException(Exception):
     pass
 
 def get_primary_metric_name(config) -> str:
-    """Get the primary metric name for early stopping from config.
-    
+    """Return the primary metric name from config, or infer from task.
+
     Args:
-        config: Configuration with config.train.early_stopping.metric field.
-        
+        config: Configuration with optional train.early_stopping.metric.
+
     Returns:
-        Primary metric name (e.g., 'mae' for regression, 'accuracy' for classification).
+        Metric name (e.g. 'mae' for regression, 'accuracy' for classification).
     """
     # Read metric from config to align with centralized training
     if hasattr(config, "train") and hasattr(config.train, "early_stopping") and hasattr(config.train.early_stopping, "metric"):
@@ -38,7 +44,7 @@ def get_primary_metric_name(config) -> str:
 def _infer_metric_direction(primary_metric_name: str) -> str:
     """Infer optimization direction from metric name.
 
-    Handles common prefixes used in configs (e.g., ``val_mae``).
+    Handles common prefixes used in configs (e.g., val_mae).
     """
     metric = (primary_metric_name or "").lower()
     normalized = metric[4:] if metric.startswith("val_") else metric
@@ -54,14 +60,24 @@ def _infer_metric_direction(primary_metric_name: str) -> str:
     
 
 class CinemaStrategyMixin:
-    """Mixin class that adds step-based validation, checkpointing, and early stopping to any Flower strategy.
-    
-    This should be used via multiple inheritance with a Flower built-in strategy.
-    Example: class FedStrategy(CinemaStrategyMixin, FedAvg): pass
-    
-    The mixin receives the global model by reference and a callable to load aggregated
-    arrays into it. This keeps the mixin semi-agnostic: it doesn't know about LoRA/head
-    specifics — the caller provides the loading logic.
+    """Mixin adding step-based validation, checkpointing, and early stopping.
+
+    Use via multiple inheritance: class FedStrategy(CinemaStrategyMixin, FedAvg).
+    The mixin receives the global model by reference plus a callable to load
+    aggregated arrays — it stays agnostic to LoRA/head specifics.
+
+    Args:
+        eval_steps: Optimizer steps between validations.
+        primary_metric_name: Metric tracked for early stopping.
+        primary_metric_direction: "max" or "min"; None to infer.
+        early_stopping_patience: Rounds without improvement before stopping.
+        early_stopping_min_delta: Minimum change to count as improvement.
+        global_model: Shared model reference for checkpointing.
+        load_arrays_fn: Callable(model, ArrayRecord) to load aggregated params.
+        save_dir: Directory for checkpoints.
+        max_n_ckpts: Maximum checkpoints to keep.
+        aggregate_head: Whether server aggregates prediction heads.
+        aggregate_decoder: Whether server aggregates decoder params.
     """
     
     def __init__(
@@ -134,10 +150,10 @@ class CinemaStrategyMixin:
     # ---- Checkpoint Management ----
 
     def _save_checkpoint(self, server_round: int, metrics: MetricRecord | None) -> None:
-        """Save a full model checkpoint. Called when the primary metric has improved.
-        
-        Loads the latest aggregated arrays into the global model (via load_arrays_fn),
-        then saves the full model.state_dict() along with metadata.
+        """Save model checkpoint when primary metric improves.
+
+        Loads the latest aggregated arrays into the global model via load_arrays_fn,
+        then saves model.state_dict() with metadata.
         """
 
         if self._latest_arrays is None:
@@ -200,7 +216,7 @@ class CinemaStrategyMixin:
         config: ConfigRecord,
         grid: Grid
     ) -> Iterable[Message]:
-        """Configure the training round. Stops providing clients if early stopping was triggered."""
+        """Skip training if early stopping was triggered."""
         if getattr(self, "early_stopping_triggered", False):
             # logger.warning(f"[{self.primary_metric_name.upper()} Early Stopping Triggered] Skipping logic for round {server_round}")
             return []
@@ -213,7 +229,7 @@ class CinemaStrategyMixin:
         server_round: int,
         replies: Iterable[Message],
     ) -> tuple[ArrayRecord | None, MetricRecord | None]:
-        """Aggregate training results and record lightweight round metadata."""
+        """Aggregate training results, strip heads/decoders if local, record metadata."""
         
         # Convert to list to avoid consuming the iterator before super() can use it
         replies_list = list(replies)
@@ -315,7 +331,7 @@ class CinemaStrategyMixin:
         config: ConfigRecord,
         grid: Grid
     ) -> Iterable[Message]:
-        """Configure evaluation, skipping it if we haven't reached eval_steps."""
+        """Skip evaluation if eval_steps haven't elapsed."""
         if getattr(self, "early_stopping_triggered", False):
             return []
             #raise MetricTargetReachedException("Early stopping target reached.")  # Gracefully skip
@@ -359,18 +375,15 @@ class CinemaStrategyMixin:
     ) -> None:
         """Check early stopping and save checkpoint if improved.
 
-        Extracted as a standalone method so strategies that always
-        evaluate (e.g. Rate-My-LoRA) can call it conditionally
-        via ``aggregate_evaluate``, while others call it on every
-        evaluation through the default ``aggregate_evaluate`` above.
+        Extracted so strategies that always evaluate (e.g. Rate-My-LoRA)
+        can call it conditionally, while others call it on every evaluation
+        through the default aggregate_evaluate above.
 
-        Parameters
-        ----------
-        eval_count_increment : bool
-            If True, increment ``_eval_count`` inside this method.
-            Set to False when the caller handles eval counting
-            separately (e.g. Rate-My-LoRA evaluates every round but
-            gates early-stopping checks).
+        Args:
+            server_round: Current communication round.
+            metrics: Aggregated evaluation metrics.
+            eval_count_increment: If True, increment _eval_count. Set False
+                when caller handles eval counting separately.
         """
         if metrics is None or self.primary_metric_name not in metrics:
             return
