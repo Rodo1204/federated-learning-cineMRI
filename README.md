@@ -45,7 +45,13 @@ conda env create -f envs/environment.yml
 conda activate flwr-cinema
 ```
 
-This installs all Python dependencies (PyTorch, MONAI, Flower, HuggingFace Hub, etc.) and registers both the main package and the CineMA submodule in editable mode.
+Then install cinema from the root of the proyect
+
+```bash
+pip install ./models/cinema
+```
+
+This installs all Python dependencies (PyTorch, MONAI, Flower, HuggingFace Hub, etc.) and registers both the main package in editable mode.
 
 ### 4. Verify PyTorch
 
