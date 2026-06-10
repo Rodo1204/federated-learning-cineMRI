@@ -24,6 +24,7 @@ from flwr.app import (
 )
 from flwr.common.logger import log
 
+from models.cinema.cinema.convvit import param_groups_lr_decay
 from models.cinema.cinema.device import get_amp_dtype_and_device
 from models.cinema.cinema.optim import GradScaler
 from models.cinema.cinema.train import train_one_epoch
@@ -121,6 +122,7 @@ class FederatedClient:
         use_lora: bool = True,
         freeze_pretrained: bool = False,
         aggregate_head: bool = True,
+        aggregate_decoder: bool = True,
         val_loader: DataLoader | None = None,
         metrics_save_path: str | None = None,
         stats_save_path: str | None = None,
@@ -141,6 +143,7 @@ class FederatedClient:
         self.use_lora = use_lora
         self.freeze_pretrained = freeze_pretrained
         self.aggregate_head = aggregate_head
+        self.aggregate_decoder = aggregate_decoder
         self.val_loader = val_loader
         self.metrics_save_path = metrics_save_path
         self.stats_save_path = stats_save_path
@@ -150,15 +153,38 @@ class FederatedClient:
         self.config = config
         self.n_accum_steps = n_accum_steps
 
+        # Cinema sets up amp_dtype, cudnn.benchmark, empty_cache
         self.amp_dtype, self.device = get_amp_dtype_and_device()
         self.model.to(self.device)
+        log(logging.INFO, f"Client {self.client_id} - Initialized on device: {self.device}")
 
         # Optimizer for local training
-        trainable_params = [p for p in self.model.parameters() if p.requires_grad]
+        if not self.use_lora:
+            param_groups = param_groups_lr_decay(
+                model,
+                no_weight_decay_list=[],
+                weight_decay=config.train.weight_decay,
+                layer_decay=config.train.layer_decay,
+            )
+        else:
+            lora_params = []
+            head_and_other_params = []
+            for name, param in model.named_parameters():
+                if not param.requires_grad:
+                    continue
+                if "lora" in name.lower():
+                    lora_params.append(param)
+                else:
+                    head_and_other_params.append(param)
+
+            param_groups = [
+                {"params": head_and_other_params, "weight_decay": self.weight_decay,},
+                {"params": lora_params, "weight_decay": 0.0},
+            ]
         self.optimizer = torch.optim.AdamW(
-            trainable_params,
+            param_groups,
             lr=self.lr,
-            weight_decay=self.weight_decay,
+            betas=config.train.betas, #TODO: corregir esto y pasarlo por parametro
         ) # TODO: verificar con centralized
         self.loss_scaler = GradScaler()
         self.n_samples = len(self.train_loader.dataset) if self.train_loader else 0
@@ -382,7 +408,7 @@ class FederatedClient:
         """Handle train message from server."""
         in_configs = message.content.config_records.get("config", ConfigRecord())
         round_idx = in_configs.get("server-round", 0)
-        use_fedce = in_configs.get("use_fedce", False)
+        strategy = in_configs.get("strategy", False)
         model_state_dict = None
 
         in_params = message.content.array_records.get(
@@ -391,6 +417,20 @@ class FederatedClient:
         if in_params:
             model_state_dict = in_params.to_torch_state_dict(keep_input=False)
             self.update_model(model_state_dict)
+
+        if strategy == "fedprox":
+            # ─── FedProx: wrap loss_fn with proximal term ──────────────────
+            # Called AFTER update_model (model holds w^t) but BEFORE dual
+            # LoRA loading (local adapters are not part of global consensus).
+            proximal_mu = float(in_configs.get("proximal-mu", 0.0))
+            _original_loss_fn = self.loss_fn
+            if proximal_mu > 0:
+                from flwr_cinema.utils.fedProx_utils import create_fedprox_loss_wrapper
+
+                self.loss_fn = create_fedprox_loss_wrapper(
+                    _original_loss_fn, self.model, proximal_mu
+                )
+            # ────────────────────────────────────────────────────────────────
 
         # Load local LoRA if using dual LoRA
         if self.use_lora and has_dual_lora(self.model):
@@ -402,6 +442,12 @@ class FederatedClient:
                 load_local_lora_state_dict(self.model, local_lora_state_dict)
 
         num_samples = self.train_local(round_idx)
+
+        if strategy == "fedprox":
+            # ─── FedProx: restore original loss_fn ─────────────────────────
+            if proximal_mu > 0:
+                self.loss_fn = _original_loss_fn
+            # ────────────────────────────────────────────────────────────────
 
         updated_state_dict = self.get_model_update()
 
@@ -417,13 +463,12 @@ class FederatedClient:
             context.state.array_records["local_lora"] = local_lora_record
             out_record["local_lora_params"] = local_lora_record
 
-        # Estimate optimizer steps this round
+        # Estimate optimizer steps this round (floor division, matching centralized:
+        # only complete accumulation groups produce an optimizer step)
         optimizer_steps_this_round = 0
         if self.train_loader is not None:
             batches_per_epoch = len(self.train_loader)
-            steps_per_epoch = (
-                batches_per_epoch + self.n_accum_steps - 1
-            ) // self.n_accum_steps
+            steps_per_epoch = batches_per_epoch // self.n_accum_steps
             optimizer_steps_this_round = steps_per_epoch * self.local_epochs
 
         out_configs["optimizer_steps_this_round"] = int(optimizer_steps_this_round)
@@ -432,7 +477,7 @@ class FederatedClient:
         out_metrics["num_samples"] = num_samples
 
         agg_metrics = None
-        if use_fedce and round_idx > 1:
+        if strategy == "fedce" and round_idx > 1:
             agg_metrics = self._compute_fedce(
                 message, model_state_dict, updated_state_dict, round_idx
             )

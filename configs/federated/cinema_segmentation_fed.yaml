@@ -14,32 +14,42 @@ logging:
 federated:
   server_host: "localhost"
   server_port: 8888
-  n_rounds: 20  # Number of communication rounds
+  n_rounds: 2000  # Number of communication rounds
   local_epochs: 1  # Local epochs per round per client 2
-  n_clients: 2  # Number of expected clients (ie. acdc + Siemens + GE + Canon + Philips)
+  n_clients: 5  # Number of expected clients (ie. acdc + Siemens + GE + Canon + Philips)
   # client_ids: ["acdc", "Siemens"]  # Identifiers for each client
-  #client_ids: ["acdc", "Siemens", "GE", "Canon", "Philips"]  # Identifiers for each client
-  client_ids: ["acdc", "Siemens"]  # For debugging with fewer clients
+  client_ids: ["acdc", "Siemens", "GE", "Canon", "Philips"]  # Identifiers for each client
+  # client_ids: ["acdc", "Siemens"]  # For debugging with fewer clients
   aggregate_head: True  # Whether to aggregate classification/regression head across clients (True) or keep locally trained (False)
-  gpu_mapping:
-    acdc: 0
-    Siemens: 0
-    Philips: 0
-    GE: 0
-    Canon: 0
+  aggregate_decoder: True  # Whether to aggregate ConvUNetR decoder across clients (True) or keep locally trained (False). Set False for decoder-local FL (saves ~30% bandwidth per round).
   # aggregation_method:
   #   name: fedce  # fedavg, fedce, or custom
   #   config:
   #     combination_method: sum  # Method to combine gamma_cos and gamma_err ("multiplication" or "sum")
-
+  # aggregation_method:
+  #  name: fedratemylora
+  #  config:
+  #    lambda_init: 0.2
+  #    lambda_decay: 0.95
+  # aggregation_method:
+  #   name: fedprox
+  #   config: 
+  #     proximal_mu: 0.1
   aggregation_method:
-    name: fedavg  # fedavg, fedce, or custom
+    name: fedavg  # fedavg, fedce, fedratemylora, or custom
+
+  # Rate-My-LoRA: adaptive penalization for heterogeneous data
+  # aggregation_method:
+  #   name: fedratemylora
+  #   config:
+  #     lambda_init: 0.2
+  #     lambda_decay: 0.95
 
 
 # Data configuration
 data:
   name: acdc_mnms_combined
-  client_name: all  # In federated evaluation, keep all configured clients.
+  # client_name: all  # In federated evaluation, keep all configured clients.
 
   # Datasets to include
   use_acdc: True
@@ -85,14 +95,15 @@ data:
       std: None
 
   combined:
-    dir: C:\Users\Rodo\.cache\cinema_datasets\acdc_mnms_combined
+    # dir: C:\Users\Rodo\.cache\cinema_datasets\acdc_mnms_combined
+    dir: /media/data10/users/rodolfo/data/acdc_mnms_combined_stratified
 
 # LoRA configuration
 lora:
   rank: 8  # LoRA rank (typically 4-16)
   alpha: 16  # LoRA alpha scaling (typically 1x-4x of rank)
   dropout: 0.1  # LoRA dropout
-  target_modules: ["q", "kv", "proj"]  # Attention modules to adapt: q, kv, proj
+  target_modules: ["q", "kv"]  # Attention modules to adapt: q, kv, proj
   blocks_to_lora: null
 
 # Dual LoRA configuration (personalized federated learning)
@@ -117,9 +128,9 @@ transform:
     translate_range: [60, 60, 0]
 
 train:
-  use_lora: False # Set to True to use LoRA
+  use_lora: True # Set to True to use LoRA
   use_class_weighted_loss: False # Set to True to use class-weighted BCE loss for imbalanced classification
-  n_workers: 2
+  n_workers: 4
   clip_grad: 5.0
   weight_decay: 0.05
   layer_decay: 0.75
@@ -127,22 +138,22 @@ train:
   label_smoothing: 0.1
   lr: 1e-3
   min_lr: 1e-5
-  n_warmup_epochs: 0
-  n_epochs: 800
+  n_warmup_epochs: 20
+  n_epochs: 2000
   max_n_ckpts: 2
   batch_size: 16
-  batch_size_per_device: 1
-  eval_steps: 80  # Evaluate every N optimizer steps (aligned centralized/federated)
+  batch_size_per_device: 4
+  eval_steps: 1450  # Evaluate every N optimizer steps (aligned centralized/federated)
   early_stopping:
     metric: "mean_dice_score"
     mode: "max"
-    patience: 5
-    min_delta: 1e-4
+    patience: 10
+    min_delta: 5e-4
 
 model:
   name: convunetr
   ckpt_path: null
-  freeze_pretrained: False
+  freeze_pretrained: True
   views: sax
   out_chans: 4
   convunetr:

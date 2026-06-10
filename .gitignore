@@ -218,3 +218,5 @@ GEMINI.md
 .atl/
 tests/
 TODO
+scripts/analyze_metrics.py
+run_runs.sh

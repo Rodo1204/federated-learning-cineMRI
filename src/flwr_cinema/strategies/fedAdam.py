@@ -2,7 +2,7 @@ from flwr.serverapp.strategy import FedAdam
 from flwr_cinema.strategies.common import CinemaStrategyMixin
 
 
-class FedStrategy(CinemaStrategyMixin, FedAdam):
+class FedAdamStrategy(CinemaStrategyMixin, FedAdam):
     """Federated strategy combining CineMA-specific logic (step-based validation, 
     early stopping, checkpointing) with Flower's FedAdam aggregation.
     

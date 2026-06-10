@@ -15,10 +15,14 @@ def load_hydra_config(context: Context) -> DictConfig:
             "Example usage: flwr run . --run-config hydra_config_dir=./configs hydra_config_name=config"
         )
     
+    # Parse optional Hydra overrides (comma-separated, e.g. "train.lr=1e-3,train.batch_size=64")
+    hydra_overrides_raw = context.run_config.get("hydra_overrides", "")
+    overrides = [o.strip() for o in hydra_overrides_raw.split(" ") if o.strip()]
+
     GlobalHydra.instance().clear()  # Clear any existing Hydra instance
 
     with initialize(version_base=None, config_path=config_dir):
-        cfg = compose(config_name=config_name)
+        cfg = compose(config_name=config_name, overrides=overrides)
     return cfg
 
 def update_config_from_config_record(config: DictConfig, config_record: ConfigRecord) -> DictConfig:

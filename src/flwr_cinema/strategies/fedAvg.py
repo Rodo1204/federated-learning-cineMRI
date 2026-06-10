@@ -2,7 +2,7 @@ from flwr.serverapp.strategy import FedAvg
 from flwr_cinema.strategies.common import CinemaStrategyMixin
 
 
-class FedStrategy(CinemaStrategyMixin, FedAvg):
+class FedAvgStrategy(CinemaStrategyMixin, FedAvg):
     """Federated strategy combining CineMA-specific logic (step-based validation, 
     early stopping, checkpointing) with Flower's FedAvg aggregation.
     

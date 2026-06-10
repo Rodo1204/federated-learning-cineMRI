@@ -76,14 +76,14 @@ data:
       std: None
 
   combined:
-    dir: C:\Users\Rodo\.cache\cinema_datasets\acdc_mnms_combined
+    dir: /media/data10/users/rodolfo/data/acdc_mnms_combined_stratified
 
 # LoRA configuration
 lora:
-  rank: 8  # LoRA rank (typically 4-16)
-  alpha: 16  # LoRA alpha scaling (typically 1x-4x of rank)
-  dropout: 0.1  # LoRA dropout
-  target_modules: ["q", "kv", "proj"]  # Attention modules to adapt: q, kv, proj
+  rank: 4  # LoRA rank (typically 4-16)
+  alpha: 8  # LoRA alpha scaling (typically 1x-4x of rank)
+  dropout: 0.0  # LoRA dropout
+  target_modules: ["q", "kv"]  # Attention modules to adapt: q, kv, proj
   blocks_to_lora: null
 
 # Dual LoRA configuration (personalized federated learning)
@@ -109,7 +109,7 @@ transform:
 
 train:
   use_lora: True # Set to True to use LoRA
-  use_class_weighted_loss: True # Set to True to use class-weighted BCE loss for imbalanced classification
+  use_class_weighted_loss: False # Set to True to use class-weighted BCE loss for imbalanced classification
   n_workers: 4
   clip_grad: 5.0
   weight_decay: 0.05
@@ -121,11 +121,11 @@ train:
   n_warmup_epochs: 10
   n_epochs: 800
   max_n_ckpts: 4
-  batch_size: 64
-  batch_size_per_device: 4
-  eval_steps: 80  # Evaluate every N optimizer steps (aligned centralized/federated)
+  batch_size: 32
+  batch_size_per_device: 16
+  eval_steps: 406  # Evaluate every N optimizer steps (aligned centralized/federated)
   early_stopping:
-    metric: "mcc" #"roc_auc"
+    metric: "roc_auc" #"roc_auc"
     mode: "max"
     patience: 10 #10
     min_delta: 5e-4 #5e-4

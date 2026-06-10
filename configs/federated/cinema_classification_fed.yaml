@@ -5,7 +5,7 @@ seed: 0
 grad_ckpt: True
 
 logging:
-  dir: ./outputs/${model_name}_${task}/${mode}/${data.name}/${data.class_column}/lora_${train.use_lora}/seed${seed}/${now:%Y-%m-%d}/${now:%H-%M-%S}
+  dir: ./outputs/${model_name}_${task}/${mode}/${data.name}/${data.class_column}/${federated.aggregation_method.name}/lora_${train.use_lora}/seed${seed}/${now:%Y-%m-%d}/${now:%H-%M-%S}
   wandb:
     project: null
     entity: null
@@ -14,25 +14,37 @@ logging:
 federated:
   server_host: "localhost"
   server_port: 8888
-  n_rounds: 10  # Number of communication rounds
-  local_epochs: 1  # Local epochs per round per client
-  n_clients: 2  # Number of expected clients
-  client_ids: ["acdc", "Siemens"]  # Identifiers for each client
-  # client_ids: ["acdc", "Siemens", "GE", "Canon", "Philips"]  # All 5 clients (for multi-GPU server)
+  n_rounds: 800  # Number of communication rounds
+  local_epochs: 1  # Local epochs per round per client 2
+  n_clients: 5  # Number of expected clients (ie. acdc + Siemens + GE + Canon + Philips)
+  # client_ids: ["acdc", "Siemens"]  # Identifiers for each client
+  client_ids: ["acdc", "Siemens", "GE", "Canon", "Philips"]  # Identifiers for each client
+  # client_ids: ["acdc", "Siemens", "GE"]  # For debugging with fewer clients
   aggregate_head: True  # Whether to aggregate classification/regression head across clients (True) or keep locally trained (False)
-  gpu_mapping:
-    acdc: 0
-    Siemens: 0
-    # Philips: 1
-    # GE: 1
-    # Canon: 1
+  aggregate_decoder: True  # Only relevant for ConvUNetR segmentation. Set False to keep decoder local (saves ~30% bandwidth).
+  # aggregation_method:
+  #   name: fedce  # fedavg, fedce, or custom
+  #   config:
+  #     combination_method: sum  # Method to combine gamma_cos and gamma_err ("multiplication" or "sum")
+  # aggregation_method:
+  #  name: fedratemylora
+  #  config:
+  #    lambda_init: 0.2
+  #    lambda_decay: 0.95
+  # aggregation_method:
+  #   name: fedprox
+  #   config: 
+  #     proximal_mu: 0.1
+  aggregation_method:
+    name: fedavg  # fedavg, fedce, or custom
+    
 
 
 # Data configuration
 data:
   name: acdc_mnms_combined
   class_column: "binary_label"  # Column name in metadata CSV that contains class labels (e.g., "pathology" for multi-class, "binary_label" for binary classification)
-  pathology: ["DCM", "HCM", "MINF", "NOR", "RV"] # Update this list based on which datasets are included (e.g., if using MnMs, include relevant pathologies)  
+  pathology: ["DCM", "HCM", "MINF", "NOR", "RV", "LV", "HHD", "Other", "ARV", "LVNC", "IHD", "ARR", "FALL", "CIA", "TRI"]
   binary_label: ["NOR", "DISEASED"] # For binary classification, specify the two classes (e.g., "abnormal" vs "normal")
 
   # Datasets to include
@@ -50,7 +62,7 @@ data:
   
   # ACDC dataset
   acdc:
-    dir: ~/.cache/cinema_datasets/acdc/processed
+    dir: /media/data10/users/rodolfo/data/acdc_mnms_combined_stratified
     lv_ef:
       mean: 46.466146
       std: 19.972946
@@ -79,8 +91,8 @@ data:
       std: None
 
   combined:
-    dir: ~/.cache/cinema_datasets/acdc_mnms_combined/processed
-    # dir: /media/data10/users/joan-perramon/data/acdc_mnms_combined # for UB GPU server use
+    #dir: C:\Users\Rodo\.cache\cinema_datasets\acdc_mnms_combined
+    dir: /media/data10/users/rodolfo/data/acdc_mnms_combined_stratified # for UB GPU server use
 
 # LoRA configuration
 lora:
@@ -120,22 +132,22 @@ transform:
     translate_range: [60, 60, 0]
 
 train:
-  use_lora: True # Set to True to use LoRA
+  use_lora: False # Set to True to use LoRA
   use_class_weighted_loss: False # Set to True to use class-weighted BCE loss for imbalanced classification
   n_workers: 4
   clip_grad: 5.0
-  weight_decay: 1e-4
+  weight_decay: 0.05
   layer_decay: 0.75
   betas: [0.9, 0.95]
-  label_smoothing: 0.0
+  label_smoothing: 0.1
   lr: 1e-3
   min_lr: 1e-5
-  n_warmup_epochs: 0
+  n_warmup_epochs: 10
   n_epochs: 800
   max_n_ckpts: 2
-  batch_size: 32
+  batch_size: 32 
   batch_size_per_device: 16
-  eval_steps: 20  # 80 Evaluate every N optimizer steps (aligned centralized/federated)
+  eval_steps: 80 #80  # Evaluate every N optimizer steps (aligned centralized/federated)
   early_stopping:
     metric: "roc_auc"
     mode: "max"
@@ -145,7 +157,7 @@ train:
 model:
   name: convvit # convvit, resnet
   ckpt_path: null
-  freeze_pretrained: True
+  freeze_pretrained: False
   views: sax
   n_frames: 2
   out_chans: null

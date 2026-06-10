@@ -91,11 +91,26 @@ def get_strategy(
         "weighted_by_key": "num_samples",  # Default to weighting by number of samples for aggregation, can be overridden by specific strategies if needed
     }
     if agg_name == "fedavg":
-        from flwr_cinema.strategies.fedAvg import FedStrategy
+        from flwr_cinema.strategies.fedAvg import FedAvgStrategy as FedStrategy
     elif agg_name == "fedce":
-        from flwr_cinema.strategies.fedCE import FedStrategy
+        from flwr_cinema.strategies.fedCE import FedCEStrategy as FedStrategy
         kwargs.update({
             "combination_method": getattr(agg_config, "combination_method", "multiplication"),
+        })
+    elif agg_name == "fedratemylora":
+        from flwr_cinema.strategies.fedRateMyLoRA import RateMyLoraStrategy as FedStrategy
+        import math
+        kwargs.update({
+            "lambda_init": getattr(agg_config, "lambda_init", 0.2),
+            "lambda_decay": getattr(agg_config, "lambda_decay", 0.95),
+        })
+        n_warmup_epochs = getattr(config.train, "n_warmup_epochs", 0)
+        local_epochs = getattr(config.federated, "local_epochs", 1)
+        kwargs["warmup_rounds"] = math.ceil(n_warmup_epochs / max(local_epochs, 1))
+    elif agg_name == "fedprox":
+        from flwr_cinema.strategies.fedProx import FedProxStrategy as FedStrategy
+        kwargs.update({
+            "proximal_mu": getattr(agg_config, "proximal_mu", 0.1),
         })
     else:
         raise ValueError(f"Unknown aggregation method: {agg_name}")
@@ -116,6 +131,7 @@ def get_strategy(
         save_dir=save_dir,
         max_n_ckpts=getattr(config.train, "max_n_ckpts", 5),
         aggregate_head=getattr(config.federated, "aggregate_head", True),
+        aggregate_decoder=getattr(config.federated, "aggregate_decoder", True),
         # FedAvg params can be added here as needed, e.g.:
         # fraction_train=config.federated.fraction_train,
         **kwargs
@@ -175,6 +191,11 @@ def save_final_model(
                 cid: rec.to_torch_state_dict() for cid, rec in strategy._latest_client_heads.items()
             }
 
+        if hasattr(strategy, "_latest_client_decoders") and strategy._latest_client_decoders:
+            checkpoint["client_decoders"] = {
+                cid: rec.to_torch_state_dict() for cid, rec in strategy._latest_client_decoders.items()
+            }
+
     # Save checkpoint
     ckpt_path = save_dir / f"global_model_final_round_{n_rounds}.pt"
     torch.save(checkpoint, ckpt_path)
@@ -208,7 +229,7 @@ def save_final_model(
             "validation_round": round_key in evaluate_metrics or round_key in evaluate_metrics_serverapp,
             "participants": metadata.get("participants", []),
             "client_steps": metadata.get("client_steps", {}),
-            "total_optimizer_steps_avg": metadata.get("total_optimizer_steps"),
+            "total_optimizer_steps": metadata.get("total_optimizer_steps"),
             "train_metrics": train_metrics.get(round_key, {}),
             "evaluate_metrics": evaluate_metrics.get(round_key, {}),
             "evaluate_metrics_serverapp": evaluate_metrics_serverapp.get(round_key, {}),
@@ -281,6 +302,8 @@ def main(grid: Grid, context: Context) -> None:
             "train.clip_grad": config.train.clip_grad,
             "federated.local_epochs": config.federated.local_epochs,
             "federated.aggregate_head": getattr(config.federated, "aggregate_head", True),
+            "federated.aggregate_decoder": getattr(config.federated, "aggregate_decoder", True),
+            "strategy": getattr(config.federated.aggregation_method, "name", "fedavg").lower(),
         }),
         evaluate_config=ConfigRecord({
             "federated_timestamp": timestamp_str,
@@ -288,7 +311,13 @@ def main(grid: Grid, context: Context) -> None:
         num_rounds=n_rounds
         # evaluate_fn=global_evaluate  # TODO: implement global evaluation function that evaluates on central test set after each round
     )
-    
+
+    # Rate-My-LoRA: swap preliminary model with re-aggregated final model
+    if hasattr(strategy, 'get_final_arrays'):
+        final = strategy.get_final_arrays()
+        if final is not None:
+            result.arrays = final
+
     save_final_model(save_dir, global_model, result, config, n_rounds, strategy)
 
 

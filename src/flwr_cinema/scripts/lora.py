@@ -1258,10 +1258,14 @@ def get_lora_policy(
     freeze_pretrained:
         Whether the pretrained backbone is frozen (head-only training).
     aggregate_head:
-        Whether prediction heads should be included.
-        - ``True`` (default): LoRA + head together (centralised training,
-          federated with ``aggregate_head=True``, or client send-back).
-        - ``False``: LoRA only — heads stay local on each client.
+        Whether prediction heads should be aggregated.
+        - ``True`` (default): LoRA + head sent to server.
+        - ``False``: head stays local on each client.
+
+    Note: decoder parameters are ALWAYS sent to the server for centralised
+    checkpointing. The ``aggregate_decoder`` setting in ``CinemaStrategyMixin``
+    controls whether they are aggregated or stripped-and-stored per-client,
+    following the same pattern as ``aggregate_head`` for prediction heads.
 
     Returns
     -------
@@ -1284,8 +1288,16 @@ def get_lora_policy(
             "with model.state_dict() / model.load_state_dict()."
         )
 
-    # ── ConvUNetR (LoRA + decoder + heads) ─────────────────────────────────────
+    # ── ConvUNetR (LoRA ± decoder ± heads) ─────────────────────────────────────
     if is_unetr:
+        # NOTE: decoder is ALWAYS sent to the server so it can be
+        # checkpointed centrally. The server decides whether to aggregate
+        # it (aggregate_decoder=True) or strip-and-store it per-client
+        # (aggregate_decoder=False), following the same pattern as heads.
+        # Bandwidth saving is achieved by not sending during intermediate
+        # rounds — but currently the full decoder (39M params) is sent
+        # every round. For true bandwidth optimisation, consider a
+        # "send-on-final-round-only" protocol.
         if aggregate_head:
             return LoRaPolicy(
                 get=get_lora_decoder_head_state_dict,

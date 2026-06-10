@@ -12,28 +12,53 @@ from flwr_cinema.scripts.federated_dataset_loader import load_client_dataloaders
 from flwr_cinema.tasks.adapters import get_federated_task_adapter
 
 from flwr_cinema.utils.hydra_utils import load_hydra_config, update_config_from_config_record
+from flwr.common.logger import log
+import logging
 
 # Flower ClientApp 
 app = ClientApp()
 
-# Caches to avoid redundant loading across train/eval calls in the same process 
-_MODEL_CACHE = None
+# Model cache per client_id to preserve local decoder/head state across rounds
+# when aggregate_decoder=False or aggregate_head=False. Each client gets its
+# own model object so per-client artifacts don't leak across clients sharing
+# the same Ray actor in simulation mode.
+_MODEL_CACHE: dict[str, torch.nn.Module] = {}
+_OPTIM_STATE_CACHE: dict[str, dict] = {}
 _TRAIN_DATALOADER_CACHE = None
 _VAL_DATALOADER_CACHE = None
 _STATS_CACHE = None
 # def setup_logging(log_dir: Path, ):
 
-def get_model(config: DictConfig) -> torch.nn.Module:
-    """Build model using the task adapter model factory."""
+def get_model(config: DictConfig, client_id: str | None = None) -> torch.nn.Module:
+    """Build or retrieve the model for a specific federated client.
     
+    Caches one model per client_id so local decoder/head parameters
+    survive across rounds. Inactive client models are flushed to CPU to
+    avoid exhausting GPU VRAM when many clients share the same actor.
+    The active model will be moved to GPU by FederatedClient.
+    """
     global _MODEL_CACHE
-    if _MODEL_CACHE is not None:
-        return _MODEL_CACHE
+    
+    cid = client_id or "__default__"
+    if cid in _MODEL_CACHE:
+        #_flush_other_clients_to_cpu(cid)
+        log(logging.INFO, f"Reusing cached model for client_id: {cid}")
+        return _MODEL_CACHE[cid]
 
     adapter = get_federated_task_adapter(config)
     model = adapter.build_model(config)
-    _MODEL_CACHE = model
+    _MODEL_CACHE[cid] = model
+    # _OPTIM_STATE_CACHE.pop(cid, None)  # new model → stale optimizer state is invalid
+    #_flush_other_clients_to_cpu(cid)
+    log(logging.INFO, f"Created new model for client_id: {cid}")
     return model
+
+
+def _flush_other_clients_to_cpu(active_client_id: str) -> None:
+    """Move inactive client models to CPU to free GPU memory."""
+    for cid, model in _MODEL_CACHE.items():
+        if cid != active_client_id:
+            model.to("cpu")
 
 def get_client_class(config: DictConfig):
     """Resolve federated client class from task adapter."""
@@ -122,7 +147,9 @@ def train(msg: Message, context: Context):
     in_config = msg.content.config_records.get("config", ConfigRecord())
     config = load_hydra_config(context)
     config = update_config_from_config_record(config, in_config)  # Update Hydra config with any overrides from server-sent config record
-    torch.manual_seed(config.seed)
+    
+    round_idx = int(in_config.get("server-round", 0))
+    torch.manual_seed(config.seed + round_idx)
 
     # Construct output directory using same config template structure as server
     # Use coordinated timestamp from server if available
@@ -167,7 +194,7 @@ def train(msg: Message, context: Context):
     vendor = getattr(config, "vendor", None)
 
     # Initialize model
-    model = get_model(config)
+    model = get_model(config, client_id)
     
     # Load client data
     train_loader, val_loader, client_stats = load_client_data(
@@ -195,8 +222,6 @@ def train(msg: Message, context: Context):
     # Dynamically load the appropriate client class based on task
     federated_client = get_client_class(config)
 
-    round_idx = int(in_config.get("server-round", 0))
-
     # Create client-specific output directory
     client_run_dir = base_output_dir / f"client_{client_id}"
     client_run_dir.mkdir(parents=True, exist_ok=True)
@@ -220,6 +245,7 @@ def train(msg: Message, context: Context):
         use_lora=config.train.use_lora,
         freeze_pretrained=config.model.freeze_pretrained,
         aggregate_head=getattr(config.federated, "aggregate_head", True),
+        aggregate_decoder=getattr(config.federated, "aggregate_decoder", True),
         metrics_save_path=metrics_save_path,
         stats_save_path=stats_save_path,
         eval_dataloader_fn=eval_dataloader_fn,
@@ -228,8 +254,17 @@ def train(msg: Message, context: Context):
         n_accum_steps=n_accum_steps,
     )
 
+    # Persist optimizer state across rounds (dirty optimizer).
+    #for testing purposes
+    # if client_id in _OPTIM_STATE_CACHE:
+    #     client.optimizer.load_state_dict(_OPTIM_STATE_CACHE[client_id])
+
     # Call the client's train method and send the reply message
-    return client.train(msg, context)
+    reply = client.train(msg, context)
+
+    # _OPTIM_STATE_CACHE[client_id] = client.optimizer.state_dict()
+
+    return reply
 
 
 @app.evaluate()
@@ -239,7 +274,9 @@ def evaluate(msg: Message, context: Context):
     # Load server and hydra config
     in_config = msg.content.config_records.get("config", ConfigRecord())
     config = load_hydra_config(context)
-    torch.manual_seed(config.seed)
+    
+    round_idx = int(in_config.get("server-round", 0))
+    torch.manual_seed(config.seed + round_idx)
     
     # Construct output directory using same config template structure as server
     # Use coordinated timestamp from server if available
@@ -281,7 +318,7 @@ def evaluate(msg: Message, context: Context):
     vendor = getattr(config, "vendor", None)
 
     # Initialize model
-    model = get_model(config)
+    model = get_model(config, client_id)
     
     # Load client data
     train_loader, val_loader, client_stats = load_client_data(
@@ -300,8 +337,6 @@ def evaluate(msg: Message, context: Context):
 
     # Dynamically load the appropriate client class based on task
     federated_client = get_client_class(config)
-
-    round_idx = int(in_config.get("server-round", 0))
 
     # Create client-specific output directory only if we persist eval artifacts
     client_run_dir = base_output_dir / f"client_{client_id}" / "eval_metrics"
@@ -323,6 +358,7 @@ def evaluate(msg: Message, context: Context):
         use_lora=config.train.use_lora,
         freeze_pretrained=config.model.freeze_pretrained,
         aggregate_head=getattr(config.federated, "aggregate_head", True),
+        aggregate_decoder=getattr(config.federated, "aggregate_decoder", True),
         metrics_save_path=metrics_save_path, # TODO: maybe delete path parameters because evaluation metrics are only saved in eval function for now
         stats_save_path=stats_save_path,
         eval_dataloader_fn=eval_dataloader_fn,
