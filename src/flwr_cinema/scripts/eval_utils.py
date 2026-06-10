@@ -419,7 +419,35 @@ def _load_federated_metrics_history(server_dir: Path) -> list[dict[str, Any]]:
     except Exception as e:  # pragma: no cover - defensive
         raise ValueError(f"Unable to parse metrics_history.json: {e}") from e
 
-    # Real contract: metrics_history is a dict with evaluate_metrics keyed by round.
+    # New format (v2): {"rounds": [{ "round": N, "evaluate_metrics": {...}, ...}, ...]}
+    if isinstance(metrics_history, dict) and "rounds" in metrics_history:
+        rounds = metrics_history["rounds"]
+        if not isinstance(rounds, list) or not rounds:
+            raise ValueError("metrics_history.json has empty or invalid 'rounds' array")
+
+        normalized_entries: list[dict[str, Any]] = []
+        for round_data in rounds:
+            if not isinstance(round_data, dict):
+                continue
+
+            evaluate_metrics = round_data.get("evaluate_metrics")
+            # Skip rounds without evaluation (no evaluate_metrics or empty dict)
+            if not isinstance(evaluate_metrics, dict) or not evaluate_metrics:
+                continue
+
+            round_num = round_data.get("round")
+            if not isinstance(round_num, int):
+                continue
+
+            # Normalize to the legacy fedavg_metrics contract: wrap flat metrics under
+            # fedavg_metrics so that find_best_federated_round works transparently.
+            normalized_entries.append({"round": round_num, "fedavg_metrics": evaluate_metrics})
+
+        if not normalized_entries:
+            raise ValueError("metrics_history.json has no validation rounds with evaluate_metrics")
+        return normalized_entries
+
+    # Legacy format (v1): dict with evaluate_metrics keyed by round.
     if isinstance(metrics_history, dict):
         evaluate_metrics = metrics_history.get("evaluate_metrics")
         if not isinstance(evaluate_metrics, dict) or not evaluate_metrics:
@@ -573,10 +601,19 @@ def get_round_participants(output_dir: Path, round_num: int) -> list[str]:
         try:
             with open(metrics_file) as f:
                 metrics_history = json.load(f)
-                for entry in metrics_history:
-                    if entry.get("round") == round_num:
-                        if "client_steps" in entry:
-                            return list(entry["client_steps"].keys())
+
+            # New format (v2): {"rounds": [...]}
+            if isinstance(metrics_history, dict) and "rounds" in metrics_history:
+                entries = metrics_history["rounds"]
+            elif isinstance(metrics_history, list):
+                entries = metrics_history
+            else:
+                entries = []
+
+            for entry in entries:
+                if entry.get("round") == round_num:
+                    if "client_steps" in entry:
+                        return list(entry["client_steps"].keys())
         except Exception as e:
             logger.warning(f"Failed to extract participants from metrics: {e}")
     
@@ -609,6 +646,67 @@ def get_round_participants(output_dir: Path, round_num: int) -> list[str]:
     return ["acdc", "GE", "Philips", "Siemens", "Canon"]  # Default assumption
 
 
+def _load_config_near_checkpoint(
+    checkpoint_path: Path,
+    output_dir: Path | None = None,
+) -> dict:
+    """Find and load the config YAML near a checkpoint, without loading the model.
+
+    Searches parent directories of both ``output_dir`` and ``checkpoint_path``
+    for ``config.yaml`` (including ``.hydra/config.yaml``).  Falls back to the
+    project default ``configs/cinema_fed.yaml`` when nothing else is found.
+
+    Args:
+        checkpoint_path: Path to a checkpoint (.pt) file (used to anchor the search).
+        output_dir: Optional output directory to also search from.
+
+    Returns:
+        Parsed config as a plain dict (via OmegaConf.to_container).
+    """
+    config_paths: list[Path] = []
+    if output_dir:
+        config_paths.extend([
+            output_dir / "config.yaml",
+            output_dir.parent / "config.yaml",
+            output_dir.parent.parent / "config.yaml",
+            output_dir / ".hydra" / "config.yaml",
+            output_dir.parent / ".hydra" / "config.yaml",
+        ])
+
+    config_paths.extend([
+        checkpoint_path.parent / "config.yaml",
+        checkpoint_path.parent.parent / "config.yaml",
+        checkpoint_path.parent.parent.parent / "config.yaml",
+        checkpoint_path.parent.parent / ".hydra" / "config.yaml",
+        checkpoint_path.parent.parent.parent / ".hydra" / "config.yaml",
+    ])
+
+    for config_path in config_paths:
+        if config_path.exists():
+            try:
+                from omegaconf import OmegaConf
+                config_dict = OmegaConf.to_container(OmegaConf.load(config_path))
+                logger.info("Loaded config from %s", config_path)
+                return config_dict  # type: ignore[return-value]
+            except Exception as e:
+                logger.warning("Failed to load config from %s: %s", config_path, e)
+
+    # Fall back to default config from configs/ directory
+    try:
+        from omegaconf import OmegaConf
+        repo_root = Path(__file__).parent.parent
+        default_config_path = repo_root / "configs" / "cinema_fed.yaml"
+        if default_config_path.exists():
+            logger.warning("Using default config from %s", default_config_path)
+            return OmegaConf.to_container(OmegaConf.load(default_config_path))  # type: ignore[return-value]
+    except Exception:
+        pass
+
+    raise FileNotFoundError(
+        f"Could not find config.yaml for checkpoint {checkpoint_path}"
+    )
+
+
 def load_checkpoint_and_config(
     checkpoint_path: Path, 
     output_dir: Path | None = None
@@ -625,53 +723,10 @@ def load_checkpoint_and_config(
     # Load checkpoint
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     logger.info(f"Loaded checkpoint from {checkpoint_path}")
+
+    config_dict = _load_config_near_checkpoint(checkpoint_path, output_dir)
     
-    # Find and load config
-    config_paths = []
-    if output_dir:
-        config_paths.extend([
-            output_dir / "config.yaml",
-            output_dir.parent / "config.yaml",
-            output_dir.parent.parent / "config.yaml",
-            output_dir / ".hydra" / "config.yaml",
-            output_dir.parent / ".hydra" / "config.yaml",
-        ])
-    
-    # Also search from checkpoint directory
-    config_paths.extend([
-        checkpoint_path.parent / "config.yaml",
-        checkpoint_path.parent.parent / "config.yaml",
-        checkpoint_path.parent.parent.parent / "config.yaml",
-        checkpoint_path.parent.parent / ".hydra" / "config.yaml",
-        checkpoint_path.parent.parent.parent / ".hydra" / "config.yaml",
-    ])
-    
-    config_dict = None
-    for config_path in config_paths:
-        if config_path.exists():
-            try:
-                from omegaconf import OmegaConf
-                config_dict = OmegaConf.to_container(OmegaConf.load(config_path))
-                logger.info(f"Loaded config from {config_path}")
-                break
-            except Exception as e:
-                logger.warning(f"Failed to load config from {config_path}: {e}")
-    
-    if config_dict is None:
-        # Fall back to default config from configs/ directory
-        try:
-            from omegaconf import OmegaConf
-            repo_root = Path(__file__).parent.parent
-            default_config_path = repo_root / "configs" / "cinema_fed.yaml"
-            if default_config_path.exists():
-                config_dict = OmegaConf.to_container(OmegaConf.load(default_config_path))
-                logger.warning(f"Using default config from {default_config_path}")
-            else:
-                raise FileNotFoundError(f"Could not find config.yaml for checkpoint {checkpoint_path}")
-        except Exception as e:
-            raise FileNotFoundError(f"Could not find config.yaml for checkpoint {checkpoint_path}") from e
-    
-    return checkpoint, config_dict # type: ignore
+    return checkpoint, config_dict
 
 
 def _detect_client_column(meta_df: pd.DataFrame) -> str | None:
@@ -2430,9 +2485,9 @@ def _resolve_federated_checkpoint(
         }
 
     resolved_checkpoint_dir = resolve_federated_checkpoint_dir(checkpoint_dir)
-    # Load provisional config from last round to get primary metric
+    # Load provisional config from last round to get primary metric (config only, no model)
     last_ckpt, _ = find_last_federated_round(resolved_checkpoint_dir)
-    _, provisional_config = load_checkpoint_and_config(last_ckpt, output_dir=resolved_checkpoint_dir)
+    provisional_config = _load_config_near_checkpoint(last_ckpt, output_dir=resolved_checkpoint_dir)
     primary_metric, direction = _extract_primary_metric_meta(provisional_config)
 
     ckpt_path, round_num = find_best_federated_round(

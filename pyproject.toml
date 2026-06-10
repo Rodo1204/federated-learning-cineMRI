@@ -83,7 +83,7 @@ local-epochs = 1
 learning-rate = 0.1
 batch-size = 32
 hydra_config_dir = "../../../configs/federated"
-hydra_config_name = "cinema_classification_fed_mypc"
+hydra_config_name = "cinema_classification_fed"
 hydra_overrides = ""
 
 [superlink.local]
